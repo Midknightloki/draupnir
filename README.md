@@ -7,6 +7,7 @@ An open, self-contained **USB-HID macro controller**: a rotary-knob brain plus a
 > every ninth night. A round controller that multiplies your macros.
 
 **Status:** Phase 1 (proof of concept) — milestone **M0**, hardware bring-up.
+**Built in:** Antigravity (agentic IDE); the agent compiles/flashes via `arduino-cli`.
 
 ## Concept
 One mental model: **dial detent N = key N = color N = icon N.**
@@ -22,7 +23,7 @@ One mental model: **dial detent N = key N = color N = icon N.**
 | Brain | M5Stack Dial (ESP32-S3, 1.28" round touch, encoder) | firmware, screen, USB HID |
 | Keys | Adafruit NeoTrellis 4x4 (16 keys + per-key RGB, I2C) | key bank + color legend |
 
-Cabled M5Dial **PORT.A (I2C)** → Grove↔STEMMA adapter → NeoTrellis. See the spec for details.
+Cabled M5Dial **PORT.A (I2C)** → Grove↔STEMMA adapter → NeoTrellis.
 
 ## Firmware stack
 Arduino + M5Unified · LVGL/M5GFX · TinyUSB HID · LittleFS · ESPAsyncWebServer.
@@ -30,22 +31,22 @@ Macro engine = sequences + delays (keys, text, media, mouse). No on-device scrip
 
 ## Repo layout
 ```
-docs/    Draupnir_Spec.md          full spec (authoritative)
-         M0_Setup_and_BringUp.md   toolchain + first flash
-firmware/M0_bringup/               M0 bring-up sketch
-scripts/                           helper scripts (git push, etc.)
-CLAUDE.md                          context for the AI assistant (Eitri)
+AGENTS.md    context/rules for the IDE agent (Eitri)  [CLAUDE.md mirrors it]
+docs/        Draupnir_Spec.md          full spec (authoritative)
+             M0_Setup_and_BringUp.md   Arduino IDE toolchain + first flash
+             Toolchain_arduino-cli.md  headless build/flash (Antigravity)
+firmware/    M0_bringup/               M0 bring-up sketch
+scripts/     bootstrap_repo.*          git init + commit + optional push
 ```
 
 ## Getting started
-See **docs/M0_Setup_and_BringUp.md** — install the toolchain, flash M5's example,
-then flash `firmware/M0_bringup`.
+Antigravity / CLI: see `docs/Toolchain_arduino-cli.md`.
+GUI fallback: `docs/M0_Setup_and_BringUp.md`.
 
 ## Roadmap
 - **P1 — POC (now):** M5Dial + NeoTrellis; prove firmware + interaction.
 - **P2:** custom radial / Megalodon-style PCB; hotswap mechanical + RGB.
-- **P3 (stretch):** sellable product; build on a pre-certified ESP32-S3 module
-  to inherit radio cert; ship via Tindie / Crowd Supply; stay open.
+- **P3 (stretch):** sellable product on a pre-certified ESP32-S3 module; Tindie / Crowd Supply; stay open.
 
 ## License
 MIT — see [LICENSE](LICENSE). Hardware designs intended to be open as well.
