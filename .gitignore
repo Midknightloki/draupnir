@@ -1,0 +1,18 @@
+# Build artifacts
+/build/
+*.hex
+*.bin
+*.elf
+*.map
+# PlatformIO
+.pio/
+# IDE
+.vscode/
+.idea/
+# OS junk
+.DS_Store
+Thumbs.db
+# Secrets / local config (never commit Wi-Fi creds etc.)
+secrets.h
+wifi_creds.h
+*.local
