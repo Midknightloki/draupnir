@@ -215,6 +215,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   ),
                 ],
               ),
+              actionsAlignment: MainAxisAlignment.spaceBetween,
               actions: [
                 if (profiles.length > 1)
                   TextButton(
@@ -223,19 +224,26 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       Navigator.pop(ctx);
                     },
                     child: const Text('DELETE', style: TextStyle(color: Colors.red)),
-                  ),
-                const Spacer(),
-                TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('CANCEL')),
-                ElevatedButton(
-                  onPressed: () {
-                    if (ctrl.text.isNotEmpty) {
-                      state.renameProfile(ctrl.text);
-                      String colorHex = currentColor.value.toRadixString(16).padLeft(8, '0').substring(2).toUpperCase();
-                      state.setProfileColor('#$colorHex');
-                    }
-                    Navigator.pop(ctx);
-                  },
-                  child: const Text('SAVE'),
+                  )
+                else
+                  const SizedBox.shrink(),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('CANCEL')),
+                    const SizedBox(width: 8),
+                    ElevatedButton(
+                      onPressed: () {
+                        if (ctrl.text.isNotEmpty) {
+                          state.renameProfile(ctrl.text);
+                          String colorHex = currentColor.value.toRadixString(16).padLeft(8, '0').substring(2).toUpperCase();
+                          state.setProfileColor('#$colorHex');
+                        }
+                        Navigator.pop(ctx);
+                      },
+                      child: const Text('SAVE'),
+                    ),
+                  ],
                 ),
               ],
             );
