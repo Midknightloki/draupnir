@@ -26,14 +26,14 @@ Draupnir consists of two primary components cabled together:
 
 ## Configuration (Companion App)
 
-Draupnir doesn't require any host software to run, but it hosts its own configuration web app over Wi-Fi.
+Draupnir doesn't require any host software to run, but it hosts its own configuration API over Wi-Fi, accessed via the mobile Companion App.
 
-1. **Enter Config Mode:** Long-press the M5Dial touchscreen until it shows the "Wi-Fi SETUP" screen. 
-2. **Connect to Wi-Fi:** The screen will display instructions to connect to the "Draupnir-Setup" hotspot (or it will display its IP address if it connects to a known network).
-3. **Open the Web App:** Open a browser and navigate to the IP address shown on the screen (or `http://192.168.4.1/` if using the hotspot).
+1. **Initial Wi-Fi Setup:** Long-press the M5Dial touchscreen to enter "Wi-Fi SETUP" mode. Connect to the "Draupnir-Setup" hotspot to configure your local network credentials.
+2. **Enter Config Mode:** Swipe down on the M5Dial touchscreen to enter Config Mode.
+3. **Pair the App:** Open the Draupnir Companion App. If the app is not paired, it will prompt you. While Draupnir is in Config Mode, tap "Pair Device" in the app to establish a secure, token-based connection.
 4. **Edit Macros:** In the Companion App, you can:
    - Add/Rename/Delete profiles and customize their accent colors.
-   - Click a key on the virtual deck to assign actions (Keystrokes, Text strings, Media controls, Mouse movements, Delays, or special Rotary behavior).
+   - Tap a key on the virtual deck to assign actions (Keystrokes, Text strings, Media controls, Mouse movements, Delays, or special Rotary behavior).
    - Set the physical mounting orientation of your dial (0°, 90°, 180°, 270°).
 5. **Save & Exit:** Once you save your profiles, Draupnir will automatically restart into run mode with your new configurations.
 

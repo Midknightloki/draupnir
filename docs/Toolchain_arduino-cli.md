@@ -34,8 +34,8 @@ USB mode is a menu option baked into the FQBN. Inspect available options:
 arduino-cli board details --fqbn <FQBN>
 ```
 Then append the USB-OTG / TinyUSB option (name shown in `board details`) to the FQBN when
-compiling M1, e.g. `--fqbn <FQBN>:USBMode=<tinyusb-option>`, and enable CDC-on-boot so the
-serial monitor keeps working alongside HID.
+compiling M1-M6, e.g. `--fqbn <FQBN>:USBMode=<tinyusb-option>,CDCOnBoot=cdc,FlashSize=8M,PartitionScheme=default_8MB`. Enable CDC-on-boot so the
+serial monitor keeps working alongside HID. Note that the M5Dial has 8MB flash and the firmware requires the `default_8MB` partition scheme.
 
 ## Notes
 - Native-USB board: after flashing, re-enter download mode (G0) before each re-upload.

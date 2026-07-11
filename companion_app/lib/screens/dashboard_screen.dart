@@ -58,6 +58,36 @@ class _DashboardScreenState extends State<DashboardScreen> {
           if (state.profilesData == null && !state.isLoading) _buildConnectionBar(state),
           if (state.isLoading)
             const Expanded(child: Center(child: CircularProgressIndicator()))
+          else if (state.needsPairing)
+            Expanded(
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const Icon(Icons.lock_outline, color: Colors.orange, size: 64),
+                    const SizedBox(height: 16),
+                    Text(
+                      state.error ?? 'Pairing Required',
+                      style: const TextStyle(color: Colors.orange, fontSize: 16, fontWeight: FontWeight.bold),
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 24),
+                    ElevatedButton.icon(
+                      icon: state.isPairing 
+                        ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                        : const Icon(Icons.link),
+                      label: Text(state.isPairing ? 'PAIRING...' : 'PAIR DEVICE'),
+                      style: ElevatedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+                        backgroundColor: Colors.orange,
+                        foregroundColor: Colors.white,
+                      ),
+                      onPressed: state.isPairing ? null : () => state.pair(),
+                    ),
+                  ],
+                ),
+              ),
+            )
           else if (state.error != null)
             Expanded(
               child: Center(

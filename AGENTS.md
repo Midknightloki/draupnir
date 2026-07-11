@@ -62,10 +62,7 @@ FQBN (e.g. `<FQBN>:USBMode=...`). Arduino IDE GUI remains a fallback — see
   radio FCC/CE; ship via Tindie / Crowd Supply; keep it open.
 
 ## Current status
-**M0** — bring-up sketch exists (`firmware/M0_bringup/`); confirm screen/encoder/button/touch
-on hardware. **Next = M1** USB HID hello (TinyUSB; knob press types a fixed string). Then
-M2 NeoTrellis over I2C · M3 keys fire HID · M4 color legend + dial · M5 store + profiles ·
-M6 Wi-Fi web config · M7 polish.
+**M6 (Wi-Fi Config + Mobile App)** — Firmware now includes `CONFIG_MODE` with token-based authentication via a Flutter mobile Companion App. Profiles are persisted to LittleFS. USB HID macros are fully functional. **Next = M7** polish, testing, and documentation.
 
 ## Key hardware facts
 **M5Dial:** StampS3 (ESP32-S3FN8), 8MB flash, **no PSRAM, no SD**. Encoder G40/G41, screen

@@ -14,8 +14,10 @@
 #include <Adafruit_NeoTrellis.h>
 #include "icons.h"
 
-enum AppMode { RUN_MODE, CONFIG_MODE };
+enum AppMode { RUN_MODE, CONFIG_MODE, WIFI_SETUP_MODE };
 AppMode currentMode = RUN_MODE;
+String pairingToken = "";
+
 
 Adafruit_NeoTrellis trellis;
 bool trellisFound = false;
@@ -519,14 +521,45 @@ TrellisCallback trellisEvent(keyEvent evt) {
   return 0;
 }
 
+bool isAuthorized() {
+  if (currentMode == CONFIG_MODE) return true;
+  if (server.hasHeader("Authorization")) {
+    String auth = server.header("Authorization");
+    if (auth == "Bearer " + pairingToken && pairingToken.length() > 0) return true;
+  }
+  return false;
+}
+
 void setupWebServer() {
   server.enableCORS(true);
   
+  const char * headerkeys[] = {"Authorization"};
+  size_t headerkeyssize = sizeof(headerkeys)/sizeof(char*);
+  server.collectHeaders(headerkeys, headerkeyssize);
+  
   server.on("/", HTTP_GET, [](){
+    if (currentMode != CONFIG_MODE) {
+      server.send(403, "text/plain", "Forbidden. Swipe down on Draupnir to enter Config Mode.");
+      return;
+    }
     server.send(200, "text/html", INDEX_HTML);
   });
   
+  server.on("/api/pair", HTTP_POST, []() {
+    if (currentMode != CONFIG_MODE) {
+      server.send(403, "application/json", "{\"status\":\"error\",\"message\":\"Not in Config Mode\"}");
+      return;
+    }
+    pairingToken = String(esp_random(), HEX) + String(esp_random(), HEX) + String(esp_random(), HEX);
+    prefs.putString("pairingToken", pairingToken);
+    server.send(200, "application/json", "{\"token\":\"" + pairingToken + "\"}");
+  });
+
   server.on("/api/profiles", HTTP_GET, [](){
+    if (!isAuthorized()) {
+      server.send(401, "application/json", "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
+      return;
+    }
     File file = LittleFS.open("/profiles.json", "r");
     if(!file){
       server.send(500, "text/plain", "Failed to open file");
@@ -537,6 +570,10 @@ void setupWebServer() {
   });
   
   server.on("/api/profiles", HTTP_POST, [](){
+    if (!isAuthorized()) {
+      server.send(401, "application/json", "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
+      return;
+    }
     if(server.hasArg("plain")) {
       String body = server.arg("plain");
       File f = LittleFS.open("/profiles.json", "w");
@@ -563,6 +600,10 @@ void setupWebServer() {
   });
   
   server.on("/api/trigger", HTTP_POST, [](){
+    if (!isAuthorized()) {
+      server.send(401, "application/json", "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
+      return;
+    }
     if(server.hasArg("plain")) {
       String body = server.arg("plain");
       JsonDocument req;
@@ -605,6 +646,26 @@ void setupWebServer() {
 
 void enterConfigMode() {
   currentMode = CONFIG_MODE;
+  killAllMacros();
+  
+  auto& d = M5Dial.Display;
+  d.fillScreen(TFT_BLACK);
+  d.setTextDatum(middle_center);
+  d.setFont(&fonts::Orbitron_Light_24);
+  d.setTextColor(TFT_GREEN, TFT_BLACK);
+  d.drawString("CONFIG MODE", 120, 60);
+  
+  d.setFont(&fonts::Orbitron_Light_24);
+  d.setTextColor(TFT_WHITE, TFT_BLACK);
+  d.drawString("IP Address:", 120, 110);
+  d.drawString(WiFi.localIP().toString(), 120, 140);
+  
+  d.setTextColor(TFT_DARKGRAY, TFT_BLACK);
+  d.drawString("TAP TO EXIT", 120, 190);
+}
+
+void enterWiFiSetupMode() {
+  currentMode = WIFI_SETUP_MODE;
   
   killAllMacros();
   
@@ -659,6 +720,7 @@ void setup() {
   }
   
   prefs.begin("draupnir", false);
+  pairingToken = prefs.getString("pairingToken", "");
   
   loadProfiles();
   
@@ -757,7 +819,7 @@ void loop() {
     if (M5Dial.BtnA.wasHold()) {
       M5Dial.Speaker.tone(2000, 100);
       waitRelease = true;
-      enterConfigMode();
+      enterWiFiSetupMode();
     }
     
     auto touch = M5Dial.Touch.getDetail();
@@ -772,6 +834,10 @@ void loop() {
         delay(50);
         M5Dial.Speaker.tone(800, 50);
         killAllMacros();
+      } else if (touch.distanceY() > 40 && abs(touch.distanceX()) < 30) {
+        // Swipe Down -> Enter Config Mode
+        M5Dial.Speaker.tone(1500, 50);
+        enterConfigMode();
       } else if (abs(touch.distanceX()) < 10 && touch.y > 60 && touch.y < 180) { 
         if (inRotaryMode && touch.x >= 80 && touch.x <= 160 && touch.y >= 80 && touch.y <= 160) {
           inRotaryMode = false;
@@ -815,6 +881,14 @@ void loop() {
       }
     }
   } else if (currentMode == CONFIG_MODE) {
+    server.handleClient();
+    auto touch = M5Dial.Touch.getDetail();
+    if (touch.wasReleased() || M5Dial.BtnA.wasReleased()) {
+      currentMode = RUN_MODE;
+      M5Dial.Speaker.tone(2000, 30);
+      requestRedraw();
+    }
+  } else if (currentMode == WIFI_SETUP_MODE) {
     server.handleClient();
     
     if (waitRelease && M5Dial.BtnA.isReleased()) {

@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
-
+import 'package:shared_preferences/shared_preferences.dart';
 class DraupnirState extends ChangeNotifier {
   String deviceIp = 'draupnir.local';
   
@@ -11,6 +11,22 @@ class DraupnirState extends ChangeNotifier {
   Map<String, dynamic>? profilesData;
   int activeProfileIdx = 0;
   bool isEditorMode = false;
+  
+  String? authToken;
+  bool needsPairing = false;
+  bool isPairing = false;
+
+  Future<void> init() async {
+    final prefs = await SharedPreferences.getInstance();
+    authToken = prefs.getString('authToken');
+  }
+
+  Map<String, String> get _headers {
+    if (authToken != null && authToken!.isNotEmpty) {
+      return {'Authorization': 'Bearer $authToken', 'Content-Type': 'text/plain'};
+    }
+    return {'Content-Type': 'text/plain'};
+  }
 
   void toggleEditorMode() {
     isEditorMode = !isEditorMode;
@@ -69,6 +85,7 @@ class DraupnirState extends ChangeNotifier {
 
   Future<void> connect(String ip) async {
     deviceIp = ip;
+    await init();
     await fetchProfiles();
   }
 
@@ -78,9 +95,13 @@ class DraupnirState extends ChangeNotifier {
     notifyListeners();
 
     try {
-      final response = await http.get(Uri.parse('http://$deviceIp/api/profiles'));
+      final response = await http.get(Uri.parse('http://$deviceIp/api/profiles'), headers: _headers);
       if (response.statusCode == 200) {
         profilesData = jsonDecode(response.body);
+        needsPairing = false;
+      } else if (response.statusCode == 401 || response.statusCode == 403) {
+        needsPairing = true;
+        error = 'Pairing required. Swipe down on Draupnir to enter Config Mode and press Pair.';
       } else {
         error = 'Failed to load profiles (HTTP ${response.statusCode})';
       }
@@ -89,6 +110,30 @@ class DraupnirState extends ChangeNotifier {
     }
 
     isLoading = false;
+    notifyListeners();
+  }
+
+  Future<void> pair() async {
+    isPairing = true;
+    notifyListeners();
+    try {
+      final response = await http.post(Uri.parse('http://$deviceIp/api/pair'));
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        if (data['token'] != null) {
+          authToken = data['token'];
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString('authToken', authToken!);
+          needsPairing = false;
+          await fetchProfiles();
+        }
+      } else {
+        error = 'Failed to pair. Make sure Draupnir is in Config Mode (swipe down).';
+      }
+    } catch (e) {
+      error = 'Pairing connection failed.';
+    }
+    isPairing = false;
     notifyListeners();
   }
 
@@ -101,7 +146,7 @@ class DraupnirState extends ChangeNotifier {
     try {
       final response = await http.post(
         Uri.parse('http://$deviceIp/api/profiles'),
-        headers: {'Content-Type': 'text/plain'},
+        headers: _headers,
         body: jsonEncode(profilesData),
       );
       if (response.statusCode != 200) {
@@ -119,7 +164,7 @@ class DraupnirState extends ChangeNotifier {
     try {
       await http.post(
         Uri.parse('http://$deviceIp/api/trigger'),
-        headers: {'Content-Type': 'text/plain'},
+        headers: _headers,
         body: jsonEncode({
           'profile': activeProfileIdx,
           'macro': macroIdx,

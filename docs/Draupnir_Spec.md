@@ -62,7 +62,7 @@ A desk macro controller with a color-coded 16-key pad and a screen+knob brain, f
 3. **Color-coded legend:** each key lit in its macro's color; screen shows the selected macro's icon/name; dial detent aligns with key.
 4. **Multiple profiles**, each up to 16 macros, persisted in onboard flash; switching re-legends keys + screen.
 5. Macros support **key combos, typed text, media/consumer keys, basic mouse, and inter-step delays.**
-6. Configurable from **any browser** via the Dial's Wi-Fi config page — no installed app.
+6. Configurable via a dedicated **mobile Companion App** connected over the Dial's Wi-Fi — providing a rich, responsive interface.
 7. Survives power cycles; boots into the last-used profile with the right colors.
 
 **Done when:** I configure a profile in the browser, unplug/replug, see the 16 keys light in their colors, press a key, and the keystrokes land in the focused app — config page closed.
@@ -155,7 +155,7 @@ This unifies the whole device: dial detent <-> screen icon <-> physical key <-> 
 
 **Modes**
 - **Run:** USB HID active, Wi-Fi off; NeoTrellis lit + scanning.
-- **Config:** long-press -> Wi-Fi AP + web server up, HID idle; exit reloads `profiles.json` and re-legends.
+- **Config:** swipe down -> Wi-Fi AP + web API up, HID idle; handles pairing and profile updates; exit reloads `profiles.json` and re-legends.
 
 ---
 
@@ -203,13 +203,12 @@ This unifies the whole device: dial detent <-> screen icon <-> physical key <-> 
 
 ---
 
-## 7. Config: Wi-Fi web UI
+## 7. Config: Mobile Companion App
 
-- Long-press -> Config mode: Dial starts a SoftAP (e.g. `Draupnir-XXXX`, QR on screen) or joins your LAN.
-- Browser -> single-page config app (served from firmware/LittleFS).
+- Swipe down -> Config mode: Dial serves a REST API over its local IP or SoftAP.
+- Open the **Companion App** -> The app securely pairs with the device, generating and storing a unique authentication token in the device's NVS memory. 
 - Edit profiles and macros, assign **grid position + color + icon**, build action sequences, set brightness (screen + LED).
 - Save -> POST JSON -> validate (ArduinoJson) -> write `profiles.json` -> reload + re-legend.
-- Add an **export/import** button so you can back up `profiles.json` (no SD card).
 
 ---
 
@@ -241,7 +240,7 @@ This unifies the whole device: dial detent <-> screen icon <-> physical key <-> 
 | M3 | Keys fire HID | Press a NeoTrellis key -> fires a multi-step macro; key flashes. |
 | M4 | Color legend + dial | 16 keys lit per macro color; dial highlight tracks selection; knob fires selected. |
 | M5 | Store + profiles | Load `profiles.json`; profile switch re-legends keys + screen; boot into last (NVS). |
-| M6 | Web config | Config mode serves the page; edits (incl. position/color) save + reload live. |
+| M6 | App config | Config mode serves the API; Companion App connects with secure pairing token; edits (incl. position/color) save + reload live. |
 | M7 | Polish | Paging, icons, brightness caps, buzzer feedback, export/import, (battery). |
 
 Dogfood gate at **M4**: once the lit grid + dial + HID firing all work together, use it for real before building config/profiles. This is the moment the whole concept proves out.
