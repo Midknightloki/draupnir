@@ -1,52 +1,46 @@
-# Draupnir
+# Draupnir 
 
-An open, self-contained **USB-HID macro controller**: a rotary-knob brain plus a
-16-key RGB pad, with a roadmap toward a custom radial / premium form factor.
+**A two-puck, self-contained HID macro controller: a rotary-knob brain + a 16-key RGB pad.**
 
-> *Draupnir* — the golden ring the dwarf Eitri forged that drips eight new rings
-> every ninth night. A round controller that multiplies your macros.
+Draupnir is a compact radial macro controller featuring 16 physical keys with per-key NeoPixels, arranged alongside a central rotary encoder with a round touch screen. The dial detent matches the key position, mapping macros logically. The entire system functions as a driverless USB HID device.
 
-**Status:** Phase 1 (proof of concept) — milestone **M0**, hardware bring-up.
-**Built in:** Antigravity (agentic IDE); the agent compiles/flashes via `arduino-cli`.
+## Hardware Setup
 
-## Concept
-One mental model: **dial detent N = key N = color N = icon N.**
-- Turn the knob to highlight; press a physical key (or the knob) to fire a macro.
-- All 16 keys are lit in their macros' colors as a persistent legend.
-- The round screen shows the active profile and the selected macro.
-- Standard USB HID — no host software at runtime. Macros live in flash;
-  configuration is a browser over the device's own Wi-Fi.
+Draupnir consists of two primary components cabled together:
 
-## Hardware (POC)
-| Puck | Part | Role |
-|------|------|------|
-| Brain | M5Stack Dial (ESP32-S3, 1.28" round touch, encoder) | firmware, screen, USB HID |
-| Keys | Adafruit NeoTrellis 4x4 (16 keys + per-key RGB, I2C) | key bank + color legend |
+1. **M5Stack Dial**: The brain. Features an ESP32-S3, a 1.28" round touch screen, and a rotary encoder with a built-in button.
+2. **Adafruit NeoTrellis 4x4 (PCB 3954)**: 16 elastomer buttons, each with its own RGB NeoPixel. *Note: You must purchase the 4x4 silicone elastomer button pad separately.*
 
-Cabled M5Dial **PORT.A (I2C)** → Grove↔STEMMA adapter → NeoTrellis.
+**Connections:**
+- Connect the NeoTrellis to the M5Dial's **PORT.A** (red Grove connector) using a **Grove-to-STEMMA (JST-PH)** adapter cable.
+- The Grove port supplies the required 5V for the NeoPixels while keeping the I2C logic at a safe 3.3V.
 
-## Firmware stack
-Arduino + M5Unified · LVGL/M5GFX · TinyUSB HID · LittleFS · ESPAsyncWebServer.
-Macro engine = sequences + delays (keys, text, media, mouse). No on-device scripting in v1.
+## Usage
 
-## Repo layout
-```
-AGENTS.md    context/rules for the IDE agent (Eitri)  [CLAUDE.md mirrors it]
-docs/        Draupnir_Spec.md          full spec (authoritative)
-             M0_Setup_and_BringUp.md   Arduino IDE toolchain + first flash
-             Toolchain_arduino-cli.md  headless build/flash (Antigravity)
-firmware/    M0_bringup/               M0 bring-up sketch
-scripts/     bootstrap_repo.*          git init + commit + optional push
-```
+1. **Plug in:** Connect the M5Dial to your computer using a data-capable USB-C cable. It will instantly enumerate as a standard USB Keyboard/Mouse/Consumer device.
+2. **Interact:** 
+   - Press any of the 16 lit keys on the NeoTrellis to instantly fire its macro.
+   - Turn the dial to select a macro, and push the dial to fire it.
+   - The screen will display the current profile and active macro's assigned color.
+3. **Change Profiles:** Swipe left or right on the M5Dial touchscreen to switch between your configured profiles.
 
-## Getting started
-Antigravity / CLI: see `docs/Toolchain_arduino-cli.md`.
-GUI fallback: `docs/M0_Setup_and_BringUp.md`.
+## Configuration (Companion App)
 
-## Roadmap
-- **P1 — POC (now):** M5Dial + NeoTrellis; prove firmware + interaction.
-- **P2:** custom radial / Megalodon-style PCB; hotswap mechanical + RGB.
-- **P3 (stretch):** sellable product on a pre-certified ESP32-S3 module; Tindie / Crowd Supply; stay open.
+Draupnir doesn't require any host software to run, but it hosts its own configuration web app over Wi-Fi.
 
-## License
-MIT — see [LICENSE](LICENSE). Hardware designs intended to be open as well.
+1. **Enter Config Mode:** Long-press the M5Dial touchscreen until it shows the "Wi-Fi SETUP" screen. 
+2. **Connect to Wi-Fi:** The screen will display instructions to connect to the "Draupnir-Setup" hotspot (or it will display its IP address if it connects to a known network).
+3. **Open the Web App:** Open a browser and navigate to the IP address shown on the screen (or `http://192.168.4.1/` if using the hotspot).
+4. **Edit Macros:** In the Companion App, you can:
+   - Add/Rename/Delete profiles and customize their accent colors.
+   - Click a key on the virtual deck to assign actions (Keystrokes, Text strings, Media controls, Mouse movements, Delays, or special Rotary behavior).
+   - Set the physical mounting orientation of your dial (0°, 90°, 180°, 270°).
+5. **Save & Exit:** Once you save your profiles, Draupnir will automatically restart into run mode with your new configurations.
+
+## Development & Flashing Firmware
+
+To compile and flash the firmware yourself, see the documentation in the `/docs` folder:
+- [M0 Setup and BringUp](docs/M0_Setup_and_BringUp.md): Step-by-step for the Arduino IDE.
+- [Toolchain (arduino-cli)](docs/Toolchain_arduino-cli.md): Fast, headless deployment.
+
+*Note: Draupnir requires the M5Unified, M5Dial, Adafruit NeoTrellis, Adafruit seesaw, and ArduinoJson libraries.*
