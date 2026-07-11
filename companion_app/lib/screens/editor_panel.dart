@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import 'package:file_picker/file_picker.dart';
+import 'package:file_selector/file_selector.dart';
 import 'package:xml/xml.dart';
 import 'dart:io';
 import 'dart:convert';
@@ -89,14 +89,18 @@ class _EditorPanelState extends State<EditorPanel> {
 
   Future<void> _importSynapseXML() async {
     try {
-      FilePickerResult? result = await FilePicker.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['xml', 'synapse3'],
-        withData: true,
+      final XFile? file = await openFile(
+        acceptedTypeGroups: [
+          XTypeGroup(
+            label: 'Synapse Profiles',
+            extensions: ['xml', 'synapse3'],
+          ),
+        ],
       );
 
-      if (result != null && result.files.single.bytes != null) {
-        final xmlString = utf8.decode(result.files.single.bytes!);
+      if (file != null) {
+        final bytes = await file.readAsBytes();
+        final xmlString = utf8.decode(bytes);
         final document = XmlDocument.parse(xmlString);
         
         List<Map<String, dynamic>> importedActions = [];
