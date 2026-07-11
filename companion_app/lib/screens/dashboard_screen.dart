@@ -423,8 +423,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
           const SizedBox(height: 16),
           Expanded(
             child: GridView.builder(
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 4,
+              gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: MediaQuery.of(context).orientation == Orientation.landscape ? 8 : 4,
                 crossAxisSpacing: 12,
                 mainAxisSpacing: 12,
               ),
@@ -471,7 +471,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         name,
                         textAlign: TextAlign.center,
                         style: GoogleFonts.orbitron(
-                          fontSize: 18,
+                          fontSize: MediaQuery.of(context).orientation == Orientation.landscape ? 12 : 18,
                           fontWeight: FontWeight.bold,
                           color: keyColor.computeLuminance() > 0.5 ? Colors.black : Colors.white,
                         ),
