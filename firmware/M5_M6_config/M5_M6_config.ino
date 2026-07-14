@@ -13,10 +13,24 @@
 #include "index_html.h"
 #include <Adafruit_NeoTrellis.h>
 #include "icons.h"
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+#define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
 enum AppMode { RUN_MODE, CONFIG_MODE, WIFI_SETUP_MODE };
 AppMode currentMode = RUN_MODE;
 String pairingToken = "";
+
+BLEServer *pServer = nullptr;
+BLECharacteristic *pTxCharacteristic = nullptr;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+String bleBuffer = "";
 
 
 Adafruit_NeoTrellis trellis;
@@ -521,6 +535,178 @@ TrellisCallback trellisEvent(keyEvent evt) {
   return 0;
 }
 
+void sendBleMessage(const String &msg) {
+  Serial.print("BLE TX: sending message of length ");
+  Serial.println(msg.length());
+  int len = msg.length();
+  int offset = 0;
+  while (offset < len) {
+    int chunkSize = min(180, len - offset);
+    pTxCharacteristic->setValue((uint8_t*)(msg.c_str() + offset), chunkSize);
+    pTxCharacteristic->notify();
+    offset += chunkSize;
+    delay(20);
+  }
+  // Send the newline delimiter at the end
+  uint8_t nl = '\n';
+  pTxCharacteristic->setValue(&nl, 1);
+  pTxCharacteristic->notify();
+  Serial.println("BLE TX: sent");
+}
+
+void handleBleCommand(String cmdStr) {
+  Serial.print("handleBleCommand: ");
+  Serial.println(cmdStr);
+  JsonDocument req;
+  DeserializationError err = deserializeJson(req, cmdStr);
+  if (err) {
+    Serial.print("JSON Parse Error: ");
+    Serial.println(err.c_str());
+    sendBleMessage("{\"status\":\"error\",\"message\":\"Invalid JSON\"}");
+    return;
+  }
+  
+  String cmd = req["cmd"] | "";
+  String token = req["token"] | "";
+  
+  if (cmd == "pair") {
+    if (currentMode != CONFIG_MODE) {
+      sendBleMessage("{\"status\":\"error\",\"message\":\"Not in Config Mode\"}");
+      return;
+    }
+    pairingToken = String(esp_random(), HEX) + String(esp_random(), HEX) + String(esp_random(), HEX);
+    prefs.putString("pairingToken", pairingToken);
+    sendBleMessage("{\"status\":\"ok\",\"token\":\"" + pairingToken + "\"}");
+    return;
+  }
+  
+  // Authorization check for other commands
+  if (currentMode != CONFIG_MODE && (token != pairingToken || pairingToken.length() == 0)) {
+    sendBleMessage("{\"status\":\"error\",\"message\":\"Unauthorized\"}");
+    return;
+  }
+  
+  if (cmd == "get_profiles") {
+    File file = LittleFS.open("/profiles.json", "r");
+    if (!file) {
+      Serial.println("get_profiles: Failed to open profiles.json");
+      sendBleMessage("{\"status\":\"error\",\"message\":\"Failed to open profiles\"}");
+      return;
+    }
+    size_t fileSize = file.size();
+    Serial.print("get_profiles: profiles.json file size = ");
+    Serial.println(fileSize);
+    
+    String profilesJson = "";
+    profilesJson.reserve(fileSize);
+    while (file.available()) {
+      char c = (char)file.read();
+      if (c != '\n' && c != '\r') {
+        profilesJson += c;
+      }
+    }
+    file.close();
+    Serial.print("get_profiles: Read profilesJson length = ");
+    Serial.println(profilesJson.length());
+    
+    String response = "";
+    response.reserve(profilesJson.length() + 50);
+    response += "{\"status\":\"ok\",\"profiles\":";
+    response += profilesJson;
+    response += "}";
+    Serial.print("get_profiles: Response length = ");
+    Serial.println(response.length());
+    sendBleMessage(response);
+  } 
+  else if (cmd == "save_profiles") {
+    JsonObject profilesObj = req["profiles"];
+    if (profilesObj.isNull()) {
+      sendBleMessage("{\"status\":\"error\",\"message\":\"No profiles object provided\"}");
+      return;
+    }
+    
+    File f = LittleFS.open("/profiles.json", "w");
+    if (f) {
+      serializeJson(profilesObj, f);
+      f.close();
+      
+      killAllMacros();
+      loadProfiles();
+      
+      int brightness = profilesDoc["settings"]["brightness"] | 160;
+      M5Dial.Display.setBrightness(brightness);
+      
+      int orientation = profilesDoc["settings"]["orientation"] | 0;
+      M5Dial.Display.setRotation(orientation);
+
+      requestRedraw();
+      sendBleMessage("{\"status\":\"ok\"}");
+    } else {
+      sendBleMessage("{\"status\":\"error\",\"message\":\"Failed to write file\"}");
+    }
+  } 
+  else if (cmd == "trigger") {
+    int pIdx = req["profile"] | activeProfileIdx;
+    int mIdx = req["macro"] | -1;
+    
+    JsonArray profiles = profilesDoc["profiles"];
+    if (pIdx >= 0 && pIdx < profiles.size()) {
+      JsonObject prof = profiles[pIdx];
+      JsonArray macros = prof["macros"];
+      bool fired = false;
+      for (JsonObject m : macros) {
+        int pos = m["pos"] | -1;
+        if (pos == mIdx) {
+          fireMacro(m, mIdx);
+          fired = true;
+          break;
+        }
+      }
+      if (fired) {
+        sendBleMessage("{\"status\":\"ok\"}");
+      } else {
+        sendBleMessage("{\"status\":\"error\",\"message\":\"Macro not found\"}");
+      }
+    } else {
+      sendBleMessage("{\"status\":\"error\",\"message\":\"Profile not found\"}");
+    }
+  } 
+  else {
+    sendBleMessage("{\"status\":\"error\",\"message\":\"Unknown command\"}");
+  }
+}
+
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+      Serial.println("BLE Client Connected");
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      Serial.println("BLE Client Disconnected");
+    }
+};
+
+class MyCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      String rxValue = pCharacteristic->getValue();
+      Serial.print("BLE RX bytes: ");
+      Serial.println(rxValue.length());
+      if (rxValue.length() > 0) {
+        for (int i = 0; i < rxValue.length(); i++) {
+          char c = rxValue[i];
+          if (c == '\n') {
+            handleBleCommand(bleBuffer);
+            bleBuffer = "";
+          } else {
+            bleBuffer += c;
+          }
+        }
+      }
+    }
+};
+
 bool isAuthorized() {
   if (currentMode == CONFIG_MODE) return true;
   if (server.hasHeader("Authorization")) {
@@ -735,6 +921,34 @@ void setup() {
   
   setupWebServer();
   
+  // Initialize BLE
+  BLEDevice::init("Draupnir");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pTxCharacteristic = pService->createCharacteristic(
+                        CHARACTERISTIC_UUID_TX,
+                        BLECharacteristic::PROPERTY_NOTIFY
+                      );
+  pTxCharacteristic->addDescriptor(new BLE2902());
+  
+  BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
+                                           CHARACTERISTIC_UUID_RX,
+                                           BLECharacteristic::PROPERTY_WRITE |
+                                           BLECharacteristic::PROPERTY_WRITE_NR
+                                         );
+  pRxCharacteristic->setCallbacks(new MyCallbacks());
+  
+  pService->start();
+  
+  pServer->getAdvertising()->addServiceUUID(SERVICE_UUID);
+  pServer->getAdvertising()->setScanResponse(true);
+  pServer->getAdvertising()->setMinPreferred(0x06);
+  pServer->getAdvertising()->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+  Serial.println("BLE Started Advertising");
+  
   Keyboard.begin();
   ConsumerControl.begin();
   Mouse.begin();
@@ -898,6 +1112,18 @@ void loop() {
     if (!waitRelease && M5Dial.BtnA.wasPressed()) {
       ESP.restart();
     }
+  }
+  
+  // BLE reconnection handling
+  if (!deviceConnected && oldDeviceConnected) {
+    delay(500); // give the bluetooth stack the chance to get ready
+    pServer->startAdvertising(); // restart advertising
+    Serial.println("Restart BLE advertising");
+    oldDeviceConnected = deviceConnected;
+  }
+  if (deviceConnected && !oldDeviceConnected) {
+    // do stuff on connection
+    oldDeviceConnected = deviceConnected;
   }
   
   delay(5);

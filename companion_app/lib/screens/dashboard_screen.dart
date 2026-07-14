@@ -16,6 +16,7 @@ class DashboardScreen extends StatefulWidget {
 class _DashboardScreenState extends State<DashboardScreen> {
   final TextEditingController _ipController = TextEditingController(text: 'draupnir.local');
   int? _editingKeyIdx;
+  bool _useBluetooth = false;
 
   @override
   void initState() {
@@ -37,6 +38,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
         ),
         actions: [
           if (state.profilesData != null) ...[
+            if (state.isBluetooth)
+              IconButton(
+                icon: const Icon(Icons.bluetooth_connected, color: Colors.blue),
+                tooltip: 'Connected via BLE. Tap to disconnect.',
+                onPressed: () => state.disconnectBluetooth(),
+              ),
             _buildProfileSwitcher(state),
             const SizedBox(width: 16),
             _buildModeToggle(state),
@@ -296,10 +303,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  TextField(
-                    controller: _ipController,
-                    decoration: const InputDecoration(labelText: 'Device IP / Hostname'),
-                  ),
+                  if (!state.isBluetooth)
+                    TextField(
+                      controller: _ipController,
+                      decoration: const InputDecoration(labelText: 'Device IP / Hostname'),
+                    )
+                  else
+                    const Text('Connected via Bluetooth (BLE)', style: TextStyle(color: Colors.green, fontWeight: FontWeight.bold)),
                   const SizedBox(height: 16),
                   const Text('Dial Orientation', style: TextStyle(fontWeight: FontWeight.bold)),
                   DropdownButton<int>(
@@ -323,7 +333,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('CANCEL')),
                 ElevatedButton(
                   onPressed: () {
-                    state.connect(_ipController.text);
+                    if (!state.isBluetooth) {
+                      state.connect(_ipController.text);
+                    }
                     if (state.orientation != currentOrientation) {
                       state.setOrientation(currentOrientation);
                     }
@@ -390,23 +402,80 @@ class _DashboardScreenState extends State<DashboardScreen> {
     return Container(
       padding: const EdgeInsets.all(16),
       color: AppTheme.surface,
-      child: Row(
+      child: Column(
         children: [
-          Expanded(
-            child: TextField(
-              controller: _ipController,
-              decoration: const InputDecoration(
-                labelText: 'Device IP / Hostname',
-                border: OutlineInputBorder(),
-                isDense: true,
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              ChoiceChip(
+                label: const Text('Wi-Fi (Network)'),
+                selected: !_useBluetooth,
+                selectedColor: AppTheme.accent,
+                labelStyle: TextStyle(color: !_useBluetooth ? Colors.black : Colors.white),
+                onSelected: (val) {
+                  if (val) setState(() => _useBluetooth = false);
+                },
+              ),
+              const SizedBox(width: 16),
+              ChoiceChip(
+                label: const Text('Bluetooth (BLE)'),
+                selected: _useBluetooth,
+                selectedColor: AppTheme.accent,
+                labelStyle: TextStyle(color: _useBluetooth ? Colors.black : Colors.white),
+                onSelected: (val) {
+                  if (val) setState(() => _useBluetooth = true);
+                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          if (!_useBluetooth)
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _ipController,
+                    decoration: const InputDecoration(
+                      labelText: 'Device IP / Hostname',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 16),
+                ElevatedButton(
+                  onPressed: () => state.connect(_ipController.text),
+                  child: const Text('CONNECT'),
+                ),
+              ],
+            )
+          else
+            Center(
+              child: ElevatedButton.icon(
+                icon: state.isScanningBle
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.black,
+                        ),
+                      )
+                    : const Icon(Icons.bluetooth),
+                label: Text(state.isScanningBle
+                    ? 'SCANNING FOR DRUAPNIR...'
+                    : 'CONNECT VIA BLUETOOTH'),
+                style: ElevatedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 32, vertical: 16),
+                  backgroundColor: AppTheme.accent,
+                  foregroundColor: Colors.black,
+                ),
+                onPressed: state.isScanningBle || state.isLoading
+                    ? null
+                    : () => state.connectBluetooth(),
               ),
             ),
-          ),
-          const SizedBox(width: 16),
-          ElevatedButton(
-            onPressed: () => state.connect(_ipController.text),
-            child: const Text('CONNECT'),
-          ),
         ],
       ),
     );

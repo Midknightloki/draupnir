@@ -1,7 +1,12 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:permission_handler/permission_handler.dart';
+
 class DraupnirState extends ChangeNotifier {
   String deviceIp = 'draupnir.local';
   
@@ -15,6 +20,14 @@ class DraupnirState extends ChangeNotifier {
   String? authToken;
   bool needsPairing = false;
   bool isPairing = false;
+
+  bool isBluetooth = false;
+  BluetoothDevice? connectedDevice;
+  BluetoothCharacteristic? rxChar;
+  BluetoothCharacteristic? txChar;
+  bool isScanningBle = false;
+  Completer<Map<String, dynamic>>? _bleResponseCompleter;
+  String _bleBuffer = '';
 
   Future<void> init() async {
     final prefs = await SharedPreferences.getInstance();
@@ -83,6 +96,183 @@ class DraupnirState extends ChangeNotifier {
     }
   }
 
+  void _onBleDataReceived(List<int> value) {
+    String text = utf8.decode(value);
+    for (int i = 0; i < text.length; i++) {
+      String char = text[i];
+      if (char == '\n') {
+        final responseStr = _bleBuffer.trim();
+        _bleBuffer = '';
+        if (responseStr.isEmpty) continue;
+        if (_bleResponseCompleter != null && !_bleResponseCompleter!.isCompleted) {
+          try {
+            final responseJson = jsonDecode(responseStr) as Map<String, dynamic>;
+            _bleResponseCompleter!.complete(responseJson);
+          } catch (e) {
+            _bleResponseCompleter!.completeError(e);
+          }
+        }
+      } else {
+        _bleBuffer += char;
+      }
+    }
+  }
+
+  Future<Map<String, dynamic>> _sendBleRequest(Map<String, dynamic> request) async {
+    if (rxChar == null) {
+      throw Exception('Not connected to BLE device');
+    }
+    
+    _bleResponseCompleter = Completer<Map<String, dynamic>>();
+    _bleBuffer = '';
+    
+    String jsonStr = '${jsonEncode(request)}\n';
+    List<int> bytes = utf8.encode(jsonStr);
+    
+    int offset = 0;
+    while (offset < bytes.length) {
+      int chunkSize = (bytes.length - offset) < 180 ? (bytes.length - offset) : 180;
+      List<int> chunk = bytes.sublist(offset, offset + chunkSize);
+      await rxChar!.write(chunk, withoutResponse: false);
+      offset += chunkSize;
+      await Future.delayed(const Duration(milliseconds: 20));
+    }
+    
+    return _bleResponseCompleter!.future.timeout(const Duration(seconds: 10));
+  }
+
+  Future<void> connectBluetooth() async {
+    isLoading = true;
+    isScanningBle = true;
+    error = null;
+    notifyListeners();
+    
+    try {
+      if (await FlutterBluePlus.isSupported == false) {
+        throw Exception('Bluetooth not supported on this device');
+      }
+      
+      if (Platform.isAndroid) {
+        Map<Permission, PermissionStatus> statuses = await [
+          Permission.bluetoothScan,
+          Permission.bluetoothConnect,
+          Permission.location,
+        ].request();
+
+        if (statuses[Permission.bluetoothScan]?.isDenied == true ||
+            statuses[Permission.bluetoothConnect]?.isDenied == true ||
+            statuses[Permission.location]?.isDenied == true) {
+          throw Exception('Permissions denied. Enable Bluetooth and Location in Settings.');
+        }
+      }
+      
+      BluetoothDevice? targetDevice;
+      List<String> foundNames = [];
+      final subscription = FlutterBluePlus.scanResults.listen((results) {
+        for (final r in results) {
+          final name = r.device.platformName;
+          if (name.isNotEmpty && !foundNames.contains(name)) {
+            foundNames.add(name);
+          }
+          if (name.toLowerCase().contains('draupnir') ||
+              r.advertisementData.serviceUuids.contains(Guid('6E400001-B5A3-F393-E0A9-E50E24DCCA9E'))) {
+            targetDevice = r.device;
+            FlutterBluePlus.stopScan();
+            break;
+          }
+        }
+      });
+
+      await FlutterBluePlus.startScan(
+        timeout: const Duration(seconds: 4),
+      );
+      
+      await subscription.cancel();
+      isScanningBle = false;
+      
+      if (targetDevice == null) {
+        final listStr = foundNames.isEmpty ? "None" : foundNames.take(5).join(", ");
+        throw Exception('No Draupnir device found. Nearby devices: $listStr. Ensure BLE/GPS is active.');
+      }
+      
+      await targetDevice!.connect(license: License.nonprofit);
+      connectedDevice = targetDevice;
+      isBluetooth = true;
+      
+      List<BluetoothService> services = await targetDevice!.discoverServices();
+      BluetoothService? uartService;
+      for (var s in services) {
+        if (s.uuid == Guid('6E400001-B5A3-F393-E0A9-E50E24DCCA9E')) {
+          uartService = s;
+          break;
+        }
+      }
+      
+      if (uartService == null) {
+        throw Exception('Nordic UART Service not found on device');
+      }
+      
+      for (var c in uartService.characteristics) {
+        if (c.uuid == Guid('6E400002-B5A3-F393-E0A9-E50E24DCCA9E')) {
+          rxChar = c;
+        } else if (c.uuid == Guid('6E400003-B5A3-F393-E0A9-E50E24DCCA9E')) {
+          txChar = c;
+        }
+      }
+      
+      if (rxChar == null || txChar == null) {
+        throw Exception('UART characteristics not found');
+      }
+      
+      await txChar!.setNotifyValue(true);
+      txChar!.onValueReceived.listen((value) {
+        _onBleDataReceived(value);
+      });
+      
+      connectedDevice!.connectionState.listen((state) {
+        if (state == BluetoothConnectionState.disconnected) {
+          isBluetooth = false;
+          connectedDevice = null;
+          rxChar = null;
+          txChar = null;
+          error = 'Bluetooth disconnected';
+          notifyListeners();
+        }
+      });
+      
+      await init();
+      await fetchProfiles();
+      
+    } catch (e) {
+      error = 'Bluetooth connection failed: $e';
+      isBluetooth = false;
+      if (connectedDevice != null) {
+        try {
+          await connectedDevice!.disconnect();
+        } catch (_) {}
+        connectedDevice = null;
+      }
+    } finally {
+      isScanningBle = false;
+      isLoading = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> disconnectBluetooth() async {
+    isBluetooth = false;
+    if (connectedDevice != null) {
+      try {
+        await connectedDevice!.disconnect();
+      } catch (_) {}
+      connectedDevice = null;
+    }
+    rxChar = null;
+    txChar = null;
+    profilesData = null;
+    notifyListeners();
+  }
+
   Future<void> connect(String ip) async {
     deviceIp = ip;
     await init();
@@ -95,18 +285,36 @@ class DraupnirState extends ChangeNotifier {
     notifyListeners();
 
     try {
-      final response = await http.get(Uri.parse('http://$deviceIp/api/profiles'), headers: _headers);
-      if (response.statusCode == 200) {
-        profilesData = jsonDecode(response.body);
-        needsPairing = false;
-      } else if (response.statusCode == 401 || response.statusCode == 403) {
-        needsPairing = true;
-        error = 'Pairing required. Swipe down on Draupnir to enter Config Mode and press Pair.';
+      if (isBluetooth) {
+        final response = await _sendBleRequest({
+          'cmd': 'get_profiles',
+          'token': authToken,
+        });
+        if (response['status'] == 'ok') {
+          profilesData = response['profiles'];
+          needsPairing = false;
+        } else if (response['message'] == 'Unauthorized') {
+          needsPairing = true;
+          error = 'Pairing required. Swipe down on Draupnir to enter Config Mode and press Pair.';
+        } else {
+          error = 'Failed to load profiles: ${response['message']}';
+        }
       } else {
-        error = 'Failed to load profiles (HTTP ${response.statusCode})';
+        final response = await http.get(Uri.parse('http://$deviceIp/api/profiles'), headers: _headers);
+        if (response.statusCode == 200) {
+          profilesData = jsonDecode(response.body);
+          needsPairing = false;
+        } else if (response.statusCode == 401 || response.statusCode == 403) {
+          needsPairing = true;
+          error = 'Pairing required. Swipe down on Draupnir to enter Config Mode and press Pair.';
+        } else {
+          error = 'Failed to load profiles (HTTP ${response.statusCode})';
+        }
       }
     } catch (e) {
-      error = 'Connection failed. Ensure Draupnir is on the same network.';
+      error = isBluetooth 
+        ? 'Bluetooth request failed: $e'
+        : 'Connection failed. Ensure Draupnir is on the same network.';
     }
 
     isLoading = false;
@@ -117,21 +325,36 @@ class DraupnirState extends ChangeNotifier {
     isPairing = true;
     notifyListeners();
     try {
-      final response = await http.post(Uri.parse('http://$deviceIp/api/pair'));
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        if (data['token'] != null) {
-          authToken = data['token'];
+      if (isBluetooth) {
+        final response = await _sendBleRequest({
+          'cmd': 'pair',
+        });
+        if (response['status'] == 'ok' && response['token'] != null) {
+          authToken = response['token'];
           final prefs = await SharedPreferences.getInstance();
           await prefs.setString('authToken', authToken!);
           needsPairing = false;
           await fetchProfiles();
+        } else {
+          error = 'Failed to pair. Make sure Draupnir is in Config Mode (swipe down).';
         }
       } else {
-        error = 'Failed to pair. Make sure Draupnir is in Config Mode (swipe down).';
+        final response = await http.post(Uri.parse('http://$deviceIp/api/pair'));
+        if (response.statusCode == 200) {
+          final data = jsonDecode(response.body);
+          if (data['token'] != null) {
+            authToken = data['token'];
+            final prefs = await SharedPreferences.getInstance();
+            await prefs.setString('authToken', authToken!);
+            needsPairing = false;
+            await fetchProfiles();
+          }
+        } else {
+          error = 'Failed to pair. Make sure Draupnir is in Config Mode (swipe down).';
+        }
       }
     } catch (e) {
-      error = 'Pairing connection failed.';
+      error = 'Pairing connection failed: $e';
     }
     isPairing = false;
     notifyListeners();
@@ -144,13 +367,24 @@ class DraupnirState extends ChangeNotifier {
     notifyListeners();
 
     try {
-      final response = await http.post(
-        Uri.parse('http://$deviceIp/api/profiles'),
-        headers: _headers,
-        body: jsonEncode(profilesData),
-      );
-      if (response.statusCode != 200) {
-        error = 'Failed to save profiles (HTTP ${response.statusCode})';
+      if (isBluetooth) {
+        final response = await _sendBleRequest({
+          'cmd': 'save_profiles',
+          'token': authToken,
+          'profiles': profilesData,
+        });
+        if (response['status'] != 'ok') {
+          error = 'Failed to save profiles: ${response['message']}';
+        }
+      } else {
+        final response = await http.post(
+          Uri.parse('http://$deviceIp/api/profiles'),
+          headers: _headers,
+          body: jsonEncode(profilesData),
+        );
+        if (response.statusCode != 200) {
+          error = 'Failed to save profiles (HTTP ${response.statusCode})';
+        }
       }
     } catch (e) {
       error = 'Failed to save profiles: $e';
@@ -162,14 +396,23 @@ class DraupnirState extends ChangeNotifier {
 
   Future<void> triggerMacro(int macroIdx) async {
     try {
-      await http.post(
-        Uri.parse('http://$deviceIp/api/trigger'),
-        headers: _headers,
-        body: jsonEncode({
+      if (isBluetooth) {
+        await _sendBleRequest({
+          'cmd': 'trigger',
+          'token': authToken,
           'profile': activeProfileIdx,
           'macro': macroIdx,
-        }),
-      );
+        });
+      } else {
+        await http.post(
+          Uri.parse('http://$deviceIp/api/trigger'),
+          headers: _headers,
+          body: jsonEncode({
+            'profile': activeProfileIdx,
+            'macro': macroIdx,
+          }),
+        );
+      }
     } catch (e) {
       debugPrint('Trigger failed: $e');
     }
