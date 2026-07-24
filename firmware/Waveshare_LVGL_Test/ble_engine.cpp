@@ -23,9 +23,29 @@ static const int BLE_CHUNK_PAYLOAD_SIZE = 100;
 // RX reassembly buffer for chunked incoming commands. Must be malloc()'d, not static/global --
 // on the M5Dial firmware a static array here silently broke BLE advertising (see
 // docs/BLE_Profile_Fetch_Debugging.md). Allocate once in ble_init() after BLEDevice::init().
-#define BLE_RX_BUFFER_SIZE 4096
+//
+// Sized for a realistic multi-profile save_profiles document, not a single profile: the
+// companion app emits an `icon_xbm` field per macro (an 18x18 1bpp bitmap as a 108-char hex
+// string, see companion_app/lib/utils/icon_generator.dart), which puts one fully-populated
+// 16-macro profile at roughly 3.5 KB before the save_profiles envelope -- i.e. essentially at
+// the old 4096 ceiling, with two profiles clearing it outright. 8192 gives ~2 such profiles of
+// headroom while costing only 4 KB more than the old value; it is allocated once in ble_init(),
+// before the LVGL draw buffers and the profile JsonDocument, when the heap is still
+// unfragmented. Free heap is logged either side of the allocation so the cost is visible in the
+// boot trace. Raising this further should be justified against that logged number, not guessed
+// -- neither board has PSRAM.
+#define BLE_RX_BUFFER_SIZE 8192
 static char *bleRxBuf = nullptr;
 static size_t bleRxLen = 0;
+// Set when a message exceeds BLE_RX_BUFFER_SIZE: the partial message is dropped and every
+// further byte is discarded up to and including the terminating '\n', so the tail of the
+// oversized command is never parsed as a bogus standalone command. Written from the BLE host
+// task (RxCallbacks::onWrite) only.
+static bool bleRxDiscarding = false;
+// Hand-off to loop(): the overflow error response must be sent from ble_update(), not from the
+// BLE callback (same rule as every other TX in this file). Set on the BLE host task, cleared on
+// the loop() task.
+static volatile bool bleRxOverflowPending = false;
 
 static BLEServer *pServer = nullptr;
 static BLECharacteristic *pTxCharacteristic = nullptr;
@@ -206,8 +226,19 @@ class RxCallbacks : public BLECharacteristicCallbacks {
     lastRxValue = rxValue;
 
     if (bleRxBuf == nullptr) return;
-    for (size_t i = 0; i < rxValue.length() && bleRxLen < BLE_RX_BUFFER_SIZE - 1; i++) {
+    for (size_t i = 0; i < rxValue.length(); i++) {
       char c = rxValue[i];
+
+      // Tail of an oversized message: drop everything up to and including its terminator.
+      // Without this the remainder would be reassembled and parsed as its own command.
+      if (bleRxDiscarding) {
+        if (c == '\n') {
+          bleRxDiscarding = false;
+          Serial.println("[ble] RX overflow: oversized message fully discarded, channel ready");
+        }
+        continue;
+      }
+
       if (c == '\n') {
         bleRxBuf[bleRxLen] = '\0';
         char *cmdCopy = strdup(bleRxBuf);
@@ -216,6 +247,17 @@ class RxCallbacks : public BLECharacteristicCallbacks {
           if (xQueueSend(bleRxQueue, &cmdCopy, 0) != pdTRUE) free(cmdCopy);
         }
       } else {
+        // The old loop simply stopped consuming at the ceiling, which also swallowed the '\n'
+        // that would have reset bleRxLen -- nothing else ever reset it, so every subsequent
+        // command was silently dropped until reboot. Reset and enter discard mode instead.
+        if (bleRxLen >= BLE_RX_BUFFER_SIZE - 1) {
+          Serial.printf("[ble] RX overflow: message exceeded %u bytes, discarding\n",
+                        (unsigned)(BLE_RX_BUFFER_SIZE - 1));
+          bleRxLen = 0;
+          bleRxDiscarding = true;
+          bleRxOverflowPending = true; // ble_update() sends the error from the loop() task
+          continue;
+        }
         bleRxBuf[bleRxLen++] = c;
       }
     }
@@ -274,9 +316,15 @@ void ble_init() {
   bleAckQueue = xQueueCreate(1, sizeof(uint8_t));
 
   BLEDevice::init("Draupnir");
+  uint32_t heapBefore = ESP.getFreeHeap();
   bleRxBuf = (char *)malloc(BLE_RX_BUFFER_SIZE);
   if (bleRxBuf == nullptr) {
-    Serial.println("[ble] FATAL: failed to allocate RX buffer");
+    Serial.printf("[ble] FATAL: failed to allocate %u byte RX buffer (free heap=%u, largest block=%u)\n",
+                  (unsigned)BLE_RX_BUFFER_SIZE, (unsigned)heapBefore,
+                  (unsigned)ESP.getMaxAllocHeap());
+  } else {
+    Serial.printf("[ble] RX buffer allocated: %u bytes, heap %u -> %u\n",
+                  (unsigned)BLE_RX_BUFFER_SIZE, (unsigned)heapBefore, (unsigned)ESP.getFreeHeap());
   }
   BLEDevice::setMTU(512);
 
@@ -327,6 +375,15 @@ void ble_init() {
 }
 
 void ble_update() {
+  // Report an RX overflow from here rather than from the callback that detected it -- every TX
+  // in this file goes out on the loop() task. Reported as soon as the overflow is seen (not
+  // when the oversized message finally terminates) so the app fails fast instead of waiting out
+  // its 30s response timeout.
+  if (bleRxOverflowPending) {
+    bleRxOverflowPending = false;
+    sendBleMessage("{\"status\":\"error\",\"message\":\"Command too large\"}");
+  }
+
   char *cmdStr;
   if (bleRxQueue != nullptr && xQueueReceive(bleRxQueue, &cmdStr, 0) == pdTRUE) {
     handleBleCommand(cmdStr); // zero-copy parse; cmdStr must outlive the call
