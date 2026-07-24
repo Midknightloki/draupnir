@@ -226,7 +226,10 @@ static void update_pairing_overlay(void) {
   static bool wasPairing = false;
   bool isPairing = ble_pairing_active();
   if (isPairing == wasPairing) return;
-  wasPairing = isPairing;
+  // Acquire the lock BEFORE committing wasPairing. Committing first meant a single 100ms lock
+  // timeout consumed the transition permanently -- the overlay then never appeared, the passkey
+  // was never displayed, and pairing became impossible. Leaving wasPairing alone on lock failure
+  // means the next loop() tick simply retries.
   if (!lvgl_lock(100)) return;
   if (isPairing) {
     char buf[48];
@@ -237,6 +240,7 @@ static void update_pairing_overlay(void) {
     lv_obj_add_flag(pairing_overlay, LV_OBJ_FLAG_HIDDEN);
   }
   lvgl_unlock();
+  wasPairing = isPairing; // only now has the transition actually been applied to the UI
 }
 
 // Polled from loop() -- a save_profiles command (handled entirely on the Bluedroid/NimBLE host
