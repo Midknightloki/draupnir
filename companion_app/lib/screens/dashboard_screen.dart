@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:google_fonts/google_fonts.dart';
 
@@ -37,31 +38,69 @@ class _DashboardScreenState extends State<DashboardScreen> {
           style: GoogleFonts.orbitron(fontWeight: FontWeight.bold),
         ),
         actions: [
-          if (state.profilesData != null) ...[
-            if (state.isBluetooth)
-              IconButton(
-                icon: const Icon(Icons.bluetooth_connected, color: Colors.blue),
-                tooltip: 'Connected via BLE. Tap to disconnect.',
-                onPressed: () => state.disconnectBluetooth(),
+          if (state.profilesData != null && state.isBluetooth)
+            IconButton(
+              icon: const Icon(Icons.bluetooth_connected, color: Colors.blue),
+              tooltip: 'Connected via BLE. Tap to disconnect.',
+              onPressed: () => state.disconnectBluetooth(),
+            ),
+          PopupMenuButton<String>(
+            icon: Badge(
+              isLabelVisible: state.debugLog.isNotEmpty,
+              label: Text('${state.debugLog.length}'),
+              child: const Icon(Icons.more_vert),
+            ),
+            onSelected: (val) {
+              switch (val) {
+                case 'refresh':
+                  state.fetchProfiles();
+                  break;
+                case 'settings':
+                  _showSettingsDialog(state);
+                  break;
+                case 'debug':
+                  _showDebugLog(state);
+                  break;
+              }
+            },
+            itemBuilder: (context) => [
+              if (state.profilesData != null)
+                const PopupMenuItem(
+                  value: 'refresh',
+                  child: ListTile(leading: Icon(Icons.refresh), title: Text('Refresh Profiles')),
+                ),
+              const PopupMenuItem(
+                value: 'settings',
+                child: ListTile(leading: Icon(Icons.settings), title: Text('Device Settings')),
               ),
-            _buildProfileSwitcher(state),
-            const SizedBox(width: 16),
-            _buildModeToggle(state),
-            const SizedBox(width: 16),
-            IconButton(
-              icon: const Icon(Icons.refresh),
-              onPressed: () => state.fetchProfiles(),
-            ),
-            IconButton(
-              icon: const Icon(Icons.settings),
-              onPressed: () => _showSettingsDialog(state),
-            ),
-          ],
-          const SizedBox(width: 16),
+              PopupMenuItem(
+                value: 'debug',
+                child: ListTile(
+                  leading: const Icon(Icons.bug_report_outlined),
+                  title: Text('Debug Log (${state.debugLog.length})'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(width: 8),
         ],
       ),
+      floatingActionButton: state.profilesData != null
+          ? FloatingActionButton.extended(
+              onPressed: () => state.toggleEditorMode(),
+              backgroundColor: state.isEditorMode ? AppTheme.surfaceHighlight : AppTheme.accent,
+              foregroundColor: state.isEditorMode ? Colors.white : Colors.black,
+              icon: Icon(state.isEditorMode ? Icons.edit : Icons.play_arrow),
+              label: Text(
+                state.isEditorMode ? 'EDIT MODE' : 'RUN MODE',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+            )
+          : null,
       body: Column(
         children: [
+          if (state.profilesData != null)
+            SizedBox(height: 48, child: _buildProfileTabs(state)),
           if (state.profilesData == null && !state.isLoading) _buildConnectionBar(state),
           if (state.isLoading)
             const Expanded(child: Center(child: CircularProgressIndicator()))
@@ -126,46 +165,55 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
-  Widget _buildProfileSwitcher(DraupnirState state) {
+  Widget _buildProfileTabs(DraupnirState state) {
     final profiles = state.profilesData!['profiles'] as List;
-    return Row(
-      children: [
-        DropdownButton<int>(
-          value: state.activeProfileIdx,
-          dropdownColor: AppTheme.surfaceHighlight,
-          underline: const SizedBox(),
-          items: List.generate(profiles.length, (idx) {
-            Color profColor = AppTheme.accent;
-            if (profiles[idx]['color'] != null) {
-              try {
-                String hex = profiles[idx]['color'].toString().replaceAll('#', '');
-                profColor = Color(int.parse('FF$hex', radix: 16));
-              } catch (_) {}
-            }
-            return DropdownMenuItem(
-              value: idx,
-              child: Text(
-                profiles[idx]['name'] ?? 'Profile $idx',
-                style: GoogleFonts.orbitron(color: profColor, fontWeight: FontWeight.bold),
-              ),
-            );
-          }),
-          onChanged: (val) {
-            if (val != null) {
-              state.setActiveProfile(val);
-              setState(() => _editingKeyIdx = null);
-            }
-          },
-        ),
-        IconButton(
-          icon: const Icon(Icons.edit, color: Colors.grey),
-          onPressed: () => _showEditProfileDialog(state),
-        ),
-        IconButton(
-          icon: const Icon(Icons.add_circle_outline, color: AppTheme.accent),
-          onPressed: () => _showAddProfileDialog(state),
-        ),
-      ],
+    return ColoredBox(
+      color: AppTheme.surface,
+      child: Row(
+        children: [
+          Expanded(
+            child: ListView.builder(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              itemCount: profiles.length,
+              itemBuilder: (context, idx) {
+                Color profColor = AppTheme.accent;
+                if (profiles[idx]['color'] != null) {
+                  try {
+                    String hex = profiles[idx]['color'].toString().replaceAll('#', '');
+                    profColor = Color(int.parse('FF$hex', radix: 16));
+                  } catch (_) {}
+                }
+                final selected = state.activeProfileIdx == idx;
+                return Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+                  child: ChoiceChip(
+                    label: Text(
+                      profiles[idx]['name'] ?? 'Profile $idx',
+                      style: GoogleFonts.orbitron(
+                        fontWeight: FontWeight.bold,
+                        color: selected ? Colors.black : profColor,
+                      ),
+                    ),
+                    selected: selected,
+                    selectedColor: profColor,
+                    backgroundColor: AppTheme.surfaceHighlight,
+                    onSelected: (_) {
+                      state.setActiveProfile(idx);
+                      setState(() => _editingKeyIdx = null);
+                    },
+                  ),
+                );
+              },
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.add_circle_outline, color: AppTheme.accent, size: 20),
+            tooltip: 'New profile',
+            onPressed: () => _showAddProfileDialog(state),
+          ),
+        ],
+      ),
     );
   }
 
@@ -351,49 +399,52 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
-  Widget _buildModeToggle(DraupnirState state) {
-    return Container(
-      decoration: BoxDecoration(
-        color: AppTheme.surfaceHighlight,
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Row(
-        children: [
-          InkWell(
-            onTap: state.isEditorMode ? () => state.toggleEditorMode() : null,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              decoration: BoxDecoration(
-                color: !state.isEditorMode ? AppTheme.accent : Colors.transparent,
-                borderRadius: const BorderRadius.horizontal(left: Radius.circular(8)),
-              ),
-              child: Text(
-                'RUN MODE',
-                style: TextStyle(
-                  color: !state.isEditorMode ? Colors.black : Colors.white,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
+  void _showDebugLog(DraupnirState state) {
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          return AlertDialog(
+            title: const Text('BLE Debug Log'),
+            content: SizedBox(
+              width: double.maxFinite,
+              height: 400,
+              child: state.debugLog.isEmpty
+                  ? const Center(child: Text('No log entries yet.\nConnect via Bluetooth to see events.', textAlign: TextAlign.center))
+                  : ListView.builder(
+                      itemCount: state.debugLog.length,
+                      itemBuilder: (ctx, i) {
+                        final line = state.debugLog[i];
+                        Color color = Colors.white70;
+                        if (line.contains('[ERR]')) color = Colors.red;
+                        else if (line.contains('[RX]')) color = Colors.greenAccent;
+                        else if (line.contains('[TX]')) color = Colors.cyanAccent;
+                        else if (line.contains('[CONN]') || line.contains('[MTU]')) color = Colors.blueAccent;
+                        return Text(line, style: TextStyle(fontFamily: 'monospace', fontSize: 11, color: color));
+                      },
+                    ),
             ),
-          ),
-          InkWell(
-            onTap: !state.isEditorMode ? () => state.toggleEditorMode() : null,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              decoration: BoxDecoration(
-                color: state.isEditorMode ? AppTheme.accent : Colors.transparent,
-                borderRadius: const BorderRadius.horizontal(right: Radius.circular(8)),
+            actions: [
+              TextButton(
+                onPressed: () { state.clearDebugLog(); setDialogState(() {}); },
+                child: const Text('CLEAR'),
               ),
-              child: Text(
-                'EDIT MODE',
-                style: TextStyle(
-                  color: state.isEditorMode ? Colors.black : Colors.white,
-                  fontWeight: FontWeight.bold,
-                ),
+              TextButton(
+                onPressed: () async {
+                  final text = state.debugLog.join('\n');
+                  await Clipboard.setData(ClipboardData(text: text));
+                  if (ctx.mounted) {
+                    ScaffoldMessenger.of(ctx).showSnackBar(
+                      const SnackBar(content: Text('Debug log copied to clipboard'), duration: Duration(seconds: 2)),
+                    );
+                  }
+                },
+                child: const Text('COPY'),
               ),
-            ),
-          ),
-        ],
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('CLOSE')),
+            ],
+          );
+        },
       ),
     );
   }
@@ -505,12 +556,21 @@ class _DashboardScreenState extends State<DashboardScreen> {
         children: [
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            crossAxisAlignment: CrossAxisAlignment.baseline,
-            textBaseline: TextBaseline.alphabetic,
             children: [
-              Text(
-                profileName,
-                style: GoogleFonts.orbitron(fontSize: 24, fontWeight: FontWeight.bold, color: profileColor),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  Text(
+                    profileName,
+                    style: GoogleFonts.orbitron(fontSize: 24, fontWeight: FontWeight.bold, color: profileColor),
+                  ),
+                  if (state.profilesData != null)
+                    IconButton(
+                      icon: const Icon(Icons.edit, color: Colors.grey, size: 20),
+                      tooltip: 'Edit current profile',
+                      onPressed: () => _showEditProfileDialog(state),
+                    ),
+                ],
               ),
               if (state.isEditorMode)
                 Text(
