@@ -91,30 +91,69 @@ void macros_stop_all() {
   }
 }
 
+// Rewrites /profiles.json with the built-in default and loads it into profilesDoc. Shared by
+// both recovery paths -- file missing, and file present but unparseable. Previously only the
+// missing-file case regenerated defaults; a parse error merely logged and returned, leaving
+// profilesDoc in whatever state a failed deserialize left it and no way back to a working config
+// short of a reflash. The unguarded "w" open in that old path was also a real bug: it called
+// file.print() on an invalid File and carried on regardless.
+static bool write_and_load_defaults(const char *reason) {
+  Serial.printf("[diag] profiles: falling back to built-in defaults (%s)\n", reason);
+
+  File out = LittleFS.open("/profiles.json", "w");
+  if (!out) {
+    Serial.println("[diag] profiles: FATAL failed to open profiles.json for writing defaults");
+    return false;
+  }
+  size_t expected = strlen(defaultProfilesJson);
+  size_t written = out.print(defaultProfilesJson);
+  out.close();
+  if (written != expected) {
+    Serial.printf("[diag] profiles: FATAL short write of defaults (%u of %u bytes)\n",
+                  (unsigned)written, (unsigned)expected);
+    return false;
+  }
+
+  DeserializationError err = deserializeJson(profilesDoc, defaultProfilesJson);
+  if (err) {
+    // Only reachable if defaultProfilesJson itself is malformed -- a build-time bug.
+    Serial.printf("[diag] profiles: FATAL built-in defaults failed to parse: %s\n", err.c_str());
+    return false;
+  }
+  return true;
+}
+
 void profiles_reload() {
   // Deliberately here rather than at the call sites, so no future caller can forget it.
   macros_stop_all();
 
+  bool loaded = false;
   File file = LittleFS.open("/profiles.json", "r");
   if (!file) {
-    Serial.println("Failed to open profiles.json, creating default");
-    file = LittleFS.open("/profiles.json", "w");
-    file.print(defaultProfilesJson);
+    loaded = write_and_load_defaults("profiles.json could not be opened");
+  } else {
+    Serial.printf("[diag] profiles_reload: opened profiles.json, size=%u\n", (unsigned)file.size());
+    DeserializationError error = deserializeJson(profilesDoc, file);
     file.close();
-    file = LittleFS.open("/profiles.json", "r");
+    Serial.printf("[diag] profiles_reload: deserializeJson done, err=%s heap=%u\n", error.c_str(), ESP.getFreeHeap());
+    if (error) {
+      Serial.printf("Failed to parse profiles.json (%s) -- config is corrupt, restoring defaults\n", error.c_str());
+      loaded = write_and_load_defaults("profiles.json failed to parse");
+    } else {
+      loaded = true;
+      Serial.println("Loaded profiles.json");
+    }
   }
-  Serial.printf("[diag] profiles_reload: opened profiles.json, size=%u\n", (unsigned)file.size());
 
-  DeserializationError error = deserializeJson(profilesDoc, file);
-  file.close();
-  Serial.printf("[diag] profiles_reload: deserializeJson done, err=%s heap=%u\n", error.c_str(), ESP.getFreeHeap());
-
-  if (error) {
-    Serial.println("Failed to parse profiles.json");
+  if (!loaded) {
+    // Nothing usable in flash and defaults could not be written/parsed either. Leave profilesDoc
+    // empty rather than pretending: the ring renders "(no macros)" instead of crashing.
+    profilesDoc.clear();
+    activeProfileIdx = 0;
+    Serial.println("[diag] profiles_reload: no usable profiles loaded");
     return;
   }
 
-  Serial.println("Loaded profiles.json");
   activeProfileIdx = prefs.getInt("activeProfile", 0);
   JsonArray profiles = profilesDoc["profiles"];
   Serial.printf("[diag] profiles_reload: activeProfileIdx=%d numProfiles=%u\n", activeProfileIdx, profiles.isNull() ? 0 : profiles.size());

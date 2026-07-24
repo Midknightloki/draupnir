@@ -182,13 +182,60 @@ static void handleBleCommand(char *cmdStr) {
       sendBleMessage("{\"status\":\"error\",\"message\":\"No profiles object provided\"}");
       return;
     }
-    File f = LittleFS.open("/profiles.json", "w");
+    // Write-temp-then-rename. Opening /profiles.json with "w" directly truncated the only good
+    // copy before a single byte of the new one was written, and the serializeJson() byte count
+    // was never checked -- a power loss, a full filesystem, or a short write left a truncated,
+    // unparseable config with no way back short of a reflash. Nothing here touches
+    // /profiles.json until the temp file has been written, closed, and verified on disk.
+    static const char *PROFILES_PATH = "/profiles.json";
+    static const char *PROFILES_TMP_PATH = "/profiles.json.tmp";
+
+    LittleFS.remove(PROFILES_TMP_PATH); // clear any leftover from a previous failed save
+    File f = LittleFS.open(PROFILES_TMP_PATH, "w");
     if (!f) {
+      sendBleMessage("{\"status\":\"error\",\"message\":\"Failed to open temp file\"}");
+      return;
+    }
+    size_t expected = measureJson(profilesObj);
+    size_t written = serializeJson(profilesObj, f);
+    f.close();
+
+    // Re-open to confirm close() actually flushed the full document to flash, rather than
+    // trusting the writer's own byte count.
+    size_t onDisk = 0;
+    File verify = LittleFS.open(PROFILES_TMP_PATH, "r");
+    if (verify) {
+      onDisk = verify.size();
+      verify.close();
+    }
+
+    if (expected == 0 || written != expected || onDisk != expected) {
+      Serial.printf("[ble] save_profiles: write failed (expected=%u written=%u onDisk=%u)\n",
+                    (unsigned)expected, (unsigned)written, (unsigned)onDisk);
+      LittleFS.remove(PROFILES_TMP_PATH);
+      // The original /profiles.json is untouched, so do NOT reload -- the in-memory document
+      // still matches what is on flash.
       sendBleMessage("{\"status\":\"error\",\"message\":\"Failed to write file\"}");
       return;
     }
-    serializeJson(profilesObj, f);
-    f.close();
+
+    if (!LittleFS.rename(PROFILES_TMP_PATH, PROFILES_PATH)) {
+      // Some LittleFS/VFS builds refuse to rename onto an existing file. Only now, with a
+      // verified-good temp file in hand, is it safe to drop the original.
+      LittleFS.remove(PROFILES_PATH);
+      if (!LittleFS.rename(PROFILES_TMP_PATH, PROFILES_PATH)) {
+        Serial.println("[ble] save_profiles: rename into place failed");
+        LittleFS.remove(PROFILES_TMP_PATH);
+        // profiles_reload() here would find no file and regenerate defaults, which is the
+        // correct recovery for a device that now has no config -- but it is still a failure.
+        profiles_reload();
+        profilesDirty = true;
+        sendBleMessage("{\"status\":\"error\",\"message\":\"Failed to commit file\"}");
+        return;
+      }
+    }
+
+    Serial.printf("[ble] save_profiles: committed %u bytes\n", (unsigned)onDisk);
     profiles_reload();
     profilesDirty = true; // .ino's loop() rebuilds the ring UI from this on its next tick
     Serial.println("[ble] save_profiles: written and reloaded");
