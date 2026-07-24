@@ -1,5 +1,14 @@
 ## UI/UX findings for P1 implementation
 
+> **Status:** all three are still open, and are tracked in `docs/Draupnir_Spec.md` §10 as
+> **M9** (detent alignment + icons) and **M8** (profile switching).
+>
+> **Context note:** these were observed on the **M5Dial**. Finding 1's 4-counts-per-detent ratio
+> is board-specific — verify the Waveshare `bidi_switch_knob` ratio separately rather than
+> assuming the same fix applies. Finding 2's "16 circles" suggestion predates the move to
+> dynamic wedges (one per macro, no fixed 16); the *icon + color* requirement stands, the fixed
+> 16-slot layout does not.
+
 1. Encoder resolution mismatch- the encoder is reading 4 positions inbetween each  detent which makes it dificult to make  accurate selections because you are fighting the detents.
    * example:Detent positions vs displayed positions
      * Detent 0 = display position 3

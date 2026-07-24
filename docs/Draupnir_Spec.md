@@ -1,184 +1,250 @@
-# Project Draupnir — Dial + NeoTrellis Macro Controller
+# Project Draupnir — Smart-Knob HID Macro Controller
 
-**A two-puck, self-contained HID macro controller: a rotary-knob brain + a 16-key RGB pad.**
+**A self-contained USB-HID macro controller built around a round touch screen and a rotary encoder.**
 
-*A FORGE project spec · L0k1.Net · v2, drafted 2026-06-27*
+*A FORGE project spec · L0k1.Net · v3, drafted 2026-07-24*
 
-> Codename note: *Draupnir* is the golden ring the dwarf Eitri forged that drips eight new rings every ninth night. A round controller that multiplies your macros felt apt. Rename at will.
+> Codename note: *Draupnir* is the golden ring the dwarf Eitri forged that drips eight new rings every ninth night. A round controller that multiplies your macros felt apt.
 
-> **v2 change:** the key bank is now an Adafruit **NeoTrellis** 4x4 (16 buttons, per-key RGB, I2C) in its own acrylic enclosure, cabled to the M5Dial. This gives full random-access to 16 macros, a color-coded legend that mirrors the dial's 16 detents, and zero fabrication — both pucks come enclosed.
+---
+
+## Changelog — what v3 changes and why
+
+v2 specified two pucks (M5Dial + NeoTrellis 4x4) configured from a browser over Wi-Fi. Field
+testing changed three things:
+
+| Change | Reason |
+|---|---|
+| **Knob is the whole device.** The 16-key pad drops from *core* to *optional add-on*. | The encoder is more tactile than expected and the ring UI gives good random access on its own. The keys solve a problem the knob turned out not to have. |
+| **The Wi-Fi web config UI is cut entirely — not deferred, not implemented.** | The Companion App does the job better, and it makes the on-device HTTP server, captive portal, and Wi-Fi credential flow pure liability. |
+| **Standard BLE pairing with a displayed PIN replaces the bespoke token scheme.** | The hand-rolled `pairingToken` in NVS reimplemented, badly, what BLE bonding already does correctly. Passkey display + bond is the supported path. |
+| **Waveshare knob becomes the primary board; M5Dial stays supported.** | The Waveshare 360x360 build is what's proven on hardware now. The M5Dial firmware still works and stays a maintained second target. |
+| **Macro count per profile is no longer capped at 16.** | `pos` was a physical grid slot when there were 16 physical keys. Without them it becomes a stable identifier and ring-order key. |
+
+Everything below is v3 and supersedes v2. The two-puck design is preserved as **Appendix B** —
+it is still the origin of the data model and still the path if the key pad returns.
 
 ---
 
 ## 0. North Star & roadmap
 
-**End goal:** a compact, distinctive **radial** macro controller — 16 hotswap mechanical keys with per-key NeoPixels arranged in a ring around the central encoder + round screen — polished enough to be a **sellable product.**
+**End goal:** a polished, standalone **smart-knob macro controller** — a round screen and a
+quality detented encoder in a compact desk puck, driverless over USB HID, configured from a
+phone. Distinctive because it is *complete at knob scale*: no key pad required.
 
-Why this is the target: the radial layout maps perfectly to the encoder's 16 detents (key angle = dial angle), it's visually unlike the sea of square macropads, and it's the natural home for everything the firmware already does. The market precedent for a solo-maker open macropad is real (duckyPad on Tindie; DeepDeck on Crowd Supply).
-
-**The phases share one firmware.** The `pos` 0-15 model, color legend, key/LED loop, HID engine, and profile system are identical across every phase. Only the physical key arrangement and wiring change. So earlier phases de-risk the expensive one.
+The 16-key ring is now an **optional expansion**, not the destination. That is a real
+simplification: one enclosure, one cable, no I2C peripheral, no per-key LED current budget.
 
 | Phase | Build | Purpose |
 |---|---|---|
-| **P1 — POC (now)** | M5Dial + NeoTrellis, two pucks cabled (this spec) | Prove firmware + interaction on cheap, enclosed, off-the-shelf parts. No fab. |
-| **P2 — Personal radial** | Custom KiCad PCB: 16 Kailh hotswap sockets + reverse-mount NeoPixels in a ring, center EC11, ESP32-S3 module, round screen in the hub. Laser-cut/printed enclosure. | One-off "real" device for myself; validate the radial form + manufacturing. |
+| **P1 — POC (now)** | Waveshare ESP32-S3 knob (primary) + M5Dial (second target) | Prove firmware + interaction on off-the-shelf enclosed parts. No fab. |
+| **P2 — Personal knob** | Custom PCB: ESP32-S3 module, round screen, quality detented encoder, machined/printed knob + enclosure | One-off "real" device; validate feel and manufacturing. |
 | **P3 — Product (stretch)** | Refined P2 + DFM, enclosure tooling, packaging, docs | Small-batch sellable unit. |
+| **Optional, any phase** | 16-key RGB pad as a companion puck / premium SKU | Only if a real workflow demands more than the ring gives. |
 
 **Design constraints to honor from P1 so P3 stays open:**
-- Build around a **pre-certified ESP32-S3 module** (e.g. StampS3 / ESP32-S3-WROOM) so radio FCC/CE modular approval is largely inherited — turns certification from a blocker into a checkbox.
-- Keep **firmware + hardware open source** (duckyPad playbook) — values fit *and* community/marketing flywheel.
-- Likely go-to-market lanes: **Tindie** (sell-as-you-fab) and/or **Crowd Supply** (crowdfund + fulfillment).
-- Keep the macro data model and config UI hardware-agnostic so a buyer's profiles survive form-factor changes.
-
-> P2/P3 are explicitly out of scope until P1 proves the concept. Everything below is P1 unless noted.
+- Build around a **pre-certified ESP32-S3 module** so radio FCC/CE modular approval is largely
+  inherited — turns certification from a blocker into a checkbox.
+- Keep **firmware + hardware open source** (duckyPad playbook) — values fit *and* community flywheel.
+- Likely lanes: **Tindie** (sell-as-you-fab) and/or **Crowd Supply**.
+- Keep the macro data model and Companion App **hardware-agnostic** so profiles survive
+  form-factor changes — and so the two P1 boards, which differ in screen size and driver stack,
+  share one schema and one app.
 
 ---
 
 ## 1. Concept
 
-Two pucks that cable together:
+One puck. A round touch screen with a detented rotary encoder around/behind it.
 
-- **Dial puck — M5Stack Dial:** the brain. ESP32-S3, 1.28" round touch screen, and the rotary encoder (16 detents). Runs the firmware, holds the macros, and is the USB HID device.
-- **Key puck — Adafruit NeoTrellis 4x4:** 16 elastomer buttons, each with its own RGB NeoPixel, all over I2C. No brain of its own — it's a peripheral the Dial reads and lights.
+The screen renders the active profile's macros as a **ring of colored wedges** — one wedge per
+macro, sized to fill the ring, so four macros means four fat wedges rather than four slivers and
+twelve empty slots. Rotating the encoder moves the selection wedge by wedge; the center of the
+screen names the selected macro.
 
-The unifying idea: **dial position N = key N = color N = icon N.** The encoder's 16 detents map 1:1 to the 16 keys. Every key is lit in its macro's assigned color as a always-on legend; the round screen shows the selected macro's icon/name. You can rotate to highlight and press the knob, **or** just hit the physical key directly — full random access. Turn past the set or swipe to change profiles, and all 16 keys plus the screen re-legend with the new colors.
+**Three ways to fire a macro:**
+- **Rotate to it, tap the center** — the knob-native path.
+- **Tap its wedge directly** — random access, no scrolling.
+- **Trigger it from the Companion App** — for testing and remote use.
 
-It runs as a standard USB HID device — no host software at runtime. Macros live in the Dial's flash; configuration is a browser over the Dial's own Wi-Fi.
+It runs as a standard USB HID device — no host software at runtime. Macros live in the device's
+flash. Configuration is a **BLE Companion App**.
 
 ### What it is
-A desk macro controller with a color-coded 16-key pad and a screen+knob brain, fully enclosed, no 3D printing.
+A desk macro knob: screen + encoder + touch, fully enclosed, driverless, no 3D printing required.
 
 ### What it is not (v1 non-goals)
 - Not a duckyScript interpreter (sequences + delays, no loops/variables on-device).
-- No microSD (the M5Dial has none) — profiles live in internal flash.
-- NeoTrellis buttons are soft silicone, not mechanical/hotswap (see §11 for the hotswap path).
+- **No web UI, no on-device HTTP server, no Wi-Fi provisioning.** Cut, permanently.
+- **No bespoke pairing tokens.** BLE bonding is the security boundary.
+- No microSD — profiles live in internal flash.
+- No physical key pad in the base device.
 
 ---
 
 ## 2. Goals & success criteria
 
 1. Plug-and-play **USB HID** keyboard/mouse/media device — works at boot, no drivers.
-2. **16 physical keys = instant random access** to the active profile's macros.
-3. **Color-coded legend:** each key lit in its macro's color; screen shows the selected macro's icon/name; dial detent aligns with key.
-4. **Multiple profiles**, each up to 16 macros, persisted in onboard flash; switching re-legends keys + screen.
+2. **Ring UI gives random access** to every macro in the active profile: rotate-and-fire, or tap
+   a wedge directly.
+3. **Color legend:** each wedge drawn in its macro's color; the selected macro is highlighted and
+   named in the center; **its icon renders on the wedge.**
+4. **Multiple profiles**, each holding a variable number of macros, persisted in onboard flash;
+   switching profiles re-legends the ring. Profile switching is reachable **on-device**, not only
+   from the app.
 5. Macros support **key combos, typed text, media/consumer keys, basic mouse, and inter-step delays.**
-6. Configurable via a dedicated **mobile Companion App** connected over the Dial's Wi-Fi — providing a rich, responsive interface.
-7. Survives power cycles; boots into the last-used profile with the right colors.
+6. Configurable over **BLE from the Companion App**, secured by **standard BLE pairing with a
+   passkey displayed on the device screen**.
+7. **Survives power cycles:** boots into the last-used profile, at the saved brightness, with the
+   right colors.
+8. **Stays trustworthy:** a malformed or interrupted config write never bricks the device, and an
+   unpaired BLE central cannot read or modify profiles or inject keystrokes.
 
-**Done when:** I configure a profile in the browser, unplug/replug, see the 16 keys light in their colors, press a key, and the keystrokes land in the focused app — config page closed.
+**Done when:** I configure a profile in the app, unplug/replug, see the ring light in its colors
+with the right profile selected, tap a wedge, and the keystrokes land in the focused app — with
+the phone nowhere nearby.
 
 ---
 
 ## 3. Hardware
 
-### Dial puck — M5Stack Dial v1.1
+### Primary target — Waveshare ESP32-S3 knob (1.8" round AMOLED)
+
+Values below are taken from the working firmware in `firmware/Waveshare_LVGL_Test/`; that code
+is the authority if a datasheet disagrees.
+
 | Item | Detail |
 |---|---|
-| Controller | M5StampS3 — ESP32-S3FN8, dual-core LX7 @240MHz, native USB (OTG/CDC) |
-| Flash | 8 MB (no PSRAM, no SD) |
+| Controller | ESP32-S3, native USB (OTG/CDC) |
+| Display | 1.8" round AMOLED, **360x360**, **SH8601** over **QSPI**, 16 bpp |
+| LCD pins | CS 14, PCLK 13, D0-D3 15/16/17/18, RST 21, backlight 47 (LEDC PWM) |
+| Touch | **CST816**, I2C addr **0x15**, SDA 11 / SCL 12 |
+| Encoder | Rotary, A = **GPIO 8**, B = **GPIO 7** |
+| Encoder button | **Not wired in firmware** — `knob_config_t` exposes A/B only. Confirm whether the hardware has a push action before relying on it. |
+| Memory | LVGL draw buffers are allocated `MALLOC_CAP_DMA` from internal RAM; **no PSRAM is used**. Treat heap as tight. |
+| UI stack | LVGL + `esp_lcd_sh8601` |
+
+### Second target — M5Stack Dial v1.1
+
+| Item | Detail |
+|---|---|
+| Controller | M5StampS3 — ESP32-S3FN8, native USB |
+| Flash | 8 MB (**no PSRAM, no SD**) |
 | Display | 1.28" round IPS, GC9A01, 240x240, FT3267 touch |
-| Input | Rotary encoder (16 detents / 64 PPR) + front/knob button |
-| Extras | Buzzer, RTC, Wi-Fi 2.4 GHz |
-| Power | USB-C 5V (also JST LiPo / 6-36V terminal); HOLD latch G46 |
-| Ports | PORT.A (Grove, I2C, G13/G15) <- used for NeoTrellis; PORT.B (Grove, GPIO, G2/G1) free |
-| Enclosure | Finished case, 51x51x32 mm |
+| Input | Rotary encoder (16 detents / 64 PPR) + knob button |
+| Extras | Buzzer, RTC; PORT.A (Grove I2C, G13/G15), PORT.B (GPIO, G2/G1) |
+| Download mode | Hold **G0** on the back Stamp, plug USB-C, release |
 
-### Key puck — Adafruit NeoTrellis (PCB 3954)
-| Item | Detail |
-|---|---|
-| Buttons | 4x4 = 16, elastomer silicone pad (**bought separately** — PCB 3954 has no buttons) |
-| LEDs | 16x WS2812 NeoPixel, one under each key |
-| Brain | seesaw (ATtiny-class) — keypad scan + LED drive over I2C |
-| Interface | I2C, 7-bit address 0x2E-0x4D (solder-jumper selectable); default 0x2E |
-| Connector | STEMMA (JST-PH 4-pin) — **not** Grove and **not** STEMMA QT |
-| Size | 60 x 60 x 7.5 mm; acrylic enclosure available |
-| Libraries | Adafruit Seesaw / NeoTrellis (Arduino + CircuitPython) |
+### Supporting two boards without forking the product
 
-### Connecting the two
-- M5Dial **PORT.A** (Grove HY2.0 I2C) -> **Grove-to-STEMMA (JST-PH) adapter cable** -> NeoTrellis.
-- Grove supplies **5V**, which the NeoPixels prefer for brightness; the Dial's 3.3V I2C logic is fine with the seesaw.
-- NeoTrellis default address 0x2E; no conflict with the Dial's onboard I2C devices, but confirm on first scan.
-- PORT.B stays free for a future second encoder or Grove keys (§12).
+Both targets must share the schema, the BLE protocol, the macro engine, and the Companion App.
+Only the display/input/driver layer differs. Concretely, the boundary is:
+
+- **Shared, board-agnostic:** macro engine, profile store, BLE command handling, action types.
+  These are already factored out on the Waveshare side (`macro_engine.*`, `ble_engine.*`) and
+  that factoring is the model — the M5Dial sketch should converge on it rather than the reverse.
+- **Per-board:** screen driver + resolution, touch driver, encoder wiring, UI geometry
+  (240x240 vs 360x360), and any board-specific peripherals.
+
+Screen geometry must be derived from the resolution constants, never hardcoded, so the same ring
+UI renders on both. A change to the macro engine that requires touching both sketches separately
+is a sign the boundary has leaked.
+
+### Optional expansion — 16-key RGB pad
+
+Not part of the base device. If revisited: Adafruit NeoTrellis 4x4 (seesaw, I2C 0x2E, STEMMA
+JST-PH — needs a Grove adapter on the M5Dial) or 4x NeoKey 1x4 for hotswap mechanical. The data
+model already accommodates it — see §6 on `pos`.
 
 ---
 
 ## 4. Interaction model
 
-**Run mode (the color-coded macro grid):**
-- **All 16 keys lit** in their macros' colors = persistent legend. Empty slots dim/off.
-- **Screen** shows the active profile name + the selected macro's big icon/name; optionally a 16-dot ring/grid mirroring the key colors.
-- **Press any NeoTrellis key** -> fire that macro immediately (random access). Key flashes + buzzer blip to confirm.
-- **Rotate dial** -> move the selection highlight across the 16 (detent-aligned); screen updates; selected key brightens/pulses.
-- **Press knob** -> fire the currently selected macro (alternative to touching the key).
-- **Touch swipe / long-press menu** -> switch profile or page; keys + screen re-legend with new colors.
-- **Optional dial-as-volume** per profile (turn = volume, key press still fires).
+**Run mode (the ring):**
+- **One wedge per macro**, sized `360 / count`, drawn in the macro's color with its icon.
+- **Center** shows the selected macro's name, with the profile name above it.
+- **Rotate** -> selection moves one wedge per detent; screen feedback must match tactile feedback
+  (see §13 — this has been a real defect).
+- **Tap a wedge** -> select it and fire it.
+- **Tap the center** -> fire the current selection without changing it.
+- **Tap outside the ring** (bezel) -> ignored.
+- **Switch profiles on-device** -> swipe left/right, with directional markers showing that other
+  profiles exist; no wrap-around at the ends.
+- **Pairing overlay** -> full-screen, shows the BLE passkey while pairing is in progress.
 
-This unifies the whole device: dial detent <-> screen icon <-> physical key <-> color, all pointing at the same macro.
+**Optional per profile:** dial-as-volume (turn = volume; tap still fires).
 
 ---
 
-## 5. Firmware architecture (Arduino + M5Unified)
+## 5. Firmware architecture (Arduino, ESP32-S3)
 
 ```
 +-----------------------------------------------+
-| App / state machine (run <-> menu <-> config) |
-+-------------+-------------+-------------+------+
-| UI layer    | Input layer | Key puck    | HID  |
-| LVGL round  | M5Dial:     | NeoTrellis  | Tiny |
-| screen +    | encoder,    | over I2C:   | USB  |
-| color ring  | button,     | read keys + | kbd/ |
-|             | touch       | drive 16 LED| mouse|
-+-------------+-------------+-------------+------+
+| App / state machine (run <-> pairing)         |
++---------------------+-------------------+-----+
+| UI layer            | Input layer       | HID |
+| LVGL ring, wedges,  | encoder, touch    | Tiny|
+| icons, overlays     |                   | USB |
++---------------------+-------------------+-----+
 | Macro engine (executes action sequences)      |
 +-----------------------------------------------+
 | Store: LittleFS (profiles.json) + NVS (state) |
 +-----------------------------------------------+
-| Config server: Wi-Fi AP + ESPAsyncWebServer   |
+| BLE GATT config transport (chunked + ack)     |
 +-----------------------------------------------+
 ```
 
+Note what is **absent** versus v2: no `ESPAsyncWebServer`, no `AsyncTCP`, no captive portal, no
+Wi-Fi stack. Removing it also removes the RAM and boot-time cost of bringing up Wi-Fi alongside
+BLE and USB on a board with no PSRAM.
+
 **Key libraries**
-- `M5Dial` / `M5Unified` — display, encoder, button, touch, buzzer.
-- `Adafruit_NeoTrellis` (+ `Adafruit_seesaw`) — read key events, set per-key NeoPixel colors over I2C.
-- `LVGL` (v8/v9) — round UI (or M5GFX directly if LVGL feels heavy at 240x240).
+- **Waveshare:** LVGL + `esp_lcd_sh8601` + CST816 driver + `bidi_switch_knob`.
+- **M5Dial:** `M5Dial` / `M5Unified` (M5GFX).
 - Arduino ESP32 USB: `USBHIDKeyboard`, `USBHIDMouse`, `USBHIDConsumerControl` (TinyUSB).
 - `LittleFS` (macro store) + `Preferences`/NVS (last profile, brightness).
-- `ESPAsyncWebServer` + `AsyncTCP` + `ArduinoJson` (config UI).
+- `ArduinoJson`; ESP32 BLE (NimBLE-backed on the current core).
+
+**Threading rules** — these are load-bearing and have already caused shipped bugs:
+- **HID interfaces register before `USB.begin()`.**
+- **The macro engine is loop()-task only.** UI callbacks (touch/encoder) run on the LVGL task and
+  must enqueue via `macros_request_fire()`, never call `macros_fire()` directly.
+- **LVGL objects are touched only under `lvgl_lock()`**, from loop() or the LVGL task.
+- **BLE callbacks run on the BLE host task** and must not touch LVGL or the macro engine
+  directly; they hand off through queues and flags drained in loop().
+- **A profile reload must stop all running macros first** — the macro engine holds `JsonObject`
+  references into the profile document, which reloading invalidates.
 
 **Main loop**
-1. `M5Dial.update()` -> encoder delta, knob button, touch.
-2. `trellis.read()` -> NeoTrellis key events.
-3. Apply input to UI state (selection / profile / mode).
-4. On any key press (physical or knob) -> `MacroEngine.run(macro)`.
-5. On profile change -> repaint screen + push 16 colors to NeoTrellis.
-6. Render screen only on change.
-
-**Modes**
-- **Run:** USB HID active, Wi-Fi off; NeoTrellis lit + scanning.
-- **Config:** swipe down -> Wi-Fi AP + web API up, HID idle; handles pairing and profile updates; exit reloads `profiles.json` and re-legends.
+1. Drain the fire queue and advance running macros.
+2. Drain the BLE command queue.
+3. Sync UI overlays (pairing) and rebuild the ring if profiles changed.
 
 ---
 
-## 6. Macro data model (sequences + delays)
+## 6. Macro data model
 
-`profiles.json` in LittleFS. Each macro now carries a `color` for its key LED and a grid position.
+`profiles.json` in LittleFS. **Variable macro count** — a profile holds as many macros as it has,
+and the ring divides itself accordingly.
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "activeProfile": 0,
-  "settings": { "brightness": 80, "ledBrightness": 60, "buzzer": true },
+  "settings": { "brightness": 160, "buzzer": true },
   "profiles": [
     {
       "name": "Editing",
+      "color": "#3080E0",
       "macros": [
-        { "pos": 0,  "name": "Build",   "icon": "hammer", "color": "#E0A030",
+        { "pos": 0, "name": "Build", "icon": "hammer", "color": "#E0A030",
+          "mode": "play_once",
           "actions": [ { "type": "key", "mods": ["CTRL","SHIFT"], "key": "B" } ] },
-        { "pos": 1,  "name": "Sign-off","icon": "text",   "color": "#3080E0",
+        { "pos": 1, "name": "Sign-off", "icon": "text", "color": "#3080E0",
+          "mode": "play_once",
           "actions": [ { "type": "text", "value": "- Eitri, FORGE Master\n" } ] },
-        { "pos": 2,  "name": "Mute",    "icon": "mic",    "color": "#E03030",
-          "actions": [ { "type": "consumer", "code": "MUTE" } ] },
-        { "pos": 3,  "name": "Shot+paste", "color": "#30C060",
+        { "pos": 2, "name": "Shot+paste", "icon": "camera", "color": "#30C060",
+          "mode": "play_once",
           "actions": [
             { "type": "key", "mods": ["WIN","SHIFT"], "key": "S" },
             { "type": "delay", "ms": 800 },
@@ -190,133 +256,233 @@ This unifies the whole device: dial detent <-> screen icon <-> physical key <-> 
 }
 ```
 
-`pos` = 0-15 grid index (maps to both the NeoTrellis key and the dial detent). `color` = key LED. Action types unchanged:
+### `pos` — now an identifier, not a slot
+
+In v2, `pos` was a physical grid index 0-15 that mapped to a NeoTrellis key. In v3 it is:
+
+- **a stable identifier** for a macro within its profile (what the app edits against), and
+- **the ring ordering key** — wedges are laid out in ascending `pos`.
+
+It is no longer capped at 15 and no longer implies a physical position. If the optional key pad
+ever returns, `pos` 0-15 maps to keys exactly as before — which is precisely why it stays rather
+than being replaced by an array index.
+
+**`version` bumps to 3.** The schema is a strict relaxation, so v3 firmware reads v2 files fine.
+The bump exists so *v2 firmware refuses a v3 file* rather than silently dropping every macro with
+`pos > 15`.
+
+### Action types
 
 | type | fields | notes |
 |---|---|---|
-| `key` | `mods[]`, `key` | modifier combo + key |
+| `key` | `mods[]`, `key` | modifier combo + key; `key` may be a character or a named special (`F5`, `ENTER`, `HOME`, …) |
 | `text` | `value` | typed string (US layout for v1) |
 | `delay` | `ms` | pause between steps |
-| `consumer` | `code` | VOL_UP/DOWN, MUTE, PLAY_PAUSE, NEXT, PREV |
-| `mouse_move` | `dx`,`dy` | relative move |
-| `mouse_click` | `button` | LEFT/RIGHT/MIDDLE |
+| `consumer` | `code` | `VOL_UP` / `VOL_DOWN` / `MUTE` / `PLAY_PAUSE` / `NEXT` / `PREV` |
+| `mouse` | `button`, `event` | `button`: `LEFT`/`RIGHT`/`MIDDLE`/`MB4`/`MB5`, or `SCROLL_UP`/`SCROLL_DOWN`/`SCROLL_LEFT`/`SCROLL_RIGHT`. `event`: `CLICK` (default) / `PRESS` / `RELEASE` / `DOUBLE_CLICK` |
+
+> v2 listed `mouse_move` (relative `dx`/`dy`) and `mouse_click` as separate types. The
+> implementation converged on a single `mouse` type and **relative movement was never built**.
+> v3 documents what exists. Relative move is parked in §12 — add it as
+> `{ "type": "mouse", "event": "MOVE", "dx": …, "dy": … }` if it is ever wanted.
+
+### Macro `mode`
+
+| mode | behavior |
+|---|---|
+| `play_once` | run the action list once (default) |
+| `toggle` | **repeat the action list continuously** until the macro is fired again |
+
+`toggle` is a repeat-loop, not a stateful on/off. It suits "jiggle the mouse" or "spam a key",
+and is actively wrong for one-shot toggles like Caps Lock — the OS already latches those.
+
+### Icons
+
+`icon` names a Feather icon. The Companion App additionally renders it to `icon_xbm`, an 18x18
+1-bpp bitmap as a 108-char hex string. Two standing rules:
+
+- **The device must actually render icons** (success criterion #3). Shipping `icon_xbm` to a
+  device that ignores it is pure payload weight on a size-constrained transport.
+- **`icon_xbm` is derived data.** If ring wedges move to a vector/font glyph, drop it from the
+  wire format rather than sending both.
 
 ---
 
-## 7. Config: Mobile Companion App
+## 7. Config: BLE Companion App
 
-- Swipe down -> Config mode: Dial serves a REST API over its local IP or SoftAP.
-- Open the **Companion App** -> The app securely pairs with the device, generating and storing a unique authentication token in the device's NVS memory. 
-- Edit profiles and macros, assign **grid position + color + icon**, build action sequences, set brightness (screen + LED).
-- Save -> POST JSON -> validate (ArduinoJson) -> write `profiles.json` -> reload + re-legend.
+The Flutter app is the **only** configuration surface. There is no web UI and none is planned.
+
+### Transport
+Nordic-UART-style GATT service: RX characteristic (app -> device, write) and TX characteristic
+(device -> app, notify). Payloads are newline-terminated JSON, chunked in both directions.
+Because `notify()` has no delivery guarantee, each device->app chunk carries a 1-byte sequence
+number and the app echoes a 2-byte `[0xFE, seq]` ack; the device resends on timeout.
+
+Commands: `get_profiles`, `save_profiles`, `trigger`.
+
+### Security — standard BLE pairing
+- **Pairing:** the device displays a passkey on screen (IO capability = DisplayOnly); the user
+  enters it in the phone's pairing dialog. Bonding is stored so subsequent connects are silent.
+- **Enforcement:** the config characteristics **require an encrypted, authenticated link**. This
+  must be enforced by GATT permission flags on the characteristics themselves, not merely
+  requested at connect time — a central that ignores a security *request* must still be unable to
+  read or write.
+- **No application-layer token.** The `token` field, the `pair` command, and the `pairingToken`
+  NVS entry are all removed from firmware, app, and schema.
+
+Why this matters more than it sounds: the device is a **keyboard**. An unauthenticated write path
+is arbitrary keystroke injection into the attached host, plus profile exfiltration.
+
+### Editing flow
+Edit profiles and macros; assign name, color, icon, mode, and action sequence; reorder; set
+brightness. Save -> `save_profiles` -> validate -> write `profiles.json` -> reload -> re-legend
+the ring live, without a reboot.
 
 ---
 
-## 8. Storage & power
+## 8. Storage, robustness & power
 
 - **Macros/profiles:** `profiles.json` in LittleFS.
-- **State:** last profile + brightness in NVS (`Preferences`), restored on boot.
-- **Power:** USB-C powers both pucks (NeoTrellis draws 5V over the Grove/STEMMA link). With 16 NeoPixels lit, mind total current — cap `ledBrightness` and avoid all-white-full. LiPo on the Dial is possible but the NeoTrellis LEDs will dominate battery draw; treat battery use as desk-untethered bursts, not all-day.
+- **State:** last profile + brightness in NVS (`Preferences`), **written on change and restored on
+  boot.** Reading it without ever writing it is the same as not having it.
+- **Writes must be atomic:** serialize to `/profiles.json.tmp`, verify, then rename. A power loss
+  mid-save must never leave an unparseable config.
+- **Parse failure must be recoverable:** if `profiles.json` is missing *or unparseable*, fall back
+  to the built-in default and log it. Only handling the missing-file case leaves corruption
+  unrecoverable without a reflash.
+- **Config transfers are bounded:** the RX reassembly buffer must be sized for a realistic
+  multi-profile document, and an overflow must reset cleanly and report an error — never wedge the
+  command channel until reboot.
+- **Power:** USB-C. Without the key pad the LED current budget that dominated v2 is gone; screen
+  brightness is now the main draw.
 
 ---
 
 ## 9. Dev environment
 
-- **Arduino IDE or PlatformIO**, ESP32 Arduino core (S3).
-- Board profile: M5Stack StampS3 / M5Dial; set **USB-OTG / "USB CDC On Boot"** so HID + flashing coexist.
-- Libraries: `M5Dial`, `M5Unified`, `Adafruit_NeoTrellis`, `Adafruit_seesaw`, `LVGL`, `ESPAsyncWebServer`, `AsyncTCP`, `ArduinoJson`.
-- Flash via G0 download mode (hold G0, power on, release).
-- Refs: M5Dial Arduino quick-start; Adafruit NeoTrellis guide.
+- **Arduino IDE or arduino-cli**, ESP32 Arduino core (S3). PowerShell on Windows; use `.ps1`
+  scripts for anything nontrivial.
+- Set **USB-OTG / "USB CDC On Boot"** so HID and flashing coexist.
+- M5Dial FQBN in use:
+  `m5stack:esp32:m5stack_dial:USBMode=default,CDCOnBoot=cdc,FlashSize=8M,PartitionScheme=default_8MB`
+- M5Dial flashing: hold G0, plug USB, release.
+- See `docs/M0_Setup_and_BringUp.md` and `docs/Toolchain_arduino-cli.md`.
 
 ---
 
-## 10. Milestones
+## 10. Milestones & current state
 
-| # | Milestone | Outcome |
+Honest status, not aspiration.
+
+| # | Milestone | State |
 |---|---|---|
-| M0 | Dial bring-up | Stock example runs; screen, encoder, knob, touch read. |
-| M1 | HID hello | Dial enumerates as USB keyboard; knob press types a fixed string. |
-| M2 | NeoTrellis bring-up | Over I2C: read all 16 keys + set all 16 colors. Confirm address + Grove/STEMMA cable. |
-| M3 | Keys fire HID | Press a NeoTrellis key -> fires a multi-step macro; key flashes. |
-| M4 | Color legend + dial | 16 keys lit per macro color; dial highlight tracks selection; knob fires selected. |
-| M5 | Store + profiles | Load `profiles.json`; profile switch re-legends keys + screen; boot into last (NVS). |
-| M6 | App config | Config mode serves the API; Companion App connects with secure pairing token; edits (incl. position/color) save + reload live. |
-| M7 | Polish | Paging, icons, brightness caps, buzzer feedback, export/import, (battery). |
+| M0 | Board bring-up (screen, encoder, touch) | **Done**, both boards |
+| M1 | USB HID hello | **Done** |
+| M2 | Macro engine: combos, text, consumer, mouse, delays | **Done** |
+| M3 | Ring UI: dynamic wedges, colors, selection, tap-to-fire | **Done** (Waveshare) |
+| M4 | Profile store: LittleFS + defaults | **Done** |
+| M5 | BLE transport: chunked send/ack, Companion App connects | **Done** |
+| M6 | **Config hardening** — pairing enforcement, atomic writes, RX bounds, reload safety | **Open — blocking** |
+| M7 | **Persistence** — write `activeProfile` + brightness to NVS and honor them at boot | **Open** |
+| M8 | **On-device profile switching** with directional indicators | **Open** |
+| M9 | **Icons on the ring** + encoder detent alignment | **Open** |
+| M10 | Polish — buzzer/haptic feedback, brightness UI, export/import | **Open** |
 
-Dogfood gate at **M4**: once the lit grid + dial + HID firing all work together, use it for real before building config/profiles. This is the moment the whole concept proves out.
+M6 is sequenced first because it is the difference between a prototype and a device that is safe
+to leave plugged into a machine.
 
 ---
 
-## 11. Tradeoffs (the random-access problem is now solved)
+## 11. Tradeoffs
 
-With 16 physical keys you get **instant random access** — the serial-scroll limitation of the dial-only design is gone. The dial becomes a selector/profile/volume control rather than the only way in. Remaining notes:
-
-- **>16 macros** still means multiple **profiles** (switch via touch/long-press); the color legend makes context switches legible.
-- **Soft buttons, not mechanical.** NeoTrellis is silicone elastomer — pleasant and quiet, but not clicky/hotswap. If mechanical feel becomes a must-have, see §12.
+- **Ring vs. keys.** A ring wedge is a bigger target than expected and needs no second puck, but
+  it degrades as macro count climbs — wedges get thin and icons stop being legible. Practical
+  ceiling is roughly 10-12 per profile; beyond that, use more profiles. The app should nudge
+  toward splitting rather than silently rendering slivers.
+- **No physical keys** means no eyes-free muscle memory. The knob's detents partly compensate
+  (count clicks from a known position); this is the main thing to re-evaluate in long-term use.
+- **BLE-only config** means no desktop config path. Accepted: the phone app is better, and a
+  desktop client can speak the same BLE protocol later if wanted.
+- **Two boards** costs a real maintenance tax. It is only worth paying while the shared-core
+  boundary in §3 holds.
 
 ---
 
 ## 12. Expansion path (optional)
 
-- **Hotswap mechanical variant:** swap the NeoTrellis puck for **4x Adafruit NeoKey 1x4** (Kailh hotswap MX + NeoPixel, I2C, chainable to 16 keys on one bus). Same firmware key/LED model, just different I2C devices and a plate to hold the four strips. This is the mechanical+hotswap+RGB+I2C path if you want it later.
-- **Second encoder / extra keys on PORT.B:** the Dial's GPIO port is still free for an EC11 or a couple of switches.
-- **Tile more NeoTrellis:** the seesaw addressing supports many boards — an 8-key or 4x8 layout is possible if 16 ever feels tight.
+- **16-key RGB pad** as a companion puck (NeoTrellis) or hotswap mechanical (4x NeoKey 1x4).
+  `pos` 0-15 already maps to it.
+- **Relative mouse movement** — `event: "MOVE"` with `dx`/`dy`.
+- **Second encoder / extra keys** on a free GPIO port.
+- **Desktop client** over the same BLE protocol.
+- **Haptics** — see the SmartKnob note in Appendix A.
 
 ---
 
 ## 13. Risks & open questions
 
-- **Buy the silicone pad:** NeoTrellis PCB 3954 ships **without buttons** — add the 4x4 silicone elastomer pad (and the acrylic enclosure) to the order.
-- **Connector mismatch:** Grove (M5) vs STEMMA JST-PH (NeoTrellis) — get the adapter cable; don't assume the plugs mate.
-- **NeoPixel current:** 16 LEDs at full white can pull real current over a thin Grove cable; keep `ledBrightness` sane.
-- **Keyboard layout:** HID sends keycodes; typed `text` assumes US layout for v1.
-- **USB routing / CDC-on-boot:** confirm native USB on the Dial's USB-C and set CDC-on-boot so you can reflash with HID firmware loaded (else G0 download mode).
-- **I2C address scan:** verify NeoTrellis at 0x2E and no clash with onboard Dial I2C before wiring assumptions into firmware.
+- **Encoder detent alignment.** Measured on the M5Dial: 4 encoder counts per physical detent, so
+  the selection fought the detents. Screen feedback must match tactile feedback on both boards —
+  verify the Waveshare `bidi_switch_knob` ratio explicitly rather than assuming 1:1.
+- **Encoder push button.** Not wired in the Waveshare firmware. Confirm whether the hardware has
+  one; if it does, wire it to "fire selection" so the center tap is not the only path.
+- **Heap pressure.** No PSRAM on either board, with LVGL draw buffers, a JSON document, BLE, and
+  USB all resident. Config payloads and any icon cache must be budgeted, not assumed.
+- **Blocking in loop().** BLE chunk ack retries and per-character HID pacing both block the loop
+  task, stalling in-flight macros. Needs a bounded time budget per tick.
+- **Keyboard layout.** HID sends keycodes; typed `text` assumes US layout for v1.
+- **Two-board drift.** The first change that has to be written twice means the §3 boundary leaked.
 
 ---
 
 ## 14. Shopping list
 
-- **M5Stack Dial v1.1** — brain + screen + encoder. *(ordered)*
-- **Adafruit NeoTrellis PCB (3954)** — 16-key RGB pad driver.
-- **4x4 silicone elastomer button pad** (Adafruit) — the actual buttons; pick your color.
-- **Acrylic enclosure for NeoTrellis.**
-- **Grove-to-STEMMA (JST-PH) adapter cable** — Dial PORT.A to NeoTrellis.
+- **Waveshare ESP32-S3 round-knob board** (1.8" 360x360 AMOLED). *(have)*
+- **M5Stack Dial v1.1** — second target. *(have)*
 - USB-C data cable.
-- *(Optional, later)* 4x NeoKey 1x4 for the hotswap-mechanical variant (§12).
-
-Two pucks, one cable, no printer, no soldering (beyond optional address jumpers).
+- *(Optional, later)* NeoTrellis 3954 + 4x4 silicone pad + acrylic case + Grove-to-STEMMA cable,
+  or 4x NeoKey 1x4, for the key-pad expansion (§12).
 
 ---
 
-## Appendix — Inspiration & parking lot
+## Appendix A — Inspiration & parking lot
 
-*Not committed scope. Ideas to revisit at P2/P3 once the POC proves the firmware and interaction. Nothing here affects the current build.*
+*Not committed scope. Revisit at P2/P3.*
 
-### A. Form-factor references (decide at P2)
+**Form factor (decide at P2).** With keys demoted, the leading silhouette is a **standalone knob
+puck** — screen in the cap, encoder body below, weighted base. The v2 candidates (radial key ring;
+Megalodon-style asymmetric cluster) survive only as key-pad-expansion shapes.
 
-Two silhouettes worth keeping on the shelf, held as equal candidates — no ranking yet:
+**Smart-knob upgrade.** *Pragmatic:* round LCD + normal encoder (what P1 already is). *Halo:* a
+haptic SmartKnob (Scott Bezek's open Apache-2.0 SmartKnob View — BLDC + magnetic encoder +
+strain-gauge press) giving software-defined detents that change feel per context. Now a much more
+natural fit than it was in v2, since the knob *is* the product. Big engineering jump (FOC motor
+control, current, bulk). Seeed sells a DevKit to prototype without building the motor assembly.
 
-- **Radial ring.** 16 hotswap NeoPixel keys in a circle around the central smart knob/screen. Striking and novel; key angle maps directly to dial angle. Harder to route and manufacture; cramped.
-- **Megalodon-style asymmetric cluster.** Inspired by the DOIO KB16 Megalodon: a key grid offset from a knob cluster (one primary + secondary encoders) with a screen. Ergonomic and easy to manufacture (rectangular PCB, standard grid). The DOIO is itself open (QMK/VIA) and hotswap, so it's a free reference design, *and* market validation that the silhouette sells.
-
-**Smart-knob upgrade (applies to either silhouette):** replace a plain encoder with a knob that has its own screen.
-- *Pragmatic:* M5Dial-style round LCD + normal encoder (what the POC already uses) — context-aware knob, ~zero added complexity.
-- *Halo:* a haptic SmartKnob (Scott Bezek's open Apache-2.0 SmartKnob View — BLDC motor + magnetic encoder + 240x240 screen + strain-gauge press) giving software-defined detents/endstops that change feel per context. Big engineering jump (FOC motor control, more current, bulkier), but a standout differentiator. Seeed sells a SmartKnob DevKit to prototype it without building the motor assembly.
-
-### B. Premium per-key feedback — LCD screen-buttons (alt product, not a variant)
-
-Each key is its own small color LCD bonded to a switch (e.g. 0.85" 128x128 SPI display-buttons), Stream-Deck-style — every key shows an arbitrary dynamic icon/label instead of just a color.
-
-- **Why it's tempting:** richest possible per-key feedback; keys self-describe with no central screen needed.
-- **Why it's hard / not the POC:**
-  - *SPI, not I2C* — won't sit on the Grove port; needs a chip-select per display (16 CS lines or a mux), breaking the single-cable model.
-  - *RAM/bandwidth* — 128x128x16bpp ~= 32KB/image, ~512KB for 16; the StampS3 has no PSRAM, so icons must stream from flash per change.
-  - *Cost* — ~$9 each, ~$145 for sixteen (≈10x the NeoTrellis pad).
-  - *Redundant with the hub screen* — per-key LCDs earn their cost only when there's **no** central screen; a dial-centric device already shows the selection in the hub.
-- **Where it fits:** a separate, more ambitious SKU — a screenless-hub, all-LCD-key deck where every key speaks for itself. P3-class effort (multi-SPI driver, flash asset pipeline, icon-upload tool). Filed as its own product idea, not a Draupnir variant.
+**Per-key LCD deck.** Filed as a separate, more ambitious product (screenless hub, every key its
+own LCD). SPI-per-key, RAM/bandwidth, and ~$145/16 keys put it out of scope; it also earns its
+cost only when there is *no* central screen, which is the opposite of this device.
 
 ### Reference links
-- DOIO KB16 Megalodon (KeebMonkey); alternate QMK firmware (wlellington/frogimancer-macropad)
 - SmartKnob (scottbez1/smartknob, Apache-2.0); SmartKnob DevKit (SeedLabs)
-- Adafruit NeoKey 1x4 (hotswap I2C path); Adafruit NeoTrellis (current POC key bank)
+- DOIO KB16 Megalodon (QMK/VIA reference for the key-pad expansion)
+- Adafruit NeoTrellis 3954 / NeoKey 1x4 (key-pad expansion paths)
+
+---
+
+## Appendix B — The v2 two-puck design (historical)
+
+Preserved because it is the origin of the `pos` model and the path back if keys return.
+
+P1 was **M5Dial + Adafruit NeoTrellis 4x4**, cabled PORT.A (Grove I2C, G13/G15) to STEMMA JST-PH
+via an adapter, seesaw at I2C 0x2E, 5V over Grove for the NeoPixels. The unifying idea was
+**dial detent N = key N = color N = icon N**: 16 detents mapped 1:1 to 16 elastomer keys, each lit
+in its macro's color as a persistent legend.
+
+Configuration was a browser over the Dial's own Wi-Fi (SoftAP + `ESPAsyncWebServer`), later
+augmented by the Companion App with a token-based pairing scheme. **Both the web UI and the token
+scheme are removed in v3** — the app replaced the former, BLE bonding replaced the latter.
+
+Known constraints from that era that still inform v3: NeoPixel current over a thin Grove cable
+(cap `ledBrightness`), the Grove-vs-STEMMA connector mismatch, and the NeoTrellis PCB shipping
+without buttons.
