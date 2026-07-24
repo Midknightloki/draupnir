@@ -16,3 +16,7 @@ Thumbs.db
 secrets.h
 wifi_creds.h
 *.local
+
+# Build logs
+build_fw.log
+*.log
