@@ -68,7 +68,33 @@ void macros_request_fire(int pos) {
   xQueueSend(fireQueue, &pos, 0);
 }
 
+// Every ActiveMacro holds a JsonObject that points INTO profilesDoc's memory pool.
+// deserializeJson() clears and reallocates that pool, so anything still running across a reload
+// would dereference freed memory on the next macros_update() tick. This is deterministic, not a
+// rare race: a "toggle" macro never terminates on its own (macros_update() just rewinds
+// currentActionIndex forever), and the shipped default profile contains one -- fire it, then
+// save profiles from the app, and the use-after-free is guaranteed.
+void macros_stop_all() {
+  // A macro interrupted mid-sequence can have modifiers or mouse buttons held down. Release them
+  // before clearing state, or the host is left with e.g. a stuck Ctrl and no way to clear it.
+  Keyboard.releaseAll();
+  Mouse.release(MOUSE_ALL);
+  ConsumerControl.release();
+
+  for (int i = 0; i < NUM_MACRO_SLOTS; i++) {
+    runningMacros[i].active = false;
+    runningMacros[i].isToggle = false;
+    runningMacros[i].slotIdx = -1;
+    runningMacros[i].macroDef = JsonObject(); // drop the reference into the old document pool
+    runningMacros[i].currentActionIndex = 0;
+    runningMacros[i].nextActionTime = 0;
+  }
+}
+
 void profiles_reload() {
+  // Deliberately here rather than at the call sites, so no future caller can forget it.
+  macros_stop_all();
+
   File file = LittleFS.open("/profiles.json", "r");
   if (!file) {
     Serial.println("Failed to open profiles.json, creating default");

@@ -45,3 +45,15 @@ void macros_fire(int pos);
 void macros_request_fire(int pos);
 void macros_update();
 bool macros_is_running(int pos);
+
+// Stops every running macro and releases any HID state (modifiers, mouse buttons, consumer
+// codes) a macro interrupted mid-sequence may still be holding down.
+//
+// loop()-task only, same constraint as macros_fire(): it mutates runningMacros[] directly with
+// no locking. profiles_reload() calls it itself as its first action -- callers do NOT need to,
+// and must not call it from an LVGL or BLE callback.
+//
+// This exists because every ActiveMacro holds a JsonObject referencing profilesDoc's memory
+// pool, which deserializeJson() frees and reallocates on reload; a macro still running across
+// that boundary reads freed memory on its next macros_update() tick.
+void macros_stop_all();
