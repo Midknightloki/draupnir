@@ -2,7 +2,6 @@
 #include "macro_engine.h"
 #include <BLEDevice.h>
 #include <BLEServer.h>
-#include <BLE2902.h>
 #include <BLESecurity.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
@@ -274,6 +273,28 @@ static const uint32_t BLE_RX_DUP_WINDOW_MS = 10;
 class RxCallbacks : public BLECharacteristicCallbacks {
   String lastRxValue;
   uint32_t lastRxValueMs = 0;
+
+  // NimBLE calls this overload (BLECharacteristic::handleGATTServerEvent); the base class's
+  // default implementation just forwards to onWrite(pCharacteristic). Taking the desc form gives
+  // us the connection's security state.
+  //
+  // Belt-and-braces on top of the GATT permission flags set in ble_init(). Those flags are what
+  // the stack enforces and should mean an unencrypted central never reaches this callback at
+  // all; this check exists so that if they ever silently stop working (they are set through the
+  // properties bitmask on this core -- see ble_init()'s comment for why), the failure is loud
+  // and closed rather than silent and open. It is a link-security check, NOT an application
+  // token: nothing about it is carried in the payload.
+  void onWrite(BLECharacteristic *pCharacteristic, ble_gap_conn_desc *desc) override {
+    if (desc == nullptr || !desc->sec_state.encrypted || !desc->sec_state.authenticated) {
+      Serial.printf("[ble] REJECTED write on unauthenticated link (encrypted=%d authenticated=%d bonded=%d)\n",
+                    desc ? desc->sec_state.encrypted : 0,
+                    desc ? desc->sec_state.authenticated : 0,
+                    desc ? desc->sec_state.bonded : 0);
+      return;
+    }
+    onWrite(pCharacteristic);
+  }
+
   void onWrite(BLECharacteristic *pCharacteristic) override {
     String rxValue = pCharacteristic->getValue();
     if (rxValue.length() == 2 && (uint8_t)rxValue[0] == BLE_CHUNK_ACK_MARKER) {
@@ -419,12 +440,16 @@ void ble_init() {
   BLESecurity::setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
   BLESecurity::setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
   BLESecurity::setPassKey(false, 0); // false = randomly generated once here, not this fixed value
-  // Diagnostic step: regenerating a fresh passkey on every reconnect (regenPassKeyOnConnect)
-  // plus forcing encryption via per-characteristic ENC flags is suspected of destabilizing this
-  // board (repeated unexplained resets into the ROM bootloader, and one get_profiles exchange
-  // that the firmware logged as fully sent+acked but the app never actually received/parsed) --
-  // simplified to a single random passkey generated once at boot, kept for the board's uptime.
-  BLESecurity::regenPassKeyOnConnect(false);
+  // Re-enabled for M6/H1. A passkey fixed for the board's uptime is a weaker secret than a
+  // per-pairing one, and with bonding working the user only ever types it once anyway.
+  //
+  // ROLLBACK LADDER, in order, if the previously-unexplained resets into the ROM bootloader
+  // return (see the git history for this file and docs/M6_Hardening_WorkOrder.md):
+  //   1. flip this back to false,
+  //   2. drop PROPERTY_WRITE_AUTHEN from the RX characteristic below,
+  //   3. drop the ENC/CCCD flags entirely (which is the pre-M6 behaviour, and is INSECURE --
+  //      do not stop there, report the boot reason instead).
+  BLESecurity::regenPassKeyOnConnect(true);
   BLEDevice::setSecurityCallbacks(new SecurityCallbacks());
 
   pServer = BLEDevice::createServer();
@@ -432,15 +457,49 @@ void ble_init() {
 
   BLEService *pService = pServer->createService(SERVICE_UUID);
 
-  // Diagnostic step (see regenPassKeyOnConnect comment above): dropped the PROPERTY_READ_ENC /
-  // PROPERTY_WRITE_ENC flags for now. Security is instead requested explicitly and once, via
-  // BLESecurity::startSecurity() in ServerCallbacks::onConnect(), rather than relying on
-  // per-characteristic permission bits to trigger pairing implicitly.
-  pTxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_TX, BLECharacteristic::PROPERTY_NOTIFY);
-  pTxCharacteristic->addDescriptor(new BLE2902());
+  // ---------------------------------------------------------------------------------------
+  // GATT permission enforcement (M6/H1). This is what the stack actually enforces; the
+  // BLESecurity::startSecurity() call in ServerCallbacks::onConnect() is only a *request* that
+  // a hostile central is free to ignore. Without these bits any central in radio range could
+  // write save_profiles/trigger -- i.e. inject keystrokes into the attached host.
+  //
+  // READ THIS BEFORE CHANGING IT. This core (m5stack:esp32 3.3.8) is NimBLE-backed despite the
+  // Bluedroid-styled class names, and the permission API differs from every Bluedroid example
+  // online:
+  //
+  //   * BLECharacteristic::setAccessPermissions() is a NO-OP here. Its body in
+  //     BLECharacteristic.cpp is wrapped in #ifdef CONFIG_BLUEDROID_ENABLED, and
+  //     BLEService::start() builds ble_gatt_chr_def.flags from m_properties, never from
+  //     m_permissions. Calling it would look correct and enforce nothing.
+  //   * The enforcement bits therefore live in the PROPERTIES bitmask, where under NimBLE
+  //     PROPERTY_READ_ENC / PROPERTY_WRITE_ENC / PROPERTY_*_AUTHEN are defined as
+  //     BLE_GATT_CHR_F_*_ENC / BLE_GATT_CHR_F_*_AUTHEN rather than as 0.
+  //   * ENC alone means "encrypted link"; AUTHEN additionally means the key came from an
+  //     MITM-protected pairing (our passkey display). Both are set on RX.
+  //
+  // CCCD: NimBLE creates the 0x2902 descriptor itself for any characteristic with NOTIFY, and
+  // BLECharacteristic::addDescriptor() explicitly discards a manually-added BLE2902 on this
+  // core (see its #ifdef CONFIG_NIMBLE_ENABLED early-return) -- so the old
+  // `addDescriptor(new BLE2902())` was dead code and is removed. The auto-created CCCD is
+  // protected via BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC on the characteristic instead, which is
+  // what makes "subscribe to TX" require an encrypted link.
+  //
+  // KNOWN GAP: BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN (0x10000) cannot be applied through this
+  // wrapper -- BLECharacteristic stores properties in a uint16_t (esp_gatt_char_prop_t is
+  // typedef'd to uint16_t under NimBLE), so the bit is silently truncated away. The CCCD is
+  // therefore gated on encryption but not explicitly on authentication. In this configuration
+  // that is not exploitable: setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND) means this
+  // device will not complete a Just Works pairing at all, so any encrypted link here is
+  // necessarily an authenticated one. Revisit if the auth mode is ever relaxed.
+  pTxCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID_TX,
+    BLECharacteristic::PROPERTY_NOTIFY | BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC
+  );
 
   BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
-    CHARACTERISTIC_UUID_RX, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
+    CHARACTERISTIC_UUID_RX,
+    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
+      | BLECharacteristic::PROPERTY_WRITE_ENC | BLECharacteristic::PROPERTY_WRITE_AUTHEN
   );
   pRxCharacteristic->setCallbacks(new RxCallbacks());
 

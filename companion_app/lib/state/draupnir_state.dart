@@ -2,14 +2,10 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
-import 'package:http/http.dart' as http;
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 class DraupnirState extends ChangeNotifier {
-  String deviceIp = 'draupnir.local';
-
   bool isLoading = false;
   String? error;
 
@@ -17,10 +13,18 @@ class DraupnirState extends ChangeNotifier {
   int activeProfileIdx = 0;
   bool isEditorMode = false;
 
-  String? authToken;
+  // Set when the device refuses a request because the BLE link is not paired/bonded. Pairing is
+  // now the operating system's job — standard BLE passkey pairing, with the PIN shown on the
+  // knob's screen — so there is deliberately no in-app "Pair" action to go with this. The app's
+  // only job is to tell the user where to go. The old application-layer scheme (a `pair`
+  // command, a `token` field on every request, an `authToken` persisted in SharedPreferences)
+  // is removed: the firmware ignored the token entirely and never implemented `pair`, so it was
+  // dead code that always reported failure, and it reimplemented — badly — what BLE bonding
+  // already does correctly.
   bool needsPairing = false;
-  bool isPairing = false;
 
+  // True once connected over BLE. BLE is now the only transport (the Wi-Fi/HTTP client half of
+  // the cut web UI is gone), so this doubles as "connected".
   bool isBluetooth = false;
   BluetoothDevice? connectedDevice;
   BluetoothCharacteristic? rxChar;
@@ -46,18 +50,6 @@ class DraupnirState extends ChangeNotifier {
   void clearDebugLog() {
     debugLog.clear();
     notifyListeners();
-  }
-
-  Future<void> init() async {
-    final prefs = await SharedPreferences.getInstance();
-    authToken = prefs.getString('authToken');
-  }
-
-  Map<String, String> get _headers {
-    if (authToken != null && authToken!.isNotEmpty) {
-      return {'Authorization': 'Bearer $authToken', 'Content-Type': 'text/plain'};
-    }
-    return {'Content-Type': 'text/plain'};
   }
 
   void toggleEditorMode() {
@@ -345,8 +337,6 @@ class DraupnirState extends ChangeNotifier {
         }
       });
 
-      await init();
-      _log('[AUTH] Stored token: ${authToken == null ? 'null' : '"${authToken!.substring(0, authToken!.length.clamp(0, 8))}…"'}');
       await fetchProfiles();
 
     } catch (e) {
@@ -380,11 +370,13 @@ class DraupnirState extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> connect(String ip) async {
-    deviceIp = ip;
-    await init();
-    await fetchProfiles();
-  }
+  // Shown whenever the device rejects a request for lack of an encrypted, bonded link. There is
+  // no in-app action that can fix this — the OS owns pairing — so the message points at the
+  // system Bluetooth settings and the PIN on the knob's screen.
+  static const String pairingRequiredMessage =
+      'This Draupnir is not paired with your phone yet.\n\n'
+      'Open your phone\'s Bluetooth settings, pair with "Draupnir", and enter the PIN shown on '
+      'the knob\'s screen. Then come back and connect again.';
 
   Future<void> fetchProfiles() async {
     isLoading = true;
@@ -392,109 +384,63 @@ class DraupnirState extends ChangeNotifier {
     notifyListeners();
 
     try {
-      if (isBluetooth) {
-        final response = await _sendBleRequest({
-          'cmd': 'get_profiles',
-          'token': authToken,
-        });
-        if (response['status'] == 'ok') {
-          profilesData = response['profiles'];
-          needsPairing = false;
-        } else if (response['message'] == 'Unauthorized') {
-          needsPairing = true;
-          error = 'Pairing required. Swipe down on Draupnir to enter Config Mode and press Pair.';
-        } else {
-          error = 'Failed to load profiles: ${response['message']}';
-        }
+      final response = await _sendBleRequest({'cmd': 'get_profiles'});
+      if (response['status'] == 'ok') {
+        profilesData = response['profiles'];
+        needsPairing = false;
       } else {
-        final response = await http.get(Uri.parse('http://$deviceIp/api/profiles'), headers: _headers);
-        if (response.statusCode == 200) {
-          profilesData = jsonDecode(response.body);
-          needsPairing = false;
-        } else if (response.statusCode == 401 || response.statusCode == 403) {
-          needsPairing = true;
-          error = 'Pairing required. Swipe down on Draupnir to enter Config Mode and press Pair.';
-        } else {
-          error = 'Failed to load profiles (HTTP ${response.statusCode})';
-        }
+        error = 'Failed to load profiles: ${response['message']}';
       }
     } catch (e) {
-      error = isBluetooth 
-        ? 'Bluetooth request failed: $e'
-        : 'Connection failed. Ensure Draupnir is on the same network.';
+      // A write/subscribe rejected for insufficient authentication surfaces here as a platform
+      // GATT error rather than as a device response — the device never sees the request at all,
+      // because the GATT permission flags stop it at the link layer.
+      if (_looksLikeAuthFailure(e)) {
+        needsPairing = true;
+        error = pairingRequiredMessage;
+      } else {
+        error = 'Bluetooth request failed: $e';
+      }
     }
 
     isLoading = false;
     notifyListeners();
   }
 
-  Future<void> pair() async {
-    isPairing = true;
-    notifyListeners();
-    try {
-      if (isBluetooth) {
-        final response = await _sendBleRequest({
-          'cmd': 'pair',
-        });
-        if (response['status'] == 'ok' && response['token'] != null) {
-          authToken = response['token'];
-          final prefs = await SharedPreferences.getInstance();
-          await prefs.setString('authToken', authToken!);
-          needsPairing = false;
-          await fetchProfiles();
-        } else {
-          error = 'Failed to pair. Make sure Draupnir is in Config Mode (swipe down).';
-        }
-      } else {
-        final response = await http.post(Uri.parse('http://$deviceIp/api/pair'));
-        if (response.statusCode == 200) {
-          final data = jsonDecode(response.body);
-          if (data['token'] != null) {
-            authToken = data['token'];
-            final prefs = await SharedPreferences.getInstance();
-            await prefs.setString('authToken', authToken!);
-            needsPairing = false;
-            await fetchProfiles();
-          }
-        } else {
-          error = 'Failed to pair. Make sure Draupnir is in Config Mode (swipe down).';
-        }
-      }
-    } catch (e) {
-      error = 'Pairing connection failed: $e';
-    }
-    isPairing = false;
-    notifyListeners();
+  // The firmware rejects unauthenticated access at the GATT layer, so there is no single
+  // well-typed error to match on: Android surfaces ATT error 0x05/0x0F
+  // (insufficient authentication / encryption) as a PlatformException whose text varies by
+  // vendor, and iOS words it differently again. Match loosely and fall back to a generic error.
+  bool _looksLikeAuthFailure(Object e) {
+    final s = e.toString().toLowerCase();
+    return s.contains('authent') ||
+        s.contains('encrypt') ||
+        s.contains('insufficient') ||
+        s.contains('not paired') ||
+        s.contains('bond');
   }
 
   Future<void> saveProfiles() async {
     if (profilesData == null) return;
-    
+
     isLoading = true;
     notifyListeners();
 
     try {
-      if (isBluetooth) {
-        final response = await _sendBleRequest({
-          'cmd': 'save_profiles',
-          'token': authToken,
-          'profiles': profilesData,
-        });
-        if (response['status'] != 'ok') {
-          error = 'Failed to save profiles: ${response['message']}';
-        }
-      } else {
-        final response = await http.post(
-          Uri.parse('http://$deviceIp/api/profiles'),
-          headers: _headers,
-          body: jsonEncode(profilesData),
-        );
-        if (response.statusCode != 200) {
-          error = 'Failed to save profiles (HTTP ${response.statusCode})';
-        }
+      final response = await _sendBleRequest({
+        'cmd': 'save_profiles',
+        'profiles': profilesData,
+      });
+      if (response['status'] != 'ok') {
+        error = 'Failed to save profiles: ${response['message']}';
       }
     } catch (e) {
-      error = 'Failed to save profiles: $e';
+      if (_looksLikeAuthFailure(e)) {
+        needsPairing = true;
+        error = pairingRequiredMessage;
+      } else {
+        error = 'Failed to save profiles: $e';
+      }
     }
 
     isLoading = false;
@@ -503,23 +449,11 @@ class DraupnirState extends ChangeNotifier {
 
   Future<void> triggerMacro(int macroIdx) async {
     try {
-      if (isBluetooth) {
-        await _sendBleRequest({
-          'cmd': 'trigger',
-          'token': authToken,
-          'profile': activeProfileIdx,
-          'macro': macroIdx,
-        });
-      } else {
-        await http.post(
-          Uri.parse('http://$deviceIp/api/trigger'),
-          headers: _headers,
-          body: jsonEncode({
-            'profile': activeProfileIdx,
-            'macro': macroIdx,
-          }),
-        );
-      }
+      await _sendBleRequest({
+        'cmd': 'trigger',
+        'profile': activeProfileIdx,
+        'macro': macroIdx,
+      });
     } catch (e) {
       debugPrint('Trigger failed: $e');
     }

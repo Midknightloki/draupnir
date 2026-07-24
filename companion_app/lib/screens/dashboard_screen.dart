@@ -15,17 +15,11 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
-  final TextEditingController _ipController = TextEditingController(text: 'draupnir.local');
   int? _editingKeyIdx;
-  bool _useBluetooth = false;
 
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      context.read<DraupnirState>().connect(_ipController.text);
-    });
-  }
+  // No auto-connect on launch: BLE is the only transport now (the Wi-Fi/HTTP path is gone with
+  // the web UI), and a BLE scan is an explicit user action, not something to fire off in
+  // initState.
 
   @override
   Widget build(BuildContext context) {
@@ -104,33 +98,43 @@ class _DashboardScreenState extends State<DashboardScreen> {
           if (state.profilesData == null && !state.isLoading) _buildConnectionBar(state),
           if (state.isLoading)
             const Expanded(child: Center(child: CircularProgressIndicator()))
+          // Pairing is the OS's job now — standard BLE passkey pairing against the PIN shown on
+          // the knob — so this is guidance, not an action. There is deliberately no in-app
+          // "Pair" button: the old one drove a `cmd: "pair"` the firmware never implemented.
           else if (state.needsPairing)
             Expanded(
               child: Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const Icon(Icons.lock_outline, color: Colors.orange, size: 64),
-                    const SizedBox(height: 16),
-                    Text(
-                      state.error ?? 'Pairing Required',
-                      style: const TextStyle(color: Colors.orange, fontSize: 16, fontWeight: FontWeight.bold),
-                      textAlign: TextAlign.center,
-                    ),
-                    const SizedBox(height: 24),
-                    ElevatedButton.icon(
-                      icon: state.isPairing 
-                        ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                        : const Icon(Icons.link),
-                      label: Text(state.isPairing ? 'PAIRING...' : 'PAIR DEVICE'),
-                      style: ElevatedButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
-                        backgroundColor: Colors.orange,
-                        foregroundColor: Colors.white,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 32),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Icon(Icons.bluetooth_searching, color: Colors.orange, size: 64),
+                      const SizedBox(height: 16),
+                      const Text(
+                        'PAIRING REQUIRED',
+                        style: TextStyle(color: Colors.orange, fontSize: 16, fontWeight: FontWeight.bold),
+                        textAlign: TextAlign.center,
                       ),
-                      onPressed: state.isPairing ? null : () => state.pair(),
-                    ),
-                  ],
+                      const SizedBox(height: 12),
+                      Text(
+                        state.error ?? DraupnirState.pairingRequiredMessage,
+                        style: const TextStyle(color: Colors.white70, fontSize: 14),
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 24),
+                      ElevatedButton.icon(
+                        icon: const Icon(Icons.refresh),
+                        label: const Text('TRY AGAIN'),
+                        style: ElevatedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+                          backgroundColor: Colors.orange,
+                          foregroundColor: Colors.white,
+                        ),
+                        onPressed: state.isLoading ? null : () => state.connectBluetooth(),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             )
@@ -351,13 +355,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  if (!state.isBluetooth)
-                    TextField(
-                      controller: _ipController,
-                      decoration: const InputDecoration(labelText: 'Device IP / Hostname'),
-                    )
-                  else
-                    const Text('Connected via Bluetooth (BLE)', style: TextStyle(color: Colors.green, fontWeight: FontWeight.bold)),
+                  Text(
+                    state.isBluetooth ? 'Connected via Bluetooth (BLE)' : 'Not connected',
+                    style: TextStyle(
+                      color: state.isBluetooth ? Colors.green : Colors.grey,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
                   const SizedBox(height: 16),
                   const Text('Dial Orientation', style: TextStyle(fontWeight: FontWeight.bold)),
                   DropdownButton<int>(
@@ -381,9 +385,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('CANCEL')),
                 ElevatedButton(
                   onPressed: () {
-                    if (!state.isBluetooth) {
-                      state.connect(_ipController.text);
-                    }
                     if (state.orientation != currentOrientation) {
                       state.setOrientation(currentOrientation);
                     }
@@ -453,80 +454,43 @@ class _DashboardScreenState extends State<DashboardScreen> {
     return Container(
       padding: const EdgeInsets.all(16),
       color: AppTheme.surface,
+      // BLE is the only transport. The Wi-Fi/IP branch here was the client half of the
+      // on-device web UI, which is cut permanently (spec v3 §1, §7).
       child: Column(
         children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              ChoiceChip(
-                label: const Text('Wi-Fi (Network)'),
-                selected: !_useBluetooth,
-                selectedColor: AppTheme.accent,
-                labelStyle: TextStyle(color: !_useBluetooth ? Colors.black : Colors.white),
-                onSelected: (val) {
-                  if (val) setState(() => _useBluetooth = false);
-                },
-              ),
-              const SizedBox(width: 16),
-              ChoiceChip(
-                label: const Text('Bluetooth (BLE)'),
-                selected: _useBluetooth,
-                selectedColor: AppTheme.accent,
-                labelStyle: TextStyle(color: _useBluetooth ? Colors.black : Colors.white),
-                onSelected: (val) {
-                  if (val) setState(() => _useBluetooth = true);
-                },
-              ),
-            ],
+          const Text(
+            'Pair "Draupnir" in your phone\'s Bluetooth settings first — the knob shows the PIN '
+            'on its screen.',
+            style: TextStyle(color: Colors.white54, fontSize: 12),
+            textAlign: TextAlign.center,
           ),
           const SizedBox(height: 16),
-          if (!_useBluetooth)
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _ipController,
-                    decoration: const InputDecoration(
-                      labelText: 'Device IP / Hostname',
-                      border: OutlineInputBorder(),
-                      isDense: true,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 16),
-                ElevatedButton(
-                  onPressed: () => state.connect(_ipController.text),
-                  child: const Text('CONNECT'),
-                ),
-              ],
-            )
-          else
-            Center(
-              child: ElevatedButton.icon(
-                icon: state.isScanningBle
-                    ? const SizedBox(
-                        width: 20,
-                        height: 20,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: Colors.black,
-                        ),
-                      )
-                    : const Icon(Icons.bluetooth),
-                label: Text(state.isScanningBle
-                    ? 'SCANNING FOR DRUAPNIR...'
-                    : 'CONNECT VIA BLUETOOTH'),
-                style: ElevatedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 32, vertical: 16),
-                  backgroundColor: AppTheme.accent,
-                  foregroundColor: Colors.black,
-                ),
-                onPressed: state.isScanningBle || state.isLoading
-                    ? null
-                    : () => state.connectBluetooth(),
+          Center(
+            child: ElevatedButton.icon(
+              icon: state.isScanningBle
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.black,
+                      ),
+                    )
+                  : const Icon(Icons.bluetooth),
+              label: Text(state.isScanningBle
+                  ? 'SCANNING FOR DRAUPNIR...'
+                  : 'CONNECT VIA BLUETOOTH'),
+              style: ElevatedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 32, vertical: 16),
+                backgroundColor: AppTheme.accent,
+                foregroundColor: Colors.black,
               ),
+              onPressed: state.isScanningBle || state.isLoading
+                  ? null
+                  : () => state.connectBluetooth(),
             ),
+          ),
         ],
       ),
     );

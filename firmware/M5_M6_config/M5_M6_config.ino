@@ -31,7 +31,19 @@
 
 enum AppMode { RUN_MODE, CONFIG_MODE, WIFI_SETUP_MODE };
 AppMode currentMode = RUN_MODE;
-String pairingToken = "";
+// The bespoke `pairingToken` / `pair` scheme is removed (spec v3 §7, M6/H1). It reimplemented —
+// badly — what BLE bonding already does correctly, and the companion app no longer sends a
+// token on any request. Access to the config surfaces is gated on CONFIG_MODE (a physical
+// gesture on the device) only.
+//
+// NOTE FOR WHOEVER PICKS THIS UP: this board's BLE stack, unlike the Waveshare firmware's, does
+// NOT yet set up BLE pairing/bonding or GATT permission flags. Removing the token therefore
+// leaves the M5Dial BLE config channel with no cryptographic access control at all. That was
+// already close to true — the token check was bypassed entirely whenever currentMode ==
+// CONFIG_MODE — but it should be closed by porting the BLESecurity block and the RX/TX
+// characteristic permission flags from firmware/Waveshare_LVGL_Test/ble_engine.cpp. That port
+// is deliberately not attempted here: it is a second-board change that cannot be verified
+// without the M5Dial in hand.
 
 BLEServer *pServer = nullptr;
 BLECharacteristic *pTxCharacteristic = nullptr;
@@ -782,25 +794,13 @@ void handleBleCommand(char *cmdStr) {
   }
   
   String cmd = req["cmd"] | "";
-  String token = req["token"] | "";
-  
-  if (cmd == "pair") {
-    if (currentMode != CONFIG_MODE) {
-      sendBleMessage("{\"status\":\"error\",\"message\":\"Not in Config Mode\"}");
-      return;
-    }
-    pairingToken = String(esp_random(), HEX) + String(esp_random(), HEX) + String(esp_random(), HEX);
-    prefs.putString("pairingToken", pairingToken);
-    sendBleMessage("{\"status\":\"ok\",\"token\":\"" + pairingToken + "\"}");
+  // The `pair` command and the per-request `token` check are removed (spec v3 §7, M6/H1) --
+  // see the note at the top of this file. Config access is gated on CONFIG_MODE.
+  if (currentMode != CONFIG_MODE) {
+    sendBleMessage("{\"status\":\"error\",\"message\":\"Not in Config Mode\"}");
     return;
   }
-  
-  // Authorization check for other commands
-  if (currentMode != CONFIG_MODE && (token != pairingToken || pairingToken.length() == 0)) {
-    sendBleMessage("{\"status\":\"error\",\"message\":\"Unauthorized\"}");
-    return;
-  }
-  
+
   if (cmd == "get_profiles") {
     // Stream the response straight from the already-loaded global profilesDoc into the chunked
     // BLE pipeline via BleChunkSink — the payload is NEVER built as a String. Two OOM bugs have
@@ -987,22 +987,17 @@ class TxLogCallbacks: public BLECharacteristicCallbacks {
     }
 };
 
+// The Bearer-token branch is removed along with the rest of the pairingToken scheme (M6/H1).
+// The legacy web UI on this board is gated on CONFIG_MODE only. The whole web server is slated
+// for removal (spec v3 §1 cuts the web config path permanently); that removal is out of scope
+// for M6 and is not attempted here.
 bool isAuthorized() {
-  if (currentMode == CONFIG_MODE) return true;
-  if (server.hasHeader("Authorization")) {
-    String auth = server.header("Authorization");
-    if (auth == "Bearer " + pairingToken && pairingToken.length() > 0) return true;
-  }
-  return false;
+  return currentMode == CONFIG_MODE;
 }
 
 void setupWebServer() {
   server.enableCORS(true);
-  
-  const char * headerkeys[] = {"Authorization"};
-  size_t headerkeyssize = sizeof(headerkeys)/sizeof(char*);
-  server.collectHeaders(headerkeys, headerkeyssize);
-  
+
   server.on("/", HTTP_GET, [](){
     if (currentMode != CONFIG_MODE) {
       server.send(403, "text/plain", "Forbidden. Swipe down on Draupnir to enter Config Mode.");
@@ -1011,15 +1006,7 @@ void setupWebServer() {
     server.send(200, "text/html", INDEX_HTML);
   });
   
-  server.on("/api/pair", HTTP_POST, []() {
-    if (currentMode != CONFIG_MODE) {
-      server.send(403, "application/json", "{\"status\":\"error\",\"message\":\"Not in Config Mode\"}");
-      return;
-    }
-    pairingToken = String(esp_random(), HEX) + String(esp_random(), HEX) + String(esp_random(), HEX);
-    prefs.putString("pairingToken", pairingToken);
-    server.send(200, "application/json", "{\"token\":\"" + pairingToken + "\"}");
-  });
+  // /api/pair removed with the pairingToken scheme (M6/H1).
 
   server.on("/api/profiles", HTTP_GET, [](){
     if (!isAuthorized()) {
@@ -1186,8 +1173,10 @@ void setup() {
   }
   
   prefs.begin("draupnir", false);
-  pairingToken = prefs.getString("pairingToken", "");
-  
+  // Actively delete any token left in NVS by a pre-M6 build, so the key does not linger on
+  // devices that have already been paired the old way.
+  prefs.remove("pairingToken");
+
   loadProfiles();
   
   int brightness = profilesDoc["settings"]["brightness"] | 160;
