@@ -172,6 +172,10 @@ static void handleBleCommand(char *cmdStr) {
       Serial.printf("[ble] get_profiles: streamed %u bytes\n", (unsigned)sink.totalSent);
     } else {
       Serial.println("[ble] get_profiles: send aborted (ack retries exhausted)");
+      // Best-effort: without this the app has nothing to react to and waits out its full 30s
+      // timeout with no diagnostic. This send may itself fail if the link is genuinely broken;
+      // that is acceptable and costs at most one more short retry cycle.
+      sendBleMessage("{\"status\":\"error\",\"message\":\"Send failed\"}");
     }
   } else if (cmd == "save_profiles") {
     // Matches M5_M6_config.ino's save_profiles handler: write the app's "profiles" object
