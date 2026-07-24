@@ -260,8 +260,16 @@ static void handleBleCommand(char *cmdStr) {
 // scheme: a duplicate-write guard (the RX characteristic's onWrite() fires twice for the same
 // value on some stacks/timings) and a '\n'-terminated message boundary. bleRxBuf is malloc'd
 // once in ble_init(), not a static array (see the comment above BLE_RX_BUFFER_SIZE).
+// Window for the duplicate-write guard below. The app paces its chunks with an explicit 20ms
+// delay AND waits for each write's ATT response, and the negotiated connection interval is
+// 50-100ms (see updateConnParams in ServerCallbacks::onConnect), so two genuinely distinct
+// chunks cannot arrive closer together than tens of milliseconds. A stack-level duplicate of a
+// single write arrives within a millisecond or two.
+static const uint32_t BLE_RX_DUP_WINDOW_MS = 10;
+
 class RxCallbacks : public BLECharacteristicCallbacks {
   String lastRxValue;
+  uint32_t lastRxValueMs = 0;
   void onWrite(BLECharacteristic *pCharacteristic) override {
     String rxValue = pCharacteristic->getValue();
     if (rxValue.length() == 2 && (uint8_t)rxValue[0] == BLE_CHUNK_ACK_MARKER) {
@@ -269,8 +277,35 @@ class RxCallbacks : public BLECharacteristicCallbacks {
       xQueueOverwrite(bleAckQueue, &seq);
       return;
     }
-    if (rxValue == lastRxValue) return; // duplicate callback for the same write
+
+    // Duplicate-write guard, scoped by time rather than by value equality alone.
+    //
+    // The original guard dropped ANY write whose bytes matched the previous one. That assumes
+    // two identical consecutive writes are always a stack artifact, which is false: the app
+    // sends save_profiles in 180-byte chunks, and with repetitive JSON -- runs of similar macro
+    // objects, long icon_xbm hex strings -- two genuinely identical adjacent chunks are
+    // possible. The second was silently discarded, corrupting the command with no error.
+    //
+    // RESIDUAL RISK, documented deliberately: this is the work order's sanctioned interim fix,
+    // not the preferred one. The preferred fix is a sequence number on inbound chunks mirroring
+    // the [0xFE, seq] scheme used outbound, but that requires a matching companion-app change,
+    // and the same app also talks to firmware/M5_M6_config/ whose RX reassembler would not
+    // understand a seq-prefixed chunk. Until both firmwares carry inbound sequencing, a genuine
+    // duplicate-valued chunk arriving inside BLE_RX_DUP_WINDOW_MS is still dropped.
+    //
+    // Worth noting for whoever revisits this: on this NimBLE-backed core the artifact this
+    // guard was written for may not exist at all. BLECharacteristic::handleGATTServerEvent()
+    // invokes onWrite() exactly once per BLE_GATT_ACCESS_OP_WRITE_CHR, with no prepare/execute
+    // double-dispatch of the kind Bluedroid had. The guard is kept only because that has not
+    // been confirmed on hardware.
+    uint32_t nowMs = millis();
+    if (rxValue == lastRxValue && (nowMs - lastRxValueMs) < BLE_RX_DUP_WINDOW_MS) {
+      Serial.printf("[ble] suppressed duplicate RX write (%u bytes, %ums apart)\n",
+                    (unsigned)rxValue.length(), (unsigned)(nowMs - lastRxValueMs));
+      return;
+    }
     lastRxValue = rxValue;
+    lastRxValueMs = nowMs;
 
     if (bleRxBuf == nullptr) return;
     for (size_t i = 0; i < rxValue.length(); i++) {
