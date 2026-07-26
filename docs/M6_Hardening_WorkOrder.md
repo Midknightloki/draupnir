@@ -8,6 +8,28 @@ start until this lands.
 
 ---
 
+> ## Status — updated 2026-07-25
+>
+> **All seven tasks are code-complete and compile-verified. None is hardware-verified.**
+> Commits, in order: `8051a7d` (H2), `c868e31` (H3), `0c09ef8` (H4), `d2edc07` (H5),
+> `798fa46` (H6), `a2733c7` (H7), `3607a28` (H1). Baseline is `6373651`.
+>
+> **M6 is NOT complete.** The milestone's defining test — an unbonded BLE central being rejected
+> — has not been run. See H1's verification section.
+>
+> **Two prescriptions in H1 as originally written were wrong for this core** and have been
+> corrected in place below; the notes are kept rather than deleted because the reasoning matters.
+> Both were caught during implementation and verified against
+> `m5stack:esp32 3.3.8`'s BLE library sources.
+>
+> **Before flashing anything:** the FQBN for the Waveshare board is not recorded anywhere in this
+> repo. The M6 work was compile-checked against `m5stack:esp32:m5stack_stamp_s3` with
+> `FlashSize=8M` purely as a syntax check — that is **not** confirmed as the correct upload
+> target, and the board is believed to have 16 MB of flash. Establish the real FQBN and record it
+> in `docs/Toolchain_arduino-cli.md`; its absence is what forced the guess.
+
+---
+
 ## 0. Why M6 exists
 
 Draupnir presents itself to the host as a **USB keyboard**. The BLE config channel can currently
@@ -252,11 +274,38 @@ merely insecure, it is **dead code that always reports failure**.
 **Required behavior:**
 
 **Firmware:**
-1. Set GATT access permissions on **both** the RX and TX characteristics requiring an encrypted
-   *and* authenticated (MITM-protected) link. Permissions on the characteristic are what the
-   stack actually enforces; a security *request* at connect time is not.
-2. Apply equivalent protection to the **CCCD / `BLE2902` descriptor** on the TX characteristic —
-   notification subscription is a write, and leaving the descriptor open is a common gap.
+1. Require an encrypted *and* authenticated (MITM-protected) link on **both** the RX and TX
+   characteristics. Flags on the characteristic itself are what the stack actually enforces; a
+   security *request* at connect time is not.
+
+   > **Corrected 2026-07-25.** This originally said "set GATT access permissions" and pointed at
+   > `setAccessPermissions()`. **That method does nothing on this core** — its entire body is
+   > wrapped in `#ifdef CONFIG_BLUEDROID_ENABLED` (`BLECharacteristic.cpp:167-171`), and
+   > `m_permissions` only exists under Bluedroid. NimBLE builds the attribute flags from the
+   > **properties bitmask** instead (`BLEService.cpp:632` assigns `flags = m_properties`).
+   >
+   > The enforcement bits therefore go in the properties argument to `createCharacteristic()`:
+   > `PROPERTY_WRITE_ENC` / `PROPERTY_WRITE_AUTHEN` (and the `READ_` equivalents), which resolve
+   > to real `BLE_GATT_CHR_F_*` values under NimBLE and to `0` under Bluedroid. Following the
+   > original instruction would have compiled, looked correct, and enforced nothing.
+
+2. Protect the CCCD so an unbonded central cannot subscribe to notifications.
+
+   > **Corrected 2026-07-25.** This originally said to protect the `BLE2902` descriptor.
+   > **On this core there is no such descriptor to protect:** `addDescriptor()` early-returns for
+   > UUID 0x2902 under NimBLE (`BLECharacteristic.cpp:126-134`), which auto-creates the CCCD
+   > itself. The pre-existing `addDescriptor(new BLE2902())` call was dead code and was removed.
+   >
+   > Gate the auto-created CCCD with `BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC` (0x8000) on the TX
+   > characteristic instead.
+   >
+   > **Known, accepted gap:** `BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN` is `0x10000`, and
+   > `BLECharacteristic` stores properties in a `uint16_t` (`esp_gatt_char_prop_t`), so that bit
+   > truncates to zero and cannot be applied through this wrapper. The CCCD is therefore gated on
+   > encryption but not explicitly on authentication. Not exploitable **as currently configured**
+   > — `ESP_LE_AUTH_REQ_SC_MITM_BOND` means this device will not complete a Just Works pairing, so
+   > any encrypted link is necessarily authenticated — but **this must be revisited if the auth
+   > mode is ever relaxed.**
 3. Keep `ESP_LE_AUTH_REQ_SC_MITM_BOND` and `ESP_IO_CAP_OUT` (display-only). The passkey is shown
    on screen; the user types it into the phone.
 4. **Remove** all remnants of the application-layer scheme: any `token` handling, any `pair`
@@ -268,13 +317,23 @@ merely insecure, it is **dead code that always reports failure**.
    and if it reintroduces instability, leave it off and *document why* in a code comment rather
    than silently.
 
-> **API caution.** This build uses the Bluedroid-styled wrapper classes (`BLEDevice`,
-> `BLECharacteristic`, `BLE2902`) but is **NimBLE-backed** on the installed core — confirmed in
-> the build's `sdkconfig.h` and noted at `ble_engine.cpp:261`. The exact permission API therefore
-> differs from most online examples. **Verify the available method against the installed core's
-> headers** (`BLECharacteristic::setAccessPermissions(...)` with `ESP_GATT_PERM_READ_ENC_MITM` /
-> `ESP_GATT_PERM_WRITE_ENC_MITM` is the likely shape) rather than copying a Bluedroid snippet.
-> Do not guess — read the header.
+> **API caution — the reason two prescriptions above were wrong.** This build uses the
+> Bluedroid-styled wrapper classes (`BLEDevice`, `BLECharacteristic`, `BLE2902`) but is
+> **NimBLE-backed** on the installed core (`m5stack:esp32 3.3.8`) — confirmed in the build's
+> `sdkconfig.h` and noted at `ble_engine.cpp:261`.
+>
+> The dangerous consequence: the wrapper **keeps the Bluedroid-shaped API surface and silently
+> neuters it.** `setAccessPermissions()` compiles and does nothing. `PROPERTY_READ_ENC` and
+> friends are `#define`d to **`0`** on the Bluedroid branch of `BLECharacteristic.h` and to real
+> `BLE_GATT_CHR_F_*` values on the NimBLE branch. `addDescriptor(new BLE2902())` compiles and is
+> discarded. Every one of these fails **silently and in the insecure direction** — nothing warns,
+> nothing errors, and the device advertises and connects exactly as before.
+>
+> Most online examples are Bluedroid and are actively wrong here. **Read the installed core's
+> headers and sources before using any BLE security API** — `BLECharacteristic.h`,
+> `BLECharacteristic.cpp`, `BLEService.cpp`. Do not guess, and do not trust that a call which
+> compiles has taken effect. Where a security flag cannot be verified in the sources, say so
+> rather than assuming.
 
 > **Known-history caution — read before flashing.** Per the comments at `ble_engine.cpp:288-293`
 > and `301-304`, the ENC permission flags plus `regenPassKeyOnConnect` were removed *because they
@@ -364,6 +423,37 @@ Do not start these; they are M7+ in spec §10. Listed so they are not "helpfully
 - Deleting `firmware/Waveshare_Knob_Config/` and its `refactor*.py` scripts.
 - The `loop()`-blocking issues (BLE ack retries up to 5x800ms; `delay(8)` per character in text
   macros). Real, but a design change deserving its own milestone.
+
+---
+
+## 3a. Follow-ups created by M6 *(added 2026-07-25)*
+
+Recorded so they are not lost. None blocks M6 sign-off; the first is the most important.
+
+- **The M5Dial firmware's BLE config channel now has no cryptographic gate.** H1 removed the
+  `pairingToken` scheme from `firmware/M5_M6_config/` for consistency, but that sketch has **no
+  `BLESecurity` setup and no GATT permission flags at all** — verified: the only `BLESecurity`
+  string in the file is an explanatory comment. Its config access is now gated solely on
+  `CONFIG_MODE`. This is close to the prior behaviour (the token check was bypassed whenever
+  `currentMode == CONFIG_MODE`) but it means the *second* supported board still carries exactly
+  the vulnerability M6 exists to close. **Port the Waveshare security block to it.** Note also a
+  real behaviour change: a valid token previously allowed config access *outside* CONFIG_MODE;
+  that path is gone.
+- **`_looksLikeAuthFailure` in the companion app is an untested string heuristic.** An
+  insufficient-authentication rejection surfaces as a platform GATT error rather than a device
+  response, so the app matches it loosely. Verify against the error text Android/iOS actually
+  return and tighten it.
+- **`http` and `shared_preferences` are now unused in `companion_app/pubspec.yaml`.** Left in
+  place deliberately rather than as a drive-by dependency change; safe to remove.
+- **H6 shipped the interim fix, not the sequenced one.** The RX duplicate-write guard is scoped by
+  a 10 ms window rather than by inbound sequence numbers, because the same app also talks to
+  `firmware/M5_M6_config/`, whose reassembler would not understand seq-prefixed chunks. Residual
+  risk is documented in the code. Revisit if both firmwares ever move together. Note also that
+  the NimBLE write path appears to call `onWrite` exactly once per ATT write with no
+  prepare/execute double-dispatch, which would make the guard vestigial here — unconfirmed on
+  hardware, which is why it was kept.
+- **Record the Waveshare FQBN** in `docs/Toolchain_arduino-cli.md`. See the status block at the
+  top of this document.
 
 ---
 
