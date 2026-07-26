@@ -141,13 +141,35 @@ class _DashboardScreenState extends State<DashboardScreen> {
           else if (state.error != null)
             Expanded(
               child: Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const Icon(Icons.error_outline, color: Colors.red, size: 48),
-                    const SizedBox(height: 16),
-                    Text(state.error!, style: const TextStyle(color: Colors.red)),
-                  ],
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 32),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Icon(Icons.error_outline, color: Colors.red, size: 48),
+                      const SizedBox(height: 16),
+                      Text(
+                        state.error!,
+                        style: const TextStyle(color: Colors.red),
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 24),
+                      // Without this the app was a dead end on any disconnect: the error was
+                      // displayed with no action attached, so the only way back to a working
+                      // connection was force-closing and reopening the app. Retrying in place is
+                      // safe — the disconnect handler already nulls connectedDevice/rxChar/txChar,
+                      // and connectBluetooth() clears `error`, rescans, and rebuilds all of that
+                      // characteristic state from scratch.
+                      ElevatedButton.icon(
+                        icon: const Icon(Icons.bluetooth_searching),
+                        label: const Text('RECONNECT'),
+                        style: ElevatedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+                        ),
+                        onPressed: state.isLoading ? null : () => state.connectBluetooth(),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             )
