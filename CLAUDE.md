@@ -62,10 +62,22 @@ arduino-cli compile --fqbn <FQBN> firmware/<sketch>
 arduino-cli upload -p <PORT> --fqbn <FQBN> firmware/<sketch>
 arduino-cli monitor -p <PORT> -c baudrate=115200
 ```
-M5Dial FQBN in use:
-`m5stack:esp32:m5stack_dial:USBMode=default,CDCOnBoot=cdc,FlashSize=8M,PartitionScheme=default_8MB`
+FQBNs in use — **full detail and the reasoning behind every option is in
+`docs/Toolchain_arduino-cli.md`; read it before flashing:**
 
-See `docs/Toolchain_arduino-cli.md` and `docs/M0_Setup_and_BringUp.md`.
+- **Waveshare (primary)** — needs the **Espressif** core (`core install esp32:esp32`); the
+  M5Stack core alone has no suitable target:
+  `esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc,FlashMode=qio,FlashSize=16M,PartitionScheme=default_8MB,PSRAM=disabled`
+- **M5Dial** — `m5stack:esp32:m5stack_dial:USBMode=default,CDCOnBoot=cdc,FlashSize=8M,PartitionScheme=default_8MB`
+
+**Two Waveshare quirks that will waste your time if you meet them cold:**
+- **The USB-C plug orientation picks which MCU you reach.** The board has two (ESP32-S3R8 and
+  ESP32-U4WDH) behind one port, switched by a CH445P. If esptool reports `ESP32-U4WDH` / 4 MB
+  flash / VID `0x1A86`, the plug is upside down — rotate it 180°. The S3 shows VID `0x303A`.
+- **Auto-reset does not work.** The running TinyUSB CDC ignores esptool's DTR/RTS reset, so
+  `No serial data received` means "hold BOOT and replug", not "the board is broken".
+
+See also `docs/M0_Setup_and_BringUp.md`.
 
 ## Firmware trees
 - `firmware/Waveshare_LVGL_Test/` — **primary.** Ring UI + BLE + macro engine, factored into

@@ -22,11 +22,21 @@ start until this lands.
 > Both were caught during implementation and verified against
 > `m5stack:esp32 3.3.8`'s BLE library sources.
 >
-> **Before flashing anything:** the FQBN for the Waveshare board is not recorded anywhere in this
-> repo. The M6 work was compile-checked against `m5stack:esp32:m5stack_stamp_s3` with
-> `FlashSize=8M` purely as a syntax check — that is **not** confirmed as the correct upload
-> target, and the board is believed to have 16 MB of flash. Establish the real FQBN and record it
-> in `docs/Toolchain_arduino-cli.md`; its absence is what forced the guess.
+> **FQBN — RESOLVED 2026-07-25.** Now recorded in `docs/Toolchain_arduino-cli.md`:
+>
+> ```
+> esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc,FlashMode=qio,FlashSize=16M,PartitionScheme=default_8MB,PSRAM=disabled
+> ```
+>
+> Requires the **Espressif** core (`arduino-cli core install esp32:esp32`), which was not
+> installed — the M5Stack core alone has no suitable target, which is why the original M6 work was
+> compile-checked against `m5stack_stamp_s3` as a syntax-only stand-in. The M6 firmware
+> **re-compiles clean** against the real FQBN: ~970 KB (29 %) flash, ~112 KB (34 %) RAM.
+>
+> Hardware confirmed on-chip via `esptool flash-id`: ESP32-S3 rev v0.2, **16 MB quad flash**,
+> **8 MB embedded PSRAM**. Two board quirks are documented in the toolchain doc and will waste
+> your time if you meet them cold: the **USB-C plug orientation** selects which of the board's two
+> MCUs you reach, and **auto-reset does not work** — download mode needs a manual BOOT press.
 
 ---
 

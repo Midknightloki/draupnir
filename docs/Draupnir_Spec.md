@@ -115,14 +115,29 @@ is the authority if a datasheet disagrees.
 
 | Item | Detail |
 |---|---|
-| Controller | ESP32-S3, native USB (OTG/CDC) |
+| Controller | **ESP32-S3R8** (QFN56, rev v0.2), native USB (OTG/CDC) |
+| Flash | **16 MB**, quad (4 data lines) per eFuse, 3.3 V |
+| PSRAM | **8 MB embedded** (AP_3v3, octal) — **present but currently unused**, see below |
+| Second MCU | **ESP32-U4WDH** (4 MB flash) also on the board, sharing the single USB-C port |
 | Display | 1.8" round AMOLED, **360x360**, **SH8601** over **QSPI**, 16 bpp |
 | LCD pins | CS 14, PCLK 13, D0-D3 15/16/17/18, RST 21, backlight 47 (LEDC PWM) |
 | Touch | **CST816**, I2C addr **0x15**, SDA 11 / SCL 12 |
 | Encoder | Rotary, A = **GPIO 8**, B = **GPIO 7** |
 | Encoder button | **Not wired in firmware** — `knob_config_t` exposes A/B only. Confirm whether the hardware has a push action before relying on it. |
-| Memory | LVGL draw buffers are allocated `MALLOC_CAP_DMA` from internal RAM; **no PSRAM is used**. Treat heap as tight. |
 | UI stack | LVGL + `esp_lcd_sh8601` |
+| FQBN | See `docs/Toolchain_arduino-cli.md` — generic `esp32:esp32:esp32s3`, Espressif core required |
+
+**On PSRAM.** The board has 8 MB and the firmware uses none of it: LVGL draw buffers are allocated
+`MALLOC_CAP_DMA` from internal RAM, and the build currently sets `PSRAM=disabled` to keep the
+memory configuration out of the M6 stability diagnosis. So heap is tight **by choice, not by
+constraint** — unlike the M5Dial, where it is a hard limit. Enabling `PSRAM=opi` is the obvious
+relief valve for the BLE reassembly buffer and the profile `JsonDocument` once M6 is stable.
+
+**Two board quirks that cost real time if met cold** (both detailed in the toolchain doc):
+the **USB-C plug orientation** selects, via a CH445P analog switch, which of the two MCUs the
+single USB port reaches — plug it the wrong way and you are talking to the ESP32-U4WDH, not the
+S3. And **auto-reset does not work**: the running firmware's TinyUSB CDC ignores esptool's
+DTR/RTS reset, so download mode requires a manual BOOT press.
 
 ### Second target — M5Stack Dial v1.1
 
@@ -426,8 +441,10 @@ to leave plugged into a machine.
   verify the Waveshare `bidi_switch_knob` ratio explicitly rather than assuming 1:1.
 - **Encoder push button.** Not wired in the Waveshare firmware. Confirm whether the hardware has
   one; if it does, wire it to "fire selection" so the center tap is not the only path.
-- **Heap pressure.** No PSRAM on either board, with LVGL draw buffers, a JSON document, BLE, and
-  USB all resident. Config payloads and any icon cache must be budgeted, not assumed.
+- **Heap pressure.** LVGL draw buffers, a JSON document, BLE, and USB all resident at once.
+  Hard on the **M5Dial**, which genuinely has no PSRAM. On the **Waveshare** board 8 MB of PSRAM is
+  available and simply not enabled yet — so budget config payloads and any icon cache carefully on
+  the Dial, and treat Waveshare heap limits as a setting to revisit rather than a ceiling.
 - **Blocking in loop().** BLE chunk ack retries and per-character HID pacing both block the loop
   task, stalling in-flight macros. Needs a bounded time budget per tick.
 - **Keyboard layout.** HID sends keycodes; typed `text` assumes US layout for v1.
