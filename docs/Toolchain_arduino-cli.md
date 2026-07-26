@@ -96,9 +96,40 @@ Always check the VID before assuming which chip you are talking to:
 arduino-cli board list --format json
 ```
 
+### Telling run mode from download mode — check `serialNumber`, not the port number
+
+Both modes present VID `0x303A` PID `0x1001`, so PID alone cannot distinguish them. The
+`serialNumber` field can:
+
+| `serialNumber` | Mode | Meaning |
+|---|---|---|
+| `FC012CD1DDD8` (the MAC) | **Running** | Arduino core's TinyUSB CDC sets it from the MAC |
+| *empty* | **Download** | ROM USB-Serial/JTAG does not set one |
+
+```
+arduino-cli board list --format json
+```
+
+The port number also changes between modes (COM10 vs COM11 here), so never reuse a
+previously-known port after any mode change.
+
+### After uploading, you must physically replug
+
+**`esptool`'s closing `Hard resetting via RTS pin...` is a no-op on this board** — the same reason
+auto-reset does not work. The flash writes and verifies correctly, but the board **stays in
+download mode and never runs the new firmware.** Serial capture returns absolutely nothing, which
+looks alarmingly like a boot loop.
+
+It is not. **Unplug and replug (correct orientation, without holding BOOT)** and the new firmware
+runs. Confirm via the `serialNumber` table above before concluding anything is wrong.
+
 ### Download mode (human step)
 
 **Hold BOOT on the ESP32-S3R8, plug in USB-C (correct orientation), release BOOT.**
+
+> **Tip from the field:** mark the S3 side of the USB-C cable (e.g. a dab of green paint) so the
+> correct orientation is unambiguous. The two orientations are otherwise indistinguishable by
+> feel, and the wrong one silently talks to the other MCU.
 
 Auto-reset does **not** work on this board the way it does on a UART-bridge board. Once the
 firmware is running, its native USB is a **TinyUSB CDC** device that does not honour esptool's
