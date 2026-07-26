@@ -7,6 +7,7 @@
 #include "bidi_switch_knob.h"
 #include "macro_engine.h"
 #include "ble_engine.h"
+#include "haptics.h"
 
 #define ENCODER_ECA_PIN 8
 #define ENCODER_ECB_PIN 7
@@ -38,6 +39,23 @@ static uint32_t parse_hex_color(const char *hex, uint32_t fallback) {
 }
 
 #define EMPTY_SLOT_COLOR 0x242430
+
+// Green, matching the M5Dial build's running-macro ring, and deliberately different from the
+// white selection highlight so "selected" and "running" never read as the same state.
+#define RUNNING_COLOR 0x30FF60
+
+// The pulse is a triangle wave over PULSE_PERIOD_MS. It never falls to zero opacity -- an
+// indicator that fully disappears reads as flicker or a glitch rather than as a live state.
+#define PULSE_PERIOD_MS 1200
+#define PULSE_MIN_OPA 70
+#define PULSE_MAX_OPA 255
+
+static lv_opa_t pulse_opa(void) {
+  uint32_t phase = millis() % PULSE_PERIOD_MS;
+  uint32_t half = PULSE_PERIOD_MS / 2;
+  uint32_t tri = (phase < half) ? phase : (PULSE_PERIOD_MS - phase); // 0..half, then back down
+  return (lv_opa_t)(PULSE_MIN_OPA + (tri * (PULSE_MAX_OPA - PULSE_MIN_OPA)) / half);
+}
 
 static void scan_active_positions(void) {
   active_count = 0;
@@ -142,6 +160,18 @@ static void ring_draw_event_cb(lv_event_t *e) {
       lv_draw_arc(draw_ctx, &hl, &center_pt, RING_OUTER_R, (uint16_t)lroundf(start), (uint16_t)lroundf(end));
       lv_draw_arc(draw_ctx, &hl, &center_pt, RING_INNER_R + 4, (uint16_t)lroundf(start), (uint16_t)lroundf(end));
     }
+
+    // Drawn last so it wins over the white selection highlight when a wedge is both selected and
+    // running -- "running" is the more urgent state, and a macro looping unnoticed is exactly the
+    // failure this indicator exists to prevent.
+    if (macros_is_running(active_positions[v])) {
+      lv_draw_arc_dsc_t run;
+      lv_draw_arc_dsc_init(&run);
+      run.color = lv_color_hex(RUNNING_COLOR);
+      run.width = 8;
+      run.opa = pulse_opa();
+      lv_draw_arc(draw_ctx, &run, &center_pt, RING_OUTER_R, (uint16_t)lroundf(start), (uint16_t)lroundf(end));
+    }
   }
 }
 
@@ -191,6 +221,61 @@ static void screen_click_cb(lv_event_t *e) {
     int idx = wedge_index_from_point(p.x, p.y);
     select_idx(idx);
     macros_request_fire(active_positions[idx]);
+  }
+}
+
+// Swipe down anywhere = stop every running macro. A gesture rather than an on-screen button
+// because it can be performed without looking at the screen -- the same reasoning the M5Dial
+// build used -- which is what you want when a runaway "toggle" macro is spamming the host and
+// the screen is the last thing you're looking at.
+//
+// Runs on the LVGL task, so it must NOT call macros_stop_all() directly (see macro_engine.h);
+// macros_request_stop_all() queues it for loop().
+static void screen_gesture_cb(lv_event_t *e) {
+  lv_indev_t *indev = lv_indev_get_act();
+  if (!indev) return;
+  if (lv_indev_get_gesture_dir(indev) != LV_DIR_BOTTOM) return;
+  if (!macros_any_running()) return;
+
+  Serial.println("[diag] swipe down -> kill all macros");
+  macros_request_stop_all();
+  haptics_pulse(); // replaces the M5Dial's buzzer blip: eyes-free confirmation the gesture took
+
+  // Suppress the rest of this touch so the release does not also land as a CLICKED event on
+  // whatever wedge the finger happens to end over -- otherwise killing everything could
+  // immediately re-fire a macro.
+  lv_indev_wait_release(indev);
+}
+
+// The running pulse is time-driven, so something has to repaint while a macro runs. Done here
+// from loop() under lvgl_lock(), matching update_pairing_overlay()/update_profiles_reload()
+// rather than an lv_timer -- an lv_timer runs on the LVGL task, which would read runningMacros[]
+// concurrently with loop()'s writes to it.
+static unsigned long last_pulse_repaint = 0;
+static void update_running_pulse(void) {
+  static bool was_running = false;
+  bool running = macros_any_running();
+
+  if (!running) {
+    if (was_running) {
+      was_running = false;
+      // One final repaint on the running->idle edge, or the last-drawn pulse frame stays burned
+      // on screen and the ring looks permanently "running".
+      if (lvgl_lock(50)) {
+        lv_obj_invalidate(lv_scr_act());
+        lvgl_unlock();
+      }
+    }
+    return;
+  }
+
+  was_running = true;
+  unsigned long now = millis();
+  if (now - last_pulse_repaint < 60) return; // ~16 fps: smooth enough for a 1.2 s pulse, cheap
+  last_pulse_repaint = now;
+  if (lvgl_lock(50)) {
+    lv_obj_invalidate(lv_scr_act());
+    lvgl_unlock();
   }
 }
 
@@ -263,6 +348,7 @@ static void build_ring_ui(void) {
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
   lv_obj_add_event_cb(scr, ring_draw_event_cb, LV_EVENT_DRAW_MAIN_END, NULL);
   lv_obj_add_event_cb(scr, screen_click_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_add_event_cb(scr, screen_gesture_cb, LV_EVENT_GESTURE, NULL);
 
   center_label = lv_label_create(scr);
   lv_obj_set_style_text_color(center_label, lv_color_white(), 0);
@@ -312,6 +398,8 @@ void setup() {
 
   Touch_Init();
   Serial.println("[diag] Touch_Init done");
+  haptics_init(); // after Touch_Init(): it installs the I2C driver this shares
+
   lcd_lvgl_Init();
   Serial.printf("[diag] lcd_lvgl_Init done heap=%u\n", ESP.getFreeHeap());
   lcd_bl_pwm_bsp_init(LCD_PWM_MODE_255);
@@ -348,6 +436,7 @@ void loop() {
   ble_update();
   update_pairing_overlay();
   update_profiles_reload();
+  update_running_pulse();
   if (millis() - last_loop_print > 3000) {
     last_loop_print = millis();
     Serial.printf("[diag] loop alive heap=%u\n", ESP.getFreeHeap());

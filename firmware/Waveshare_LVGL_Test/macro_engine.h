@@ -57,3 +57,15 @@ bool macros_is_running(int pos);
 // pool, which deserializeJson() frees and reallocates on reload; a macro still running across
 // that boundary reads freed memory on its next macros_update() tick.
 void macros_stop_all();
+
+// Cross-task-safe form of macros_stop_all(), for the swipe-down "kill all" gesture, whose event
+// callback runs on the LVGL task. Enqueues a sentinel that macros_update() picks up and acts on
+// from loop(), exactly as macros_request_fire() does for a normal fire.
+void macros_request_stop_all();
+
+// True if any macro is currently running -- drives the ring's "this macro is running" pulse and
+// tells the UI whether a kill-all gesture would do anything.
+//
+// Unlike the mutating calls above, this is safe to read from the LVGL task: it only reads the
+// `active` booleans, never writes, and a one-frame-stale answer costs at most one frame of pulse.
+bool macros_any_running();
