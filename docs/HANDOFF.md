@@ -115,6 +115,19 @@ persistence.
 Use `scripts/serial_capture.ps1 -Port <COM> -DurationSec <n> -LogPath <file>`.
 **Do not use `arduino-cli monitor`** — it treats non-interactive stdin as an immediate quit.
 
+### Companion app — build for Android, never Windows
+
+```
+cd companion_app
+flutter build apk --debug     # ALWAYS build first -- `flutter install` does NOT rebuild
+flutter install
+```
+
+`flutter doctor` reports a Visual Studio error. **Ignore it.** It only affects
+`flutter run -d windows`, which this project never uses; the Android toolchain is green and the
+APK builds in ~48 s. See `docs/FLUTTER_TOOLCHAIN_ISSUE.md` — a previous session lost time to a
+proposed Visual Studio reinstall that would have fixed nothing.
+
 ---
 
 ## 5. What to do next, in order
