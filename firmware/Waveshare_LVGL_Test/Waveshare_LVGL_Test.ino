@@ -215,12 +215,22 @@ static void screen_click_cb(lv_event_t *e) {
   float dy = (float)p.y - EXAMPLE_LCD_V_RES / 2.0f;
   float dist = sqrtf(dx * dx + dy * dy);
 
+  // DIAGNOSTIC (temporary): the touch->fire path had no logging at all, so a tap that never
+  // fired was indistinguishable from a tap that never arrived. Logs whether CLICKED reaches us,
+  // where, and which branch it takes.
+  Serial.printf("[tap] CLICKED x=%d y=%d dist=%.1f inner=%d outer=%d active_count=%d\n",
+                (int)p.x, (int)p.y, dist, RING_INNER_R, RING_OUTER_R, active_count);
+
   if (dist < RING_INNER_R) {
+    Serial.printf("[tap] -> center, fire pos=%d\n", active_positions[selected_idx]);
     macros_request_fire(active_positions[selected_idx]);
   } else if (dist <= RING_OUTER_R + 10) {
     int idx = wedge_index_from_point(p.x, p.y);
+    Serial.printf("[tap] -> wedge v=%d fire pos=%d\n", idx, active_positions[idx]);
     select_idx(idx);
     macros_request_fire(active_positions[idx]);
+  } else {
+    Serial.println("[tap] -> outside ring, ignored");
   }
 }
 
@@ -234,7 +244,12 @@ static void screen_click_cb(lv_event_t *e) {
 static void screen_gesture_cb(lv_event_t *e) {
   lv_indev_t *indev = lv_indev_get_act();
   if (!indev) return;
-  if (lv_indev_get_gesture_dir(indev) != LV_DIR_BOTTOM) return;
+  lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+  // DIAGNOSTIC (temporary): a GESTURE firing on ordinary taps would explain taps not reaching
+  // CLICKED at all -- LVGL delivers one or the other, not both.
+  Serial.printf("[tap] GESTURE dir=%d (bottom=%d) any_running=%d\n",
+                (int)dir, (int)LV_DIR_BOTTOM, (int)macros_any_running());
+  if (dir != LV_DIR_BOTTOM) return;
   if (!macros_any_running()) return;
 
   Serial.println("[diag] swipe down -> kill all macros");
@@ -398,7 +413,14 @@ void setup() {
 
   Touch_Init();
   Serial.println("[diag] Touch_Init done");
-  haptics_init(); // after Touch_Init(): it installs the I2C driver this shares
+  // DIAGNOSTIC BISECT (temporary): touch stopped reaching LVGL entirely after this was added --
+  // no CLICKED and no GESTURE events, while the encoder kept working. haptics_init() is the only
+  // new code sharing I2C bus 0 with the CST816 touch controller at 0x15, and it probes all 112
+  // addresses at boot before lcd_lvgl_Init() registers the touch input device. Disabled to test
+  // that as a single variable; everything else on this branch stays in.
+  // haptics_init();
+  Serial.println("[diag] haptics_init SKIPPED (bisect: testing I2C interference with touch)");
+
 
   lcd_lvgl_Init();
   Serial.printf("[diag] lcd_lvgl_Init done heap=%u\n", ESP.getFreeHeap());
@@ -439,7 +461,11 @@ void loop() {
   update_running_pulse();
   if (millis() - last_loop_print > 3000) {
     last_loop_print = millis();
-    Serial.printf("[diag] loop alive heap=%u\n", ESP.getFreeHeap());
+    // any_running is the important new field: a "toggle" macro never terminates, so one left
+    // looping would drive update_running_pulse()'s 16fps full-ring repaint forever and could
+    // starve the LVGL task of the lock it needs to process touch.
+    Serial.printf("[diag] loop alive heap=%u any_running=%d active_count=%d selected=%d\n",
+                  ESP.getFreeHeap(), (int)macros_any_running(), active_count, selected_idx);
   }
   delay(5);
 }

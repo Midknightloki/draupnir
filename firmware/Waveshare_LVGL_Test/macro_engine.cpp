@@ -69,8 +69,15 @@ void hid_init() {
 #define MACRO_CMD_STOP_ALL (-99)
 
 void macros_request_fire(int pos) {
-  if (!fireQueue) return;
-  xQueueSend(fireQueue, &pos, 0);
+  if (!fireQueue) {
+    Serial.println("[fire] request DROPPED: no queue");
+    return;
+  }
+  // DIAGNOSTIC (temporary): xQueueSend with a 0 tick timeout silently drops when the queue is
+  // full (depth 8), which would look exactly like "the tap did nothing".
+  BaseType_t ok = xQueueSend(fireQueue, &pos, 0);
+  Serial.printf("[fire] request pos=%d queued=%d waiting=%u\n",
+                pos, (int)(ok == pdTRUE), (unsigned)uxQueueMessagesWaiting(fireQueue));
 }
 
 void macros_request_stop_all() {
@@ -356,17 +363,28 @@ static void executeAction(JsonObject action) {
 }
 
 void macros_fire(int pos) {
-  if (pos < 0 || pos >= NUM_MACRO_SLOTS) return;
+  // DIAGNOSTIC (temporary): distinguishes "never dequeued" from "dequeued but no macro at that
+  // pos" from "dequeued and started".
+  if (pos < 0 || pos >= NUM_MACRO_SLOTS) {
+    Serial.printf("[fire] fire pos=%d REJECTED (out of range)\n", pos);
+    return;
+  }
   JsonObject macro = profiles_find_macro(pos);
-  if (macro.isNull()) return;
+  if (macro.isNull()) {
+    Serial.printf("[fire] fire pos=%d REJECTED (no macro at this pos)\n", pos);
+    return;
+  }
 
   const char *mode = macro["mode"] | "play_once";
   bool isToggle = (strcmp(mode, "toggle") == 0);
 
   if (runningMacros[pos].active && runningMacros[pos].isToggle) {
+    Serial.printf("[fire] fire pos=%d -> stopping running toggle\n", pos);
     runningMacros[pos].active = false;
     return;
   }
+  Serial.printf("[fire] fire pos=%d START mode=%s actions=%u\n", pos, mode,
+                (unsigned)(macro["actions"].isNull() ? 0 : macro["actions"].size()));
 
   runningMacros[pos].active = true;
   runningMacros[pos].isToggle = isToggle;
