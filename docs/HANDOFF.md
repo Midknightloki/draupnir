@@ -54,6 +54,32 @@ c868e31  fix(m6): H3
 2da815e  docs: spec v3
 ```
 
+### H3 — VERIFIED ON HARDWARE 2026-07-26 ✅
+
+The use-after-free fix is **confirmed**, twice, in the exact scenario that was previously a
+guaranteed crash: a `toggle` macro actively looping when `save_profiles` triggers a reload.
+
+```
+22:17:48  [fire] fire pos=3 START mode=toggle
+22:17:50  loop alive ... any_running=1          <- macro confirmed running
+22:17:52  [ble] cmd: save_profiles
+22:17:52  [ble] save_profiles: committed 903 bytes
+22:17:52  profiles_reload: deserializeJson done, err=Ok     <- the pool realloc
+22:17:53  rebuild_ring_layout: active_count=4
+22:17:53  loop alive ... any_running=0          <- macros_stop_all() dropped the stale ref
+```
+
+Repeated at 22:18:20 with the macro having looped 22 s first. **No crash, no reset, no panic —
+no `rst:0x` line in 90 s of capture.** The `any_running` 1→0 transition immediately after each
+reload is the direct evidence: the running macro was deliberately stopped rather than left
+holding a `JsonObject` into a freed pool.
+
+No leak across cycles: resting heap 61304 → 61136 → 61128, stepping with JSON document size
+(903 → 919 bytes), not per-cycle.
+
+Also confirmed in the same session: **H4's atomic write** (`committed N bytes` — serialize to
+tmp, verify, rename) fired on every save.
+
 ### Verified on hardware ✅
 
 `a2733c7` (H2–H7, **no security changes**) was flashed and confirmed working:
