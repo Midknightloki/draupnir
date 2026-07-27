@@ -40,21 +40,30 @@ static uint32_t parse_hex_color(const char *hex, uint32_t fallback) {
 
 #define EMPTY_SLOT_COLOR 0x242430
 
-// Green, matching the M5Dial build's running-macro ring, and deliberately different from the
-// white selection highlight so "selected" and "running" never read as the same state.
-#define RUNNING_COLOR 0x30FF60
+// The running indicator modulates the wedge's BRIGHTNESS rather than tinting it a fixed colour.
+//
+// A fixed hue cannot work here: macro colours are user-chosen, so any constant we pick is
+// invisible on a macro someone coloured the same. That is not hypothetical -- the first version
+// used a green pulse and was completely invisible on a green macro, while showing correctly on a
+// blue one. Picking a different constant just moves the collision to a different user.
+//
+// Overlaying white for half the cycle and black for the other half makes the wedge breathe
+// lighter-then-darker, which is visible against ANY colour including white and black. It also
+// stops competing with the white selection outline: "selected" is a static shape, "running" is
+// motion, so the two never read as the same state.
+#define PULSE_PERIOD_MS 1400
+#define PULSE_PEAK_OPA 110
 
-// The pulse is a triangle wave over PULSE_PERIOD_MS. It never falls to zero opacity -- an
-// indicator that fully disappears reads as flicker or a glitch rather than as a live state.
-#define PULSE_PERIOD_MS 1200
-#define PULSE_MIN_OPA 70
-#define PULSE_MAX_OPA 255
-
-static lv_opa_t pulse_opa(void) {
+// Sets *lighten and returns the overlay opacity for this instant. Ramps up and back down within
+// each half-cycle so it eases rather than snapping at the direction change.
+static lv_opa_t pulse_overlay(bool *lighten) {
   uint32_t phase = millis() % PULSE_PERIOD_MS;
   uint32_t half = PULSE_PERIOD_MS / 2;
-  uint32_t tri = (phase < half) ? phase : (PULSE_PERIOD_MS - phase); // 0..half, then back down
-  return (lv_opa_t)(PULSE_MIN_OPA + (tri * (PULSE_MAX_OPA - PULSE_MIN_OPA)) / half);
+  *lighten = (phase < half);
+  uint32_t t = *lighten ? phase : (phase - half); // 0..half within the current direction
+  uint32_t quarter = half / 2;
+  uint32_t tri = (t < quarter) ? t : (half - t);  // 0..quarter, up then back down
+  return (lv_opa_t)((tri * PULSE_PEAK_OPA) / quarter);
 }
 
 static void scan_active_positions(void) {
@@ -165,11 +174,13 @@ static void ring_draw_event_cb(lv_event_t *e) {
     // running -- "running" is the more urgent state, and a macro looping unnoticed is exactly the
     // failure this indicator exists to prevent.
     if (macros_is_running(active_positions[v])) {
+      bool lighten = true;
+      lv_opa_t opa = pulse_overlay(&lighten);
       lv_draw_arc_dsc_t run;
       lv_draw_arc_dsc_init(&run);
-      run.color = lv_color_hex(RUNNING_COLOR);
-      run.width = 8;
-      run.opa = pulse_opa();
+      run.color = lighten ? lv_color_white() : lv_color_black();
+      run.opa = opa;
+      run.width = RING_OUTER_R - RING_INNER_R; // whole band, so the wedge itself breathes
       lv_draw_arc(draw_ctx, &run, &center_pt, RING_OUTER_R, (uint16_t)lroundf(start), (uint16_t)lroundf(end));
     }
   }
