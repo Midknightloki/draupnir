@@ -229,9 +229,10 @@ static void handleBleCommand(char *cmdStr) {
       if (!LittleFS.rename(PROFILES_TMP_PATH, PROFILES_PATH)) {
         Serial.println("[ble] save_profiles: rename into place failed");
         LittleFS.remove(PROFILES_TMP_PATH);
-        // profiles_reload() here would find no file and regenerate defaults, which is the
-        // correct recovery for a device that now has no config -- but it is still a failure.
-        profiles_reload();
+        // The device now has no config file. Flagging dirty makes the display task reload,
+        // which finds no file and regenerates defaults -- the correct recovery, though this is
+        // still a failure from the caller's point of view. Deferred rather than reloaded here
+        // for the same locking reason as the success path below.
         profilesDirty = true;
         sendBleMessage("{\"status\":\"error\",\"message\":\"Failed to commit file\"}");
         return;
@@ -239,9 +240,19 @@ static void handleBleCommand(char *cmdStr) {
     }
 
     Serial.printf("[ble] save_profiles: committed %u bytes\n", (unsigned)onDisk);
-    profiles_reload();
-    profilesDirty = true; // .ino's loop() rebuilds the ring UI from this on its next tick
-    Serial.println("[ble] save_profiles: written and reloaded");
+    // Deliberately does NOT call profiles_reload() here. deserializeJson() clears and reallocates
+    // profilesDoc's pool, and the display layer reads that same document from the LVGL task while
+    // rendering the ring -- reloading from this (loop) task without holding the LVGL lock is a
+    // use-after-free on the renderer, the same defect class H3 fixed for the macro engine.
+    //
+    // The board layer owns the lock, so it owns the reload: setting the flag makes the .ino's
+    // update_profiles_reload() do it under lvgl_lock(). Keeping lvgl_lock out of this file is
+    // what preserves the display-agnostic boundary (spec §3) that lets both boards share it.
+    //
+    // No stale-read window: loop() calls update_profiles_reload() immediately after ble_update(),
+    // so the reload completes before the next command is dequeued.
+    profilesDirty = true;
+    Serial.println("[ble] save_profiles: written; reload deferred to the display task");
     sendBleMessage("{\"status\":\"ok\"}");
   } else if (cmd == "trigger") {
     // Waveshare has no profile-switching UI yet (only one profile is ever "active" at a time),
@@ -390,6 +401,19 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onDisconnect(BLEServer *server, ble_gap_conn_desc *desc) override {
     connected = false;
     pairingActive = false;
+    // A half-received command from a dropped connection must not poison the next one. Without
+    // this, bytes buffered when the link dropped stay in bleRxBuf and get prepended to the next
+    // client's first command, which then fails to parse; and a bleRxDiscarding left set silently
+    // swallows everything the next client sends until a '\n' happens to appear.
+    //
+    // The M5Dial firmware this was ported from resets bleRxLen here for exactly this reason; the
+    // port dropped that line. bleRxOverflowPending is cleared too, or the "Command too large"
+    // error queued just before the drop would be delivered to whichever central connects next.
+    bleRxLen = 0;
+    bleRxDiscarding = false;
+    bleRxOverflowPending = false;
+    // Note: RxCallbacks::lastRxValue needs no reset -- its duplicate guard is scoped to
+    // BLE_RX_DUP_WINDOW_MS (10 ms), far shorter than any reconnect, so it self-expires.
     Serial.println("[ble] disconnected");
     BLEDevice::startAdvertising(); // pServer->startAdvertising() silently fails on ESP32
   }

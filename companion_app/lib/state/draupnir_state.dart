@@ -170,6 +170,25 @@ class DraupnirState extends ChangeNotifier {
       throw Exception('Not connected to BLE device');
     }
 
+    // Retire any completer still outstanding from a previous request before installing a new one.
+    //
+    // Dart's Future.timeout() does NOT complete the underlying Completer -- it only rejects the
+    // derived future. So after a request times out, its Completer stays open and eligible to
+    // receive data. Without this, a late response for the timed-out request would satisfy the
+    // NEXT request's completer with the wrong payload: a slow get_profiles landing during a
+    // subsequent save_profiles reports {"status":"ok"} and the app claims the save succeeded when
+    // it has no idea whether it did. Silently-wrong success is the worst failure mode for a
+    // config app, so fail loudly instead.
+    final stale = _bleResponseCompleter;
+    if (stale != null && !stale.isCompleted) {
+      _log('[TX] superseding an outstanding request (previous one never completed)');
+      // Attach a swallowing handler BEFORE completing it. The original caller stopped listening
+      // when its .timeout() wrapper threw, so completing the source with an error would otherwise
+      // surface as an unhandled async error and could crash the zone in release builds.
+      stale.future.catchError((_) => <String, dynamic>{});
+      stale.completeError(StateError('Request superseded by a newer one'));
+    }
+
     _bleResponseCompleter = Completer<Map<String, dynamic>>();
     _bleBuffer = '';
     _lastProcessedSeq = null;

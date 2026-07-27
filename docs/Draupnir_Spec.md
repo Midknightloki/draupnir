@@ -304,9 +304,30 @@ It is no longer capped at 15 and no longer implies a physical position. If the o
 ever returns, `pos` 0-15 maps to keys exactly as before — which is precisely why it stays rather
 than being replaced by an array index.
 
-**`version` bumps to 3.** The schema is a strict relaxation, so v3 firmware reads v2 files fine.
-The bump exists so *v2 firmware refuses a v3 file* rather than silently dropping every macro with
-`pos > 15`.
+**`version` bumps to 3** *when the uncapping actually ships.* The schema is a strict relaxation, so
+v3 firmware reads v2 files fine; the bump exists so *v2 firmware refuses a v3 file* rather than
+silently dropping every macro with `pos > 15`.
+
+> ### ⚠️ NOT YET IMPLEMENTED — this section is the target, not current behaviour
+>
+> **The firmware still enforces the 16 cap, and the on-device default still declares
+> `"version": 2`.** `NUM_MACRO_SLOTS` is 16 and is baked into `runningMacros[]`,
+> `macros_is_running()`, `macros_stop_all()`, `active_positions[]`, and `macro_labels[]`;
+> `scan_active_positions()` scans only 0-15 and `macros_fire()` rejects `pos >= 16`. The companion
+> app's deck is likewise a hardcoded 16 cells, so no normal user flow can currently produce a
+> macro above 15.
+>
+> A macro with `pos > 15` written by any *other* client — nRF Connect, a hand-crafted
+> `save_profiles`, a future desktop client — is silently **invisible and unfireable**: present in
+> flash and in `profilesDoc`, but never added to `active_positions[]`, never drawn, never
+> selectable, and rejected by `macros_fire()`.
+>
+> **The default file deliberately stays at `version: 2` until this is true.** Declaring 3 while
+> still capping at 16 would be worse than not bumping at all — it would assert the relaxation to
+> other clients while breaking exactly the silent-drop the bump exists to prevent.
+>
+> Uncapping properly means keying running-macro state by macro identity rather than by `pos`,
+> which is M8+ work. Tracked in §10.
 
 ### Action types
 
@@ -422,6 +443,7 @@ Honest status, not aspiration.
 | M6 | **Config hardening** — pairing enforcement, atomic writes, RX bounds, reload safety | **Open — blocking** |
 | M7 | **Persistence** — write `activeProfile` + brightness to NVS and honor them at boot | **Open** |
 | M8 | **On-device profile switching** with directional indicators | **Open** |
+| M8b | **Uncap `pos`** — key running-macro state by identity, not slot; then bump the default to `version: 3` | **Open** (see §6 warning) |
 | M9 | **Icons on the ring** + encoder detent alignment | **Open** |
 | M10 | Polish — buzzer/haptic feedback, brightness UI, export/import | **Open** |
 

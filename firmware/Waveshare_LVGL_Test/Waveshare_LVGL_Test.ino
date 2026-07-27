@@ -28,6 +28,10 @@ static int active_positions[NUM_MACRO_SLOTS];
 static int active_count = 0;
 
 static lv_obj_t *macro_labels[NUM_MACRO_SLOTS];
+// Declared up here rather than beside the rest of the pairing UI below, because
+// rebuild_ring_layout() has to re-assert its z-order after re-creating the wedge labels (see the
+// comment there) and that function is defined earlier in this file.
+static lv_obj_t *pairing_overlay = nullptr;
 static int selected_idx = 0;
 static knob_handle_t s_knob = NULL;
 static EventGroupHandle_t knob_events = NULL;
@@ -130,6 +134,14 @@ static void rebuild_ring_layout(void) {
 
     macro_labels[v] = label;
   }
+  // LVGL 8 draws a screen's children in insertion order, so the labels just re-created above now
+  // sit AFTER pairing_overlay in scr's child list and would paint on top of it. Since this runs
+  // on every profile save, one edit is enough to leave a later re-pair rendering the passkey
+  // overlay with macro names bleeding through it. Re-assert the overlay's z-order.
+  //
+  // Guarded because the first call comes from build_ring_ui() before build_pairing_overlay().
+  if (pairing_overlay) lv_obj_move_foreground(pairing_overlay);
+
   Serial.printf("[diag] rebuild_ring_layout: active_count=%d\n", active_count);
 }
 
@@ -284,13 +296,17 @@ static void update_running_pulse(void) {
 
   if (!running) {
     if (was_running) {
-      was_running = false;
       // One final repaint on the running->idle edge, or the last-drawn pulse frame stays burned
       // on screen and the ring looks permanently "running".
-      if (lvgl_lock(50)) {
-        lv_obj_invalidate(lv_scr_act());
-        lvgl_unlock();
-      }
+      //
+      // Lock FIRST, commit was_running AFTER -- the same ordering H5 established for
+      // update_pairing_overlay(). Committing first meant a single 50ms lock timeout consumed the
+      // transition permanently: the guard above would then return early forever and the stale
+      // pulse frame would never be cleared. Leaving was_running set makes the next tick retry.
+      if (!lvgl_lock(50)) return;
+      lv_obj_invalidate(lv_scr_act());
+      lvgl_unlock();
+      was_running = false;
     }
     return;
   }
@@ -308,7 +324,7 @@ static void update_running_pulse(void) {
 // Full-screen overlay shown while ble_pairing_active() is true, on top of the ring (created
 // after it, so it draws later/on top in LVGL's default per-screen z-order). Hidden the rest of
 // the time.
-static lv_obj_t *pairing_overlay = nullptr;
+// pairing_overlay itself is declared at the top of this file (see the note there).
 static lv_obj_t *pairing_label = nullptr;
 
 static void build_pairing_overlay(void) {
@@ -360,8 +376,14 @@ static void update_pairing_overlay(void) {
 // loop() or the LVGL task itself, same pattern as update_pairing_overlay()/encoder_task().
 static void update_profiles_reload(void) {
   if (!ble_profiles_dirty()) return;
-  if (!lvgl_lock(200)) return;
-  Serial.println("[diag] profiles changed via BLE, rebuilding ring UI");
+  if (!lvgl_lock(200)) return; // not clearing the flag on failure means the next tick retries
+  Serial.println("[diag] profiles changed via BLE, reloading + rebuilding ring UI");
+  // The reload itself must happen HERE, inside the lock -- not in ble_engine's save handler.
+  // deserializeJson() clears and reallocates profilesDoc's pool, and ring_draw_event_cb reads
+  // that same document from the LVGL task on every repaint. Reloading without the lock held is
+  // a use-after-free on the renderer: the same defect class H3 fixed for the macro engine, on a
+  // second reader that H3 did not cover.
+  profiles_reload();
   rebuild_ring_layout();
   selected_idx = 0;
   if (active_count > 0) select_idx(selected_idx);
@@ -400,7 +422,13 @@ static void encoder_task(void *arg) {
     if (bits & (1 << 0)) delta -= 1;
     if (bits & (1 << 1)) delta += 1;
     if (delta != 0 && active_count > 0 && lvgl_lock(100)) {
-      select_idx((selected_idx + delta + active_count) % active_count);
+      // Re-check INSIDE the lock. The guard above runs before lvgl_lock() blocks, and a profile
+      // reload on the loop task can drop active_count to 0 while this task waits -- making the
+      // modulo below a divide-by-zero, which traps and reboots the S3. Capturing the pre-lock
+      // value into a local would not fix it: a shrunk count would still index out of range.
+      if (active_count > 0) {
+        select_idx((selected_idx + delta + active_count) % active_count);
+      }
       lvgl_unlock();
     }
   }
