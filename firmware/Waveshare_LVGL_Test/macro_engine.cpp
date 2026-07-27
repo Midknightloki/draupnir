@@ -63,9 +63,34 @@ void hid_init() {
   fireQueue = xQueueCreate(8, sizeof(int));
 }
 
+// Sentinel pushed through the same fireQueue as a normal position, rather than adding a second
+// queue: it keeps kill-all strictly ordered against any fires already queued ahead of it, so a
+// swipe can never be overtaken by a tap that was requested first.
+#define MACRO_CMD_STOP_ALL (-99)
+
 void macros_request_fire(int pos) {
+  if (!fireQueue) {
+    Serial.println("[fire] request DROPPED: no queue");
+    return;
+  }
+  // DIAGNOSTIC (temporary): xQueueSend with a 0 tick timeout silently drops when the queue is
+  // full (depth 8), which would look exactly like "the tap did nothing".
+  BaseType_t ok = xQueueSend(fireQueue, &pos, 0);
+  Serial.printf("[fire] request pos=%d queued=%d waiting=%u\n",
+                pos, (int)(ok == pdTRUE), (unsigned)uxQueueMessagesWaiting(fireQueue));
+}
+
+void macros_request_stop_all() {
   if (!fireQueue) return;
-  xQueueSend(fireQueue, &pos, 0);
+  int cmd = MACRO_CMD_STOP_ALL;
+  xQueueSend(fireQueue, &cmd, 0);
+}
+
+bool macros_any_running() {
+  for (int i = 0; i < NUM_MACRO_SLOTS; i++) {
+    if (runningMacros[i].active) return true;
+  }
+  return false;
 }
 
 // Every ActiveMacro holds a JsonObject that points INTO profilesDoc's memory pool.
@@ -338,17 +363,28 @@ static void executeAction(JsonObject action) {
 }
 
 void macros_fire(int pos) {
-  if (pos < 0 || pos >= NUM_MACRO_SLOTS) return;
+  // DIAGNOSTIC (temporary): distinguishes "never dequeued" from "dequeued but no macro at that
+  // pos" from "dequeued and started".
+  if (pos < 0 || pos >= NUM_MACRO_SLOTS) {
+    Serial.printf("[fire] fire pos=%d REJECTED (out of range)\n", pos);
+    return;
+  }
   JsonObject macro = profiles_find_macro(pos);
-  if (macro.isNull()) return;
+  if (macro.isNull()) {
+    Serial.printf("[fire] fire pos=%d REJECTED (no macro at this pos)\n", pos);
+    return;
+  }
 
   const char *mode = macro["mode"] | "play_once";
   bool isToggle = (strcmp(mode, "toggle") == 0);
 
   if (runningMacros[pos].active && runningMacros[pos].isToggle) {
+    Serial.printf("[fire] fire pos=%d -> stopping running toggle\n", pos);
     runningMacros[pos].active = false;
     return;
   }
+  Serial.printf("[fire] fire pos=%d START mode=%s actions=%u\n", pos, mode,
+                (unsigned)(macro["actions"].isNull() ? 0 : macro["actions"].size()));
 
   runningMacros[pos].active = true;
   runningMacros[pos].isToggle = isToggle;
@@ -366,7 +402,12 @@ bool macros_is_running(int pos) {
 void macros_update() {
   int pendingPos;
   while (fireQueue && xQueueReceive(fireQueue, &pendingPos, 0) == pdTRUE) {
-    macros_fire(pendingPos);
+    if (pendingPos == MACRO_CMD_STOP_ALL) {
+      Serial.println("[diag] kill-all requested (swipe down)");
+      macros_stop_all();
+    } else {
+      macros_fire(pendingPos);
+    }
   }
 
   unsigned long now = millis();
