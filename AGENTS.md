@@ -96,6 +96,13 @@ See also `docs/M0_Setup_and_BringUp.md`.
 - **Stop all running macros before reloading profiles** — the engine holds `JsonObject` refs into
   the profile document, which reloading invalidates.
 
+## Work order: Waveshare first, then M5Dial
+Both boards stay in the product — the owner uses both, for different use cases and form factors.
+But they are worked **in sequence**: get the Waveshare knob polished and presentable (through
+M10), *then* bring the M5Dial up to spec. Deferring the M5Dial's **UI** work is fine; baking
+Waveshare assumptions into the **shared** layer (schema, BLE protocol, macro engine, app) is not —
+that turns the catch-up from a port into a rewrite. See `docs/Draupnir_Spec.md` §3.
+
 ## Current status
 Working on hardware: USB HID, macro engine (combos/text/consumer/mouse/delays), ring UI with
 dynamic wedges and tap-to-fire, LittleFS profile store, BLE transport + Companion App.

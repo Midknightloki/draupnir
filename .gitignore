@@ -20,3 +20,19 @@ wifi_creds.h
 # Build logs
 build_fw.log
 *.log
+
+# Vendored toolchain. arduino-cli is a freely downloadable tool and does not belong in the repo
+# (it was ~54 MB of the clone). Install it per docs/Toolchain_arduino-cli.md and keep it here, or
+# anywhere on PATH.
+arduino-cli.exe
+arduino-cli.zip
+
+# Photos and device screenshots. Useful locally, but ~9 MB of binaries that bloat a public clone
+# and cannot be diffed or reviewed. Attach them to issues/PRs instead.
+companion_app/Screenshots/
+
+# Flutter/Dart
+companion_app/.dart_tool/
+companion_app/build/
+companion_app/android/local.properties
+companion_app/android/.gradle/

@@ -8,6 +8,7 @@
 #include "macro_engine.h"
 #include "ble_engine.h"
 #include "haptics.h"
+#include "trace.h"
 
 #define ENCODER_ECA_PIN 8
 #define ENCODER_ECB_PIN 7
@@ -226,22 +227,21 @@ static void screen_click_cb(lv_event_t *e) {
   float dy = (float)p.y - EXAMPLE_LCD_V_RES / 2.0f;
   float dist = sqrtf(dx * dx + dy * dy);
 
-  // DIAGNOSTIC (temporary): the touch->fire path had no logging at all, so a tap that never
-  // fired was indistinguishable from a tap that never arrived. Logs whether CLICKED reaches us,
-  // where, and which branch it takes.
-  Serial.printf("[tap] CLICKED x=%d y=%d dist=%.1f inner=%d outer=%d active_count=%d\n",
+  // The touch->fire path had no logging at all, which made a tap that never fired
+  // indistinguishable from a tap that never arrived. Gated by DRAUPNIR_TRACE_INPUT.
+  TRACE("[tap] CLICKED x=%d y=%d dist=%.1f inner=%d outer=%d active_count=%d\n",
                 (int)p.x, (int)p.y, dist, RING_INNER_R, RING_OUTER_R, active_count);
 
   if (dist < RING_INNER_R) {
-    Serial.printf("[tap] -> center, fire pos=%d\n", active_positions[selected_idx]);
+    TRACE("[tap] -> center, fire pos=%d\n", active_positions[selected_idx]);
     macros_request_fire(active_positions[selected_idx]);
   } else if (dist <= RING_OUTER_R + 10) {
     int idx = wedge_index_from_point(p.x, p.y);
-    Serial.printf("[tap] -> wedge v=%d fire pos=%d\n", idx, active_positions[idx]);
+    TRACE("[tap] -> wedge v=%d fire pos=%d\n", idx, active_positions[idx]);
     select_idx(idx);
     macros_request_fire(active_positions[idx]);
   } else {
-    Serial.println("[tap] -> outside ring, ignored");
+    TRACE("[tap] -> outside ring, ignored\n");
   }
 }
 
@@ -256,9 +256,9 @@ static void screen_gesture_cb(lv_event_t *e) {
   lv_indev_t *indev = lv_indev_get_act();
   if (!indev) return;
   lv_dir_t dir = lv_indev_get_gesture_dir(indev);
-  // DIAGNOSTIC (temporary): a GESTURE firing on ordinary taps would explain taps not reaching
-  // CLICKED at all -- LVGL delivers one or the other, not both.
-  Serial.printf("[tap] GESTURE dir=%d (bottom=%d) any_running=%d\n",
+  // LVGL delivers GESTURE or CLICKED for a touch, never both, so a gesture misfiring on
+  // ordinary taps would silently swallow every macro fire. Gated by DRAUPNIR_TRACE_INPUT.
+  TRACE("[tap] GESTURE dir=%d (bottom=%d) any_running=%d\n",
                 (int)dir, (int)LV_DIR_BOTTOM, (int)macros_any_running());
   if (dir != LV_DIR_BOTTOM) return;
   if (!macros_any_running()) return;
@@ -424,13 +424,21 @@ void setup() {
 
   Touch_Init();
   Serial.println("[diag] Touch_Init done");
-  // DIAGNOSTIC BISECT (temporary): touch stopped reaching LVGL entirely after this was added --
-  // no CLICKED and no GESTURE events, while the encoder kept working. haptics_init() is the only
-  // new code sharing I2C bus 0 with the CST816 touch controller at 0x15, and it probes all 112
-  // addresses at boot before lcd_lvgl_Init() registers the touch input device. Disabled to test
-  // that as a single variable; everything else on this branch stays in.
+  // DISABLED -- KNOWN ISSUE. haptics_init() breaks the CST816 touch controller: with it enabled,
+  // touch events stop reaching LVGL entirely (no CLICKED and no GESTURE), while the encoder keeps
+  // working. Confirmed on hardware by single-variable bisect -- disabling only this call restored
+  // touch completely.
+  //
+  // The mechanism is I2C interference: this is the only code sharing bus 0 with the CST816 at
+  // 0x15, and it probes all 112 addresses at boot, before lcd_lvgl_Init() registers the touch
+  // input device.
+  //
+  // NOT yet narrowed to the specific cause -- either the blind bus scan or the DRV2605 register
+  // access. Re-enabling requires isolating which, then likely dropping the scan and moving init
+  // after lcd_lvgl_Init(). Do NOT simply uncomment this: it will break touch again.
+  // See docs/HANDOFF.md.
   // haptics_init();
-  Serial.println("[diag] haptics_init SKIPPED (bisect: testing I2C interference with touch)");
+  Serial.println("[diag] haptics_init SKIPPED (known issue: breaks CST816 touch -- see HANDOFF.md)");
 
 
   lcd_lvgl_Init();

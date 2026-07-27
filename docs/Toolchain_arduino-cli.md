@@ -7,6 +7,19 @@ Draupnir has **two board targets**. Waveshare is primary; M5Dial is a supported 
 
 ---
 
+## Getting arduino-cli
+
+**`arduino-cli` is not vendored in this repo.** It used to be (~54 MB of `.exe` + `.zip`), which
+bloated every clone of what is a public repository, for a tool anyone can download in seconds.
+
+Install it from <https://arduino.github.io/arduino-cli/latest/installation/>, then either put it
+on your `PATH` or drop the binary in the repo root — `arduino-cli.exe` and `arduino-cli.zip` are
+gitignored, so a local copy there stays out of git.
+
+Everything below assumes `arduino-cli` is runnable.
+
+---
+
 ## Waveshare ESP32-S3 knob (primary)
 
 ### The FQBN

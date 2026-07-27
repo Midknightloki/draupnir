@@ -150,6 +150,28 @@ DTR/RTS reset, so download mode requires a manual BOOT press.
 | Extras | Buzzer, RTC; PORT.A (Grove I2C, G13/G15), PORT.B (GPIO, G2/G1) |
 | Download mode | Hold **G0** on the back Stamp, plug USB-C, release |
 
+### Sequencing: Waveshare to polish first, then M5Dial *(decided 2026-07-26)*
+
+Both boards stay in the product — the owner uses **both, for different use cases and form
+factors**, so the M5Dial is not a legacy target being wound down. But they are worked in order:
+
+1. **Waveshare knob to a finished, polished, presentable state.** Everything through M10:
+   hardening, persistence, on-device profile switching, icons, and the visual polish that makes it
+   demoable rather than merely functional.
+2. **Then circle back and bring the M5Dial up to spec.** It currently lags: still monolithic,
+   still carrying the removed web-server and token-pairing code, and (see §13) with no
+   cryptographic gate on its BLE config channel.
+
+The reason for sequencing rather than parallelising: every shared-core change would otherwise be
+written and verified twice on hardware, which doubles the slowest part of the loop. Polishing one
+board first also forces the shared/board-specific boundary below to be genuinely correct, so the
+M5Dial catch-up becomes mostly a display/input port rather than a re-implementation.
+
+**This does not license Waveshare-only shortcuts.** Anything in the shared layer — schema, BLE
+protocol, macro engine, app — must still be written board-agnostically. Deferring the M5Dial's
+*UI* work is fine; baking Waveshare assumptions into the shared core is not, and would turn step 2
+from a port into a rewrite.
+
 ### Supporting two boards without forking the product
 
 Both targets must share the schema, the BLE protocol, the macro engine, and the Companion App.
