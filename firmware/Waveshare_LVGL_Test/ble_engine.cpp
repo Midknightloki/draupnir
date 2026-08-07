@@ -334,6 +334,13 @@ class RxCallbacks : public BLECharacteristicCallbacks {
     // invokes onWrite() exactly once per BLE_GATT_ACCESS_OP_WRITE_CHR, with no prepare/execute
     // double-dispatch of the kind Bluedroid had. The guard is kept only because that has not
     // been confirmed on hardware.
+    //
+    // So check that BEFORE building inbound sequencing. External audit 2026-08 re-flagged the
+    // silent-drop risk and recommended prioritising seq numbers; that is the right fix if the
+    // guard is needed, but it costs a companion-app change plus a matching M5Dial reassembler
+    // change (the same app talks to both). If the double-dispatch genuinely cannot happen here,
+    // DELETING this guard removes the silent-drop risk outright for free. Confirm on hardware
+    // first -- instrument this callback and send a payload with two identical adjacent chunks.
     uint32_t nowMs = millis();
     if (rxValue == lastRxValue && (nowMs - lastRxValueMs) < BLE_RX_DUP_WINDOW_MS) {
       Serial.printf("[ble] suppressed duplicate RX write (%u bytes, %ums apart)\n",
@@ -512,9 +519,16 @@ void ble_init() {
   // wrapper -- BLECharacteristic stores properties in a uint16_t (esp_gatt_char_prop_t is
   // typedef'd to uint16_t under NimBLE), so the bit is silently truncated away. The CCCD is
   // therefore gated on encryption but not explicitly on authentication. In this configuration
-  // that is not exploitable: setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND) means this
-  // device will not complete a Just Works pairing at all, so any encrypted link here is
+  // that should not be exploitable: setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND) means
+  // this device will not complete a Just Works pairing at all, so any encrypted link here is
   // necessarily an authenticated one. Revisit if the auth mode is ever relaxed.
+  //
+  // THAT ARGUMENT IS UNVERIFIED. It is a reading of the configuration, not an observation: the
+  // H1 negative test -- an unbonded central declaring NoInputNoOutput must be rejected on both
+  // an RX write AND a TX subscribe -- has never been run on hardware. Until it is, treat the
+  // CCCD as gated on encryption only and do not lean on the MITM claim. Running that test is
+  // what makes M6 complete (docs/HANDOFF.md §5 step 3). Independently re-flagged by external
+  // audit 2026-08, which reached the same conclusion from the truncation alone.
   pTxCharacteristic = pService->createCharacteristic(
     CHARACTERISTIC_UUID_TX,
     BLECharacteristic::PROPERTY_NOTIFY | BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC

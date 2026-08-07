@@ -219,10 +219,26 @@ alignment (M9). Spec §10.
 
 ## 7. Open items and known gaps
 
-- **M5Dial firmware has no cryptographic gate.** H1 removed its token but that sketch has no
-  `BLESecurity` setup and no GATT permission flags at all — config access is gated solely on
-  `CONFIG_MODE`. The second supported board still carries the vulnerability M6 exists to close.
-  **Top follow-up.** (Work order §3a.)
+- **M5Dial firmware has no cryptographic gate.** That sketch has no `BLESecurity` setup and no
+  GATT permission flags at all — config access is gated solely on `CONFIG_MODE`. The second
+  supported board still carries the vulnerability M6 exists to close. **Top follow-up.**
+  (Work order §3a.) Deferred by the board sequencing (spec §3), not by tooling — the hardware is
+  on hand.
+  > **Do not close this by restoring the `pairingToken`.** An external audit (2026-08) called the
+  > removal a blocking regression; it was not. The token was checked *only outside* `CONFIG_MODE`,
+  > and `CONFIG_MODE` is the only mode serving config commands — so in the mode that mattered
+  > there was never a check. Accepted requests went from `{CONFIG_MODE: any} ∪ {RUN_MODE: token}`
+  > to `{CONFIG_MODE: any}`: a strict subset, i.e. net *tightening*. The old `pair` command also
+  > handed the token to any central in `CONFIG_MODE` and persisted it to NVS, converting one
+  > moment of physical access into permanent remote `RUN_MODE` access. Full reasoning is in the
+  > header comment of `firmware/M5_M6_config/M5_M6_config.ino`.
+  > *Why the audit misread it:* this file's baseline commit is empty, so all 1,431 lines appear
+  > as additions and the token's absence reads as a deletion with no visible context.
+- **TX CCCD is gated on encryption, not authentication.** `BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN`
+  (0x10000) truncates away — `BLECharacteristic` stores properties in a `uint16_t`. The argument
+  that this is harmless (`SC_MITM_BOND` won't complete Just Works, so any encrypted link is
+  authenticated) is **a reading of the config, not an observation** — the H1 negative test has
+  never been run. Don't lean on it until §5 step 3 is done. Re-flagged by the 2026-08 audit.
 - **PSRAM is disabled although 8 MB is present.** Deliberate — kept out of the M6 stability
   diagnosis. Now that H2–H7 is confirmed stable, enabling `PSRAM=opi` is a reasonable isolated next
   experiment; free heap is 62 KB, which is workable but not generous.
@@ -233,9 +249,19 @@ alignment (M9). Spec §10.
   GATT error text.
 - **`http` / `shared_preferences`** are now unused in `companion_app/pubspec.yaml`.
 - **H6 shipped the interim fix** (10 ms time-scoped duplicate guard) rather than inbound sequence
-  numbers, because the same app also talks to the M5Dial firmware. Documented in code.
+  numbers, because the same app also talks to the M5Dial firmware. Documented in code. The 2026-08
+  audit re-flagged the silent-drop risk and urged prioritising seq numbers — but **check first
+  whether the guard is needed at all.** NimBLE calls `onWrite()` once per write, with none of the
+  Bluedroid prepare/execute double-dispatch the guard was written for. If that holds on hardware,
+  deleting the guard kills the silent-drop risk for free and saves a two-firmware app change.
+- **Haptics remain disabled** (breaks the CST816). A three-step single-variable re-enable plan is
+  written at the call site in `Waveshare_LVGL_Test.ino`. Test by tapping *and* swiping — the
+  encoder kept working right through the original failure, so it proves nothing.
 - **Display controller discrepancy:** third-party sources describe the panel as ST77916; the
   firmware drives it with SH8601 and works. Unresolved, low priority.
 - **`firmware/Waveshare_Knob_Config/`** is a superseded Adafruit_GFX port, still untracked, with
   leftover `refactor*.py` scripts. Safe to delete once nothing is owed to it.
-- **Nothing is pushed.** 13 commits local-only on `main`.
+- **Branch `review/waveshare-m6-foundation` is pushed** and open as PR #1 against `master`. Note
+  `origin/master` is a bare "Initial commit" — it holds almost none of the tree, which is why
+  diff-scoped reviews of this PR see nearly every file as wholly new and lose all before/after
+  context. Weigh review findings against the file's own history, not the PR diff.

@@ -37,13 +37,28 @@ AppMode currentMode = RUN_MODE;
 // gesture on the device) only.
 //
 // NOTE FOR WHOEVER PICKS THIS UP: this board's BLE stack, unlike the Waveshare firmware's, does
-// NOT yet set up BLE pairing/bonding or GATT permission flags. Removing the token therefore
-// leaves the M5Dial BLE config channel with no cryptographic access control at all. That was
-// already close to true — the token check was bypassed entirely whenever currentMode ==
-// CONFIG_MODE — but it should be closed by porting the BLESecurity block and the RX/TX
-// characteristic permission flags from firmware/Waveshare_LVGL_Test/ble_engine.cpp. That port
-// is deliberately not attempted here: it is a second-board change that cannot be verified
-// without the M5Dial in hand.
+// NOT yet set up BLE pairing/bonding or GATT permission flags, so the M5Dial BLE config channel
+// has no cryptographic access control at all. Close it by porting the BLESecurity block and the
+// RX/TX characteristic permission flags from firmware/Waveshare_LVGL_Test/ble_engine.cpp. It is
+// the top item of the M5Dial catch-up (docs/HANDOFF.md §7); deferred only because the board
+// targets are worked in sequence -- Waveshare through M10 first (spec §3, CLAUDE.md). The
+// hardware is on hand; this is a scheduling decision, not a tooling limitation.
+//
+// DO NOT "FIX" THIS BY RESTORING THE TOKEN. An external audit (2026-08) read the removal as the
+// cause of the gap and called it a blocking regression. It is not -- the token made things
+// strictly worse, and the diff misleads because this file's baseline commit is empty, so every
+// line reads as newly added:
+//
+//   Before:  if (currentMode != CONFIG_MODE && (token != pairingToken || !pairingToken.length()))
+//   After:   if (currentMode != CONFIG_MODE)
+//
+// The token was only ever checked OUTSIDE CONFIG_MODE, and CONFIG_MODE is the only mode that
+// serves config commands -- so in the mode that mattered there was never a check. Accepted
+// requests went from {CONFIG_MODE: anything} U {RUN_MODE: with token} to {CONFIG_MODE: anything},
+// a strict subset. Worse, any central could send {"cmd":"pair"} while in CONFIG_MODE and be
+// handed the token, which persisted to NVS and reloaded at boot -- turning one moment of physical
+// access into permanent remote config access in RUN_MODE. That is why setup() now actively calls
+// prefs.remove("pairingToken"). Restoring it would reopen a hole, not close one.
 
 BLEServer *pServer = nullptr;
 BLECharacteristic *pTxCharacteristic = nullptr;

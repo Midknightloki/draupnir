@@ -462,8 +462,18 @@ void setup() {
   // input device.
   //
   // NOT yet narrowed to the specific cause -- either the blind bus scan or the DRV2605 register
-  // access. Re-enabling requires isolating which, then likely dropping the scan and moving init
-  // after lcd_lvgl_Init(). Do NOT simply uncomment this: it will break touch again.
+  // access. Do NOT simply uncomment this: it will break touch again.
+  //
+  // Re-enable via single-variable tests, in this order (external audit 2026-08 proposed the same
+  // two changes; run them separately or a pass tells you nothing about which one mattered):
+  //   1. Drop the blind i2c_scan() from haptics_init(), leave the call site here. Touch back?
+  //      -> the scan was the culprit; delete the scan permanently.
+  //   2. Still broken? Restore the scan, instead move haptics_init() to AFTER lcd_lvgl_Init()
+  //      so the CST816 input device is registered before anything else touches bus 0.
+  //   3. Still broken? It is the DRV2605 register access itself -- next suspects are a bus speed
+  //      or pull-up conflict, or the DRV2605 holding SDA. Scope the bus rather than guessing.
+  // Re-test after each step by tapping a wedge AND swiping down; the encoder is not a valid
+  // check, it kept working throughout the original failure.
   // See docs/HANDOFF.md.
   // haptics_init();
   Serial.println("[diag] haptics_init SKIPPED (known issue: breaks CST816 touch -- see HANDOFF.md)");
