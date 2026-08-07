@@ -529,14 +529,21 @@ void ble_init() {
   // Enforcement is real. Note the CCCD *read* did succeed unencrypted (returns 0x0000); that
   // leaks only whether notifications are on, no data and no control.
   //
-  // STILL UNVERIFIED -- the Just Works case, which is the part that actually depends on the
-  // truncated bit. Android reported PAIRING_VARIANT: CONSENT (Just-Works-style consent, not
-  // passkey entry) on every attempt, and all were declined, so what happens when one is ACCEPTED
-  // is unknown. If this device completes such a pairing the result is authenticated=0 bonded=1,
-  // and because the CCCD is gated on encryption only, that central could then subscribe to TX.
-  // The MITM claim above is exactly what would prevent it, and it is still an inference.
-  // One-action test in docs/HANDOFF.md. Re-flagged independently by external audit 2026-08,
-  // which reached the same conclusion from the truncation alone.
+  // The Just Works case -- the part that actually depends on the truncated bit -- is ALSO
+  // VERIFIED now (2026-08-07). Android offers PAIRING_VARIANT: CONSENT (Just-Works-style, not
+  // passkey entry); accepting it does NOT produce an unauthenticated bond. The device rejects
+  // that association model mid-negotiation and escalates to passkey entry:
+  //     [ble] connected -> [ble] show passkey: 739528
+  //                     -> authentication complete, encrypted=1 authenticated=1 bonded=1
+  // Across every session tested, only two outcomes ever occurred: 0/0/0 when pairing was
+  // declined, and 1/1/1 when completed. authenticated=0 bonded=1 -- the one state that would
+  // make the truncation exploitable -- was never reachable. So the MITM claim above is now an
+  // observation rather than an inference, and this gap is closed in THIS configuration.
+  //
+  // It reopens the moment setAuthenticationMode() is relaxed away from *_MITM_*. If you change
+  // that line, this comment is void and the CCCD is genuinely unprotected against Just Works.
+  // Re-flagged independently by external audit 2026-08, which reached the same conclusion from
+  // the truncation alone.
   pTxCharacteristic = pService->createCharacteristic(
     CHARACTERISTIC_UUID_TX,
     BLECharacteristic::PROPERTY_NOTIFY | BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC

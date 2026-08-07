@@ -146,18 +146,29 @@ retries after bonding; the operation simply hangs until the bond fails and the l
 Precise statement of what is gated: **CCCD write is gated, CCCD read is not.** The unencrypted
 read leaks only whether notifications are enabled — no data, no control.
 
-### NOT verified ❌
+### Just Works rejection — VERIFIED ON HARDWARE 2026-08-07 ✅ (closes the AUTHEN question)
 
-- **The Just Works question — the last real unknown in H1.** Android reported
-  `PAIRING_VARIANT: CONSENT` (Just-Works-style consent, *not* passkey entry) on every negative-test
-  attempt. All were declined, so **what happens if it is accepted is untested.** If the device
-  completes such a pairing the result is `authenticated=0 bonded=1`, and since the CCCD is gated on
-  encryption only (`NOTIFY_INDICATE_AUTHEN` truncates — `ble_engine.cpp:511`), a Just-Works-bonded
-  central could then subscribe to TX.
-  > **One-action test:** connect with nRF Connect and **accept** the consent prompt, then read the
-  > device's `authentication complete` line. `authenticated=0 bonded=1` means the gap is real and
-  > the AUTHEN truncation needs a real workaround. A refusal confirms `SC_MITM_BOND` holds and the
-  > comment's assumption is proven rather than assumed.
+Accepting Android's `PAIRING_VARIANT: CONSENT` (Just-Works-style) does **not** yield an
+unauthenticated bond. The device rejects that association model mid-negotiation and escalates to
+passkey entry:
+
+```
+17:47:40  [ble] connected, conn_handle=1
+17:47:47  [ble] show passkey: 739528                 <- consent rejected, escalated
+17:48:19  [ble] authentication complete, encrypted=1 authenticated=1 bonded=1
+```
+
+Across every session tested, only two outcomes ever occurred: `0/0/0` when pairing was declined,
+`1/1/1` when completed. **`authenticated=0 bonded=1` was never reachable** — and that is the one
+state that would make the `NOTIFY_INDICATE_AUTHEN` truncation exploitable. The `SC_MITM_BOND`
+claim in `ble_engine.cpp` is now an observation, not an inference.
+
+> Valid only while `setAuthenticationMode()` keeps a `*_MITM_*` mode. Relax that and the CCCD is
+> genuinely unprotected against Just Works, because the AUTHEN bit still truncates away.
+
+Bonded reconnect authenticates in **121 ms** with no prompt, so the passkey is a one-time cost.
+
+### NOT verified ❌
 - **Heap across a save/reload cycle is not yet proven flat.** One cycle went 61,720 -> 61,392
   (−328 B), consistent with a larger `profilesDoc` (919 B) rather than a leak — the same "steps
   with document size, not per cycle" pattern seen before. One cycle cannot separate the two;
