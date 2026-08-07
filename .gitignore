@@ -31,6 +31,10 @@ arduino-cli.zip
 # and cannot be diffed or reviewed. Attach them to issues/PRs instead.
 companion_app/Screenshots/
 
+# Local-environment agent config. CLAUDE.md and AGENTS.md ARE tracked deliberately — they are the
+# shared project context and must be edited together (see CLAUDE.md). GEMINI.md is local-only.
+GEMINI.md
+
 # Flutter/Dart
 companion_app/.dart_tool/
 companion_app/build/
