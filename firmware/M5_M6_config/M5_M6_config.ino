@@ -17,20 +17,78 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 
 #define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+// Flow-control ack the app writes to RX after processing each TX chunk: 2 bytes,
+// [BLE_CHUNK_ACK_MARKER, seq]. seq echoes the chunk's sequence byte (prefixed onto every TX
+// chunk) so a late ack from a chunk we already gave up retrying can't be mistaken for the
+// current one. 0xFE can't collide with a real JSON command chunk (those are ASCII/UTF-8, <0x80).
+#define BLE_CHUNK_ACK_MARKER 0xFE
 
 enum AppMode { RUN_MODE, CONFIG_MODE, WIFI_SETUP_MODE };
 AppMode currentMode = RUN_MODE;
-String pairingToken = "";
+// The bespoke `pairingToken` / `pair` scheme is removed (spec v3 §7, M6/H1). It reimplemented —
+// badly — what BLE bonding already does correctly, and the companion app no longer sends a
+// token on any request. Access to the config surfaces is gated on CONFIG_MODE (a physical
+// gesture on the device) only.
+//
+// NOTE FOR WHOEVER PICKS THIS UP: this board's BLE stack, unlike the Waveshare firmware's, does
+// NOT yet set up BLE pairing/bonding or GATT permission flags, so the M5Dial BLE config channel
+// has no cryptographic access control at all. Close it by porting the BLESecurity block and the
+// RX/TX characteristic permission flags from firmware/Waveshare_LVGL_Test/ble_engine.cpp. It is
+// the top item of the M5Dial catch-up (docs/HANDOFF.md §7); deferred only because the board
+// targets are worked in sequence -- Waveshare through M10 first (spec §3, CLAUDE.md). The
+// hardware is on hand; this is a scheduling decision, not a tooling limitation.
+//
+// DO NOT "FIX" THIS BY RESTORING THE TOKEN. An external audit (2026-08) read the removal as the
+// cause of the gap and called it a blocking regression. It is not -- the token made things
+// strictly worse. Compare the gate before and after (baseline is origin/main:584):
+//
+//   Before:  if (currentMode != CONFIG_MODE && (token != pairingToken || !pairingToken.length()))
+//   After:   if (currentMode != CONFIG_MODE)
+//
+// The token was only ever checked OUTSIDE CONFIG_MODE, and CONFIG_MODE is the only mode that
+// serves config commands -- so in the mode that mattered there was never a check. Accepted
+// requests went from {CONFIG_MODE: anything} U {RUN_MODE: with token} to {CONFIG_MODE: anything},
+// a strict subset. Worse, any central could send {"cmd":"pair"} while in CONFIG_MODE and be
+// handed the token, which persisted to NVS and reloaded at boot -- turning one moment of physical
+// access into permanent remote config access in RUN_MODE. That is why setup() now actively calls
+// prefs.remove("pairingToken"). Restoring it would reopen a hole, not close one.
 
 BLEServer *pServer = nullptr;
 BLECharacteristic *pTxCharacteristic = nullptr;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
-String bleBuffer = "";
+// RX reassembly buffer for chunked BLE commands — a save_profiles command can be ~12KB+.
+// Growing a String one byte at a time via += to that size repeatedly hit failed reallocations
+// once the heap fragmented (largestBlock measured as low as ~9KB mid-session), silently
+// truncating the reassembled command down to whatever tail happened to fit.
+// Deliberately NOT a compile-time-sized static/global array: reserving ~24KB of .bss
+// unconditionally at link time (before BLE has initialized anything) was confirmed by direct
+// testing to starve BLE bring-up itself — advertising silently never started. Instead, malloc'd
+// ONCE in setup() right after BLEDevice::init(), while the heap is still fresh/unfragmented, so
+// it's a single clean allocation rather than either a permanent static reservation or thousands
+// of incremental String reallocs.
+#define BLE_RX_BUFFER_SIZE 16384
+static char *bleRxBuf = nullptr;
+static size_t bleRxLen = 0;
+// Cross-core queue: BLE task (Core 0) -> main loop (Core 1)
+// volatile flag is NOT sufficient on ESP32-S3 — L1 caches are not coherent across cores
+// xQueueSend/xQueueReceive include the necessary memory barriers
+QueueHandle_t bleRxQueue = nullptr;
+// App-level flow control for chunked BLE sends: notify() has no delivery guarantee (confirmed by
+// testing — the stack reports SUCCESS_NOTIFY even when the central never surfaces the packet at
+// all), so instead of trusting it we wait for the app to ack each chunk before sending the next.
+// (BLECharacteristic::indicate() looks like the "proper" fix but this library's indicate() has a
+// real bug: if a single confirm ever times out, its internal gate semaphore is left permanently
+// taken, wedging all future sends until reboot — verified by reading BLECharacteristic.cpp.)
+// A single-slot queue (not a semaphore) carries the acked sequence byte itself, given from the
+// BLE stack task when the ack write arrives, consumed on the main loop.
+QueueHandle_t bleAckQueue = nullptr;
 
 
 Adafruit_NeoTrellis trellis;
@@ -535,26 +593,209 @@ TrellisCallback trellisEvent(keyEvent evt) {
   return 0;
 }
 
+// Per-chunk payload size (excluding our 1-byte sequence prefix). Verified directly by testing:
+// full 500B chunks reliably got SUCCESS_NOTIFY from the stack but never reached the app (0/5
+// retries acked over 4s), while a ~20B size (hit by accident via an earlier MTU-lookup bug)
+// delivered 160+ consecutive chunks with zero retries. WiFi/BLE coexistence — this firmware runs
+// WiFi STA + a WebServer alongside BLE — was the leading suspect, so WiFi is now paused for the
+// duration of any BLE connection (see MyServerCallbacks). 100B is a middle ground between that
+// proven-reliable size and full throughput now that the radio isn't shared; re-measure if drops
+// come back.
+const int BLE_CHUNK_PAYLOAD_SIZE = 100;
+
+// Sends one chunk, prefixed with a sequence byte, via notify() and blocks until the app echoes
+// that same seq back as an ack before returning, so the caller can safely overwrite the
+// characteristic's value buffer for the next chunk. notify() has no over-the-air delivery
+// guarantee — confirmed by testing: the BLE stack reports SUCCESS_NOTIFY (handed to the
+// controller) even when the central's Android stack never surfaces the packet at all — so a
+// missing ack is resolved by resending the same chunk, not just waiting longer. The sequence
+// number lets us tell a genuinely-missing ack apart from a late ack for a chunk we already
+// gave up on, so a retry can never be mistaken for confirmation of the wrong chunk — and lets
+// the app-side detect a resend that arrives after the original was already processed.
+// Returns false only once retries are exhausted — caller should abort the rest of the message
+// rather than keep blasting chunks the app was never confirmed to have received.
+bool sendNotifyAndWaitAck(const uint8_t *data, size_t len, uint8_t seq) {
+  uint8_t framed[501];
+  framed[0] = seq;
+  memcpy(framed + 1, data, len);
+  const int maxAttempts = 5;
+  const uint32_t attemptTimeoutMs = 800;
+  for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+    Serial.print("BLE TX: notify seq=");
+    Serial.print(seq);
+    Serial.print(" len=");
+    Serial.print(len);
+    Serial.print(" attempt=");
+    Serial.println(attempt);
+    pTxCharacteristic->setValue(framed, len + 1);
+    pTxCharacteristic->notify();
+    // A stale ack (a late arrival from an earlier retry of a PRIOR chunk, still in flight from
+    // the app when we started this attempt) must not cost this attempt its full timeout budget —
+    // keep waiting out the REMAINING time for the real ack instead of treating "got something,
+    // just not a match" the same as "got nothing" and immediately resending. Resending on every
+    // stale ack was amplifying exactly this duplicate-ack noise instead of letting it settle.
+    uint32_t deadline = millis() + attemptTimeoutMs;
+    bool ackedThisAttempt = false;
+    while (true) {
+      int32_t remaining = (int32_t)(deadline - millis());
+      if (remaining <= 0) break;
+      uint8_t ackedSeq;
+      if (xQueueReceive(bleAckQueue, &ackedSeq, pdMS_TO_TICKS(remaining)) != pdTRUE) break;
+      if (ackedSeq == seq) {
+        ackedThisAttempt = true;
+        break;
+      }
+      Serial.print("BLE TX: stale ack seq=");
+      Serial.print(ackedSeq);
+      Serial.print(" expected=");
+      Serial.println(seq);
+    }
+    if (ackedThisAttempt) return true;
+    Serial.print("BLE TX: chunk ack timed out, attempt ");
+    Serial.println(attempt);
+  }
+  Serial.println("BLE TX: chunk ack timed out after all retries, aborting message");
+  return false;
+}
+
+// Shared preamble for any chunked TX: log link state, drain any stale ack left over from a
+// prior aborted message, and give the central's BLE stack a moment to settle after enabling
+// notifications — sending immediately (observed ~250ms after CCCD-enable) reproducibly missed
+// the very first packet.
+void bleSendPreamble() {
+  Serial.print("BLE TX: connectedCount=");
+  Serial.print(pServer->getConnectedCount());
+  Serial.print(" peerDevices=");
+  Serial.println(pServer->getPeerDevices(false).size());
+  uint8_t dummy;
+  while (xQueueReceive(bleAckQueue, &dummy, 0) == pdTRUE) {}
+  delay(300);
+}
+
+// The ,"icon_xbm":"<hex>" pairs are stripped from get_profiles responses on the fly (the app
+// only needs the icon *name*; XBM bitmaps are display-side data). Streaming state machine
+// below matches this marker byte-by-byte.
+static const char ICON_XBM_MARKER[] = ",\"icon_xbm\":\"";
+
+// Streams a large JSON response straight into the chunked notify+ack pipeline through a fixed
+// chunk-size buffer, so the full ~12KB get_profiles payload never exists in RAM at once.
+//
+// WHY THIS EXISTS (heap fragmentation, no-PSRAM S3): the previous implementation built the
+// payload as Strings — serializeJson into an ~11-12KB String, concatenated into a second
+// ~equal-size wrapper String (≈24KB contiguous peak), then held that String alive for the whole
+// multi-second chunked send while the BLE stack allocated into the freed holes. After 1-2
+// fetches per boot the largest contiguous free block dropped below what serializeJson's String
+// needed and it came back EMPTY (never partial — an up-front allocation failure), producing the
+// observed exactly-27-byte {"status":"ok","profiles":} corruption. This sink's peak heap cost
+// is ~0 (one chunk buffer + a few ints, on the stack).
+//
+// Usage: print()/write() the message through it (serializeJson accepts any Print), end the
+// message with the '\n' delimiter, then call flushRemainder() and check failed.
+class BleChunkSink : public Print {
+public:
+  bool failed = false;     // sticky: set when a chunk exhausts its ack retries
+  size_t totalSent = 0;    // bytes emitted after icon_xbm stripping (for logging)
+
+  size_t write(uint8_t c) override {
+    if (failed) return 0;
+    if (_skipping) {
+      // Swallowing an icon_xbm hex value: it contains no quotes or escapes, so it ends at the
+      // next '"' (also swallowed — the marker's opening quote was never emitted).
+      if (c == '"') _skipping = false;
+      return 1;
+    }
+    if (c == (uint8_t)ICON_XBM_MARKER[_matched]) {
+      _matched++;
+      if (ICON_XBM_MARKER[_matched] == '\0') { // full marker matched — swallow the value next
+        _matched = 0;
+        _skipping = true;
+      }
+      return 1; // matched bytes are withheld until the match fails or completes
+    }
+    if (_matched > 0) {
+      // Partial match broken: emit the withheld marker prefix, then re-run this byte against
+      // the marker start. (Safe single-step fallback: ',' only occurs at position 0 of the
+      // marker, so no longer suffix of a broken match can begin a new match.)
+      int had = _matched;
+      _matched = 0;
+      for (int i = 0; i < had; i++) {
+        if (!emit((uint8_t)ICON_XBM_MARKER[i])) return 0;
+      }
+      if (c == (uint8_t)ICON_XBM_MARKER[0]) {
+        _matched = 1;
+        return 1;
+      }
+    }
+    return emit(c) ? 1 : 0;
+  }
+
+  size_t write(const uint8_t *buffer, size_t size) override {
+    size_t n = 0;
+    while (n < size && write(buffer[n]) == 1) n++;
+    return n;
+  }
+
+  // Send whatever partial chunk remains. Call once, after the trailing '\n' delimiter.
+  bool flushRemainder() {
+    if (failed) return false;
+    // A withheld partial marker match at end-of-stream can't be a real icon_xbm (the message
+    // ends "}\n"), but emit it anyway for correctness.
+    int had = _matched;
+    _matched = 0;
+    for (int i = 0; i < had; i++) {
+      if (!emit((uint8_t)ICON_XBM_MARKER[i])) return false;
+    }
+    if (_fill > 0) {
+      if (!sendNotifyAndWaitAck(_buf, _fill, _seq)) { failed = true; return false; }
+      _seq++;
+      _fill = 0;
+    }
+    return true;
+  }
+
+private:
+  uint8_t _buf[BLE_CHUNK_PAYLOAD_SIZE];
+  int _fill = 0;
+  uint8_t _seq = 0;      // same per-message sequence numbering the app already dedups on
+  int _matched = 0;      // bytes of ICON_XBM_MARKER currently matched (withheld)
+  bool _skipping = false; // inside an icon_xbm hex value
+
+  bool emit(uint8_t c) {
+    _buf[_fill++] = c;
+    totalSent++;
+    if (_fill == BLE_CHUNK_PAYLOAD_SIZE) {
+      if (!sendNotifyAndWaitAck(_buf, _fill, _seq)) { failed = true; return false; }
+      _seq++;
+      _fill = 0;
+    }
+    return true;
+  }
+};
+
 void sendBleMessage(const String &msg) {
   Serial.print("BLE TX: sending message of length ");
   Serial.println(msg.length());
+  bleSendPreamble();
   int len = msg.length();
   int offset = 0;
+  uint8_t seq = 0;
   while (offset < len) {
-    int chunkSize = min(180, len - offset);
-    pTxCharacteristic->setValue((uint8_t*)(msg.c_str() + offset), chunkSize);
-    pTxCharacteristic->notify();
+    int chunkSize = min(BLE_CHUNK_PAYLOAD_SIZE, len - offset);
+    if (!sendNotifyAndWaitAck((const uint8_t*)(msg.c_str() + offset), chunkSize, seq)) return;
     offset += chunkSize;
-    delay(20);
+    seq++;
   }
   // Send the newline delimiter at the end
   uint8_t nl = '\n';
-  pTxCharacteristic->setValue(&nl, 1);
-  pTxCharacteristic->notify();
+  if (!sendNotifyAndWaitAck(&nl, 1, seq)) return;
   Serial.println("BLE TX: sent");
 }
 
-void handleBleCommand(String cmdStr) {
+// Takes a mutable char* on purpose: deserializeJson(doc, char*) parses ZERO-COPY — req's
+// strings point into cmdStr itself (unescaped in place) instead of being duplicated, which
+// roughly halves peak RAM while parsing a ~12KB save_profiles command. cmdStr must therefore
+// stay alive until this function returns (the caller frees it afterwards).
+void handleBleCommand(char *cmdStr) {
   Serial.print("handleBleCommand: ");
   Serial.println(cmdStr);
   JsonDocument req;
@@ -567,57 +808,37 @@ void handleBleCommand(String cmdStr) {
   }
   
   String cmd = req["cmd"] | "";
-  String token = req["token"] | "";
-  
-  if (cmd == "pair") {
-    if (currentMode != CONFIG_MODE) {
-      sendBleMessage("{\"status\":\"error\",\"message\":\"Not in Config Mode\"}");
-      return;
-    }
-    pairingToken = String(esp_random(), HEX) + String(esp_random(), HEX) + String(esp_random(), HEX);
-    prefs.putString("pairingToken", pairingToken);
-    sendBleMessage("{\"status\":\"ok\",\"token\":\"" + pairingToken + "\"}");
+  // The `pair` command and the per-request `token` check are removed (spec v3 §7, M6/H1) --
+  // see the note at the top of this file. Config access is gated on CONFIG_MODE.
+  if (currentMode != CONFIG_MODE) {
+    sendBleMessage("{\"status\":\"error\",\"message\":\"Not in Config Mode\"}");
     return;
   }
-  
-  // Authorization check for other commands
-  if (currentMode != CONFIG_MODE && (token != pairingToken || pairingToken.length() == 0)) {
-    sendBleMessage("{\"status\":\"error\",\"message\":\"Unauthorized\"}");
-    return;
-  }
-  
+
   if (cmd == "get_profiles") {
-    File file = LittleFS.open("/profiles.json", "r");
-    if (!file) {
-      Serial.println("get_profiles: Failed to open profiles.json");
-      sendBleMessage("{\"status\":\"error\",\"message\":\"Failed to open profiles\"}");
-      return;
+    // Stream the response straight from the already-loaded global profilesDoc into the chunked
+    // BLE pipeline via BleChunkSink — the payload is NEVER built as a String. Two OOM bugs have
+    // lived in this branch already: (1) re-parsing profiles.json into a second JsonDocument
+    // failed once the BLE stack had claimed heap, and (2) the String-based double-buffer build
+    // fragmented the heap until serializeJson returned empty after 1-2 fetches per boot
+    // (the {"status":"ok","profiles":} corruption). See BleChunkSink for details.
+    Serial.printf("get_profiles: heap before: free=%u largestBlock=%u\n",
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+    bleSendPreamble();
+    BleChunkSink sink;
+    sink.print("{\"status\":\"ok\",\"profiles\":");
+    serializeJson(profilesDoc, sink);           // icon_xbm stripped on the fly by the sink
+    sink.print("}\n");                           // '\n' = end-of-message delimiter for the app
+    if (sink.flushRemainder()) {
+      Serial.print("get_profiles: streamed bytes = ");
+      Serial.println(sink.totalSent);
+      Serial.println("BLE TX: sent");
+    } else {
+      Serial.println("get_profiles: send aborted (chunk ack retries exhausted)");
     }
-    size_t fileSize = file.size();
-    Serial.print("get_profiles: profiles.json file size = ");
-    Serial.println(fileSize);
-    
-    String profilesJson = "";
-    profilesJson.reserve(fileSize);
-    while (file.available()) {
-      char c = (char)file.read();
-      if (c != '\n' && c != '\r') {
-        profilesJson += c;
-      }
-    }
-    file.close();
-    Serial.print("get_profiles: Read profilesJson length = ");
-    Serial.println(profilesJson.length());
-    
-    String response = "";
-    response.reserve(profilesJson.length() + 50);
-    response += "{\"status\":\"ok\",\"profiles\":";
-    response += profilesJson;
-    response += "}";
-    Serial.print("get_profiles: Response length = ");
-    Serial.println(response.length());
-    sendBleMessage(response);
-  } 
+    Serial.printf("get_profiles: heap after: free=%u largestBlock=%u\n",
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+  }
   else if (cmd == "save_profiles") {
     JsonObject profilesObj = req["profiles"];
     if (profilesObj.isNull()) {
@@ -679,50 +900,118 @@ void handleBleCommand(String cmdStr) {
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
       deviceConnected = true;
-      Serial.println("BLE Client Connected");
+      // The actual WiFi pause happens on the main loop (see the deviceConnected/oldDeviceConnected
+      // transition handling below), not here — this callback runs on the BLE stack's own task, and
+      // driving a WiFi driver reconfiguration from that foreign task while the main loop is
+      // concurrently building the get_profiles response corrupted it (verified: reverting this to
+      // a loop-driven toggle fixed a reproducible empty-JSON response that appeared as soon as this
+      // callback called WiFi.mode() directly).
+      Serial.print("BLE Client Connected, connectedCount=");
+      Serial.print(pServer->getConnectedCount());
+      Serial.print(" peerDevices=");
+      Serial.println(pServer->getPeerDevices(false).size());
     };
 
     void onDisconnect(BLEServer* pServer) {
       deviceConnected = false;
-      Serial.println("BLE Client Disconnected");
+      // A half-received command from a dropped connection must not poison the next one.
+      bleRxLen = 0;
+      Serial.print("BLE Client Disconnected, connectedCount=");
+      Serial.print(pServer->getConnectedCount());
+      Serial.print(" peerDevices=");
+      Serial.println(pServer->getPeerDevices(false).size());
     }
 };
 
 class MyCallbacks: public BLECharacteristicCallbacks {
+    String lastRxValue;
     void onWrite(BLECharacteristic *pCharacteristic) {
       String rxValue = pCharacteristic->getValue();
+      if (rxValue.length() == 2 && (uint8_t)rxValue[0] == BLE_CHUNK_ACK_MARKER) {
+        uint8_t seq = (uint8_t)rxValue[1];
+        xQueueOverwrite(bleAckQueue, &seq);
+        return;
+      }
+      // The BLE stack has been observed to invoke onWrite() twice for a single write from the
+      // app — the same underlying quirk documented for the doubled TX notify-status callback.
+      // Harmless there (just a log line); here it used to double-append into the RX buffer and,
+      // combined with heap fragmentation, corrupt the reassembled save_profiles command down to
+      // a garbage tail. Skip an exact repeat of the immediately-previous write.
+      if (rxValue == lastRxValue) {
+        Serial.println("BLE RX: duplicate write ignored");
+        return;
+      }
+      lastRxValue = rxValue;
+
       Serial.print("BLE RX bytes: ");
       Serial.println(rxValue.length());
+      if (bleRxBuf == nullptr) return; // malloc failed at boot — already logged as fatal
       if (rxValue.length() > 0) {
         for (int i = 0; i < rxValue.length(); i++) {
           char c = rxValue[i];
           if (c == '\n') {
-            handleBleCommand(bleBuffer);
-            bleBuffer = "";
+            bleRxBuf[bleRxLen] = '\0';
+            // Pass to main loop via queue — FreeRTOS queue ops include memory barriers
+            // that guarantee cross-core visibility (volatile alone is insufficient on ESP32-S3)
+            char *cmdCopy = strdup(bleRxBuf);
+            bleRxLen = 0;
+            if (cmdCopy != nullptr && bleRxQueue != nullptr) {
+              if (xQueueSend(bleRxQueue, &cmdCopy, 0) != pdTRUE) {
+                Serial.println("BLE RX queue full, dropping command");
+                free(cmdCopy);
+              } else {
+                Serial.println("BLE RX queued OK");
+              }
+            }
+          } else if (bleRxLen < BLE_RX_BUFFER_SIZE - 1) {
+            bleRxBuf[bleRxLen++] = c;
           } else {
-            bleBuffer += c;
+            Serial.println("BLE RX: command exceeds buffer, dropping");
+            bleRxLen = 0;
           }
         }
       }
     }
 };
 
+// Pure diagnostics — does not participate in the ack flow control. Logs what notify()
+// actually did, since a silent no-op (e.g. central hasn't re-enabled the CCCD yet) looks
+// identical to a dropped-over-the-air packet from the ack-timeout's point of view.
+class TxLogCallbacks: public BLECharacteristicCallbacks {
+    void onStatus(BLECharacteristic *pCharacteristic, Status s, uint32_t code) {
+      Serial.print("BLE TX notify status [core=");
+      Serial.print(xPortGetCoreID());
+      Serial.print(" task=");
+      Serial.print(pcTaskGetName(NULL));
+      Serial.print(" us=");
+      Serial.print((unsigned long)esp_timer_get_time());
+      Serial.print("]: ");
+      switch (s) {
+        case SUCCESS_NOTIFY: Serial.println("SUCCESS_NOTIFY"); break;
+        case SUCCESS_INDICATE: Serial.println("SUCCESS_INDICATE"); break;
+        case ERROR_INDICATE_DISABLED: Serial.println("ERROR_INDICATE_DISABLED"); break;
+        case ERROR_NOTIFY_DISABLED: Serial.println("ERROR_NOTIFY_DISABLED"); break;
+        case ERROR_GATT: Serial.print("ERROR_GATT code="); Serial.println(code); break;
+        case ERROR_NO_CLIENT: Serial.println("ERROR_NO_CLIENT"); break;
+        case ERROR_NO_SUBSCRIBER: Serial.println("ERROR_NO_SUBSCRIBER"); break;
+        case ERROR_INDICATE_TIMEOUT: Serial.println("ERROR_INDICATE_TIMEOUT"); break;
+        case ERROR_INDICATE_FAILURE: Serial.println("ERROR_INDICATE_FAILURE"); break;
+        default: Serial.println((int)s); break;
+      }
+    }
+};
+
+// The Bearer-token branch is removed along with the rest of the pairingToken scheme (M6/H1).
+// The legacy web UI on this board is gated on CONFIG_MODE only. The whole web server is slated
+// for removal (spec v3 §1 cuts the web config path permanently); that removal is out of scope
+// for M6 and is not attempted here.
 bool isAuthorized() {
-  if (currentMode == CONFIG_MODE) return true;
-  if (server.hasHeader("Authorization")) {
-    String auth = server.header("Authorization");
-    if (auth == "Bearer " + pairingToken && pairingToken.length() > 0) return true;
-  }
-  return false;
+  return currentMode == CONFIG_MODE;
 }
 
 void setupWebServer() {
   server.enableCORS(true);
-  
-  const char * headerkeys[] = {"Authorization"};
-  size_t headerkeyssize = sizeof(headerkeys)/sizeof(char*);
-  server.collectHeaders(headerkeys, headerkeyssize);
-  
+
   server.on("/", HTTP_GET, [](){
     if (currentMode != CONFIG_MODE) {
       server.send(403, "text/plain", "Forbidden. Swipe down on Draupnir to enter Config Mode.");
@@ -731,15 +1020,7 @@ void setupWebServer() {
     server.send(200, "text/html", INDEX_HTML);
   });
   
-  server.on("/api/pair", HTTP_POST, []() {
-    if (currentMode != CONFIG_MODE) {
-      server.send(403, "application/json", "{\"status\":\"error\",\"message\":\"Not in Config Mode\"}");
-      return;
-    }
-    pairingToken = String(esp_random(), HEX) + String(esp_random(), HEX) + String(esp_random(), HEX);
-    prefs.putString("pairingToken", pairingToken);
-    server.send(200, "application/json", "{\"token\":\"" + pairingToken + "\"}");
-  });
+  // /api/pair removed with the pairingToken scheme (M6/H1).
 
   server.on("/api/profiles", HTTP_GET, [](){
     if (!isAuthorized()) {
@@ -906,8 +1187,10 @@ void setup() {
   }
   
   prefs.begin("draupnir", false);
-  pairingToken = prefs.getString("pairingToken", "");
-  
+  // Actively delete any token left in NVS by a pre-M6 build, so the key does not linger on
+  // devices that have already been paired the old way.
+  prefs.remove("pairingToken");
+
   loadProfiles();
   
   int brightness = profilesDoc["settings"]["brightness"] | 160;
@@ -918,41 +1201,51 @@ void setup() {
   
   WiFi.mode(WIFI_STA);
   WiFi.begin();
-  
+
   setupWebServer();
-  
+
+  // USB must start before BLE on ESP32-S3 — USB.begin() disrupts BLE if it runs after
+  Keyboard.begin();
+  ConsumerControl.begin();
+  Mouse.begin();
+  USB.begin();
+  delay(200); // let USB settle before BLE init
+
   // Initialize BLE
+  bleRxQueue = xQueueCreate(4, sizeof(char*));
+  bleAckQueue = xQueueCreate(1, sizeof(uint8_t));
   BLEDevice::init("Draupnir");
+  bleRxBuf = (char*)malloc(BLE_RX_BUFFER_SIZE);
+  if (bleRxBuf == nullptr) {
+    Serial.println("FATAL: failed to allocate BLE RX buffer");
+  }
+  BLEDevice::setMTU(512);
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
-  
+
   BLEService *pService = pServer->createService(SERVICE_UUID);
   pTxCharacteristic = pService->createCharacteristic(
                         CHARACTERISTIC_UUID_TX,
                         BLECharacteristic::PROPERTY_NOTIFY
                       );
   pTxCharacteristic->addDescriptor(new BLE2902());
-  
+  pTxCharacteristic->setCallbacks(new TxLogCallbacks());
+
   BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
                                            CHARACTERISTIC_UUID_RX,
                                            BLECharacteristic::PROPERTY_WRITE |
                                            BLECharacteristic::PROPERTY_WRITE_NR
                                          );
   pRxCharacteristic->setCallbacks(new MyCallbacks());
-  
+
   pService->start();
-  
+
   pServer->getAdvertising()->addServiceUUID(SERVICE_UUID);
   pServer->getAdvertising()->setScanResponse(true);
   pServer->getAdvertising()->setMinPreferred(0x06);
-  pServer->getAdvertising()->setMinPreferred(0x12);
+  pServer->getAdvertising()->setMaxPreferred(0x12);
   BLEDevice::startAdvertising();
   Serial.println("BLE Started Advertising");
-  
-  Keyboard.begin();
-  ConsumerControl.begin();
-  Mouse.begin();
-  USB.begin();
 
   drawRunUI();
   Serial.println("Draupnir M5/M6 Ready");
@@ -1114,15 +1407,37 @@ void loop() {
     }
   }
   
+  // Dispatch queued BLE command (safe to call notify from main loop)
+  char *rxPtr = nullptr;
+  if (bleRxQueue != nullptr && xQueueReceive(bleRxQueue, &rxPtr, 0) == pdTRUE) {
+    Serial.println("Main loop: dispatching BLE command");
+    if (rxPtr != nullptr) {
+      handleBleCommand(rxPtr); // zero-copy parse; rxPtr must outlive the call
+      free(rxPtr);
+    }
+  }
+
   // BLE reconnection handling
   if (!deviceConnected && oldDeviceConnected) {
+    // Restore WiFi/web access for Config Mode now that BLE no longer needs exclusive radio time.
+    // Routes are already registered from setup()'s setupWebServer() call — just restart the
+    // listener, don't re-register them.
+    WiFi.mode(WIFI_STA);
+    WiFi.begin();
+    server.begin();
     delay(500); // give the bluetooth stack the chance to get ready
-    pServer->startAdvertising(); // restart advertising
+    BLEDevice::startAdvertising(); // restart advertising (pServer->startAdvertising silently fails on ESP32)
     Serial.println("Restart BLE advertising");
     oldDeviceConnected = deviceConnected;
   }
   if (deviceConnected && !oldDeviceConnected) {
-    // do stuff on connection
+    // WiFi STA + the web server aren't needed at the same time as a BLE session in practice — and
+    // WiFi/BLE radio coexistence was the leading suspect for large BLE notify chunks being
+    // silently dropped (verified: tiny ~20B chunks were reliable, 500B chunks weren't). Freeing
+    // the radio for BLE's exclusive use while a client is connected removes that contention.
+    server.stop();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
     oldDeviceConnected = deviceConnected;
   }
   

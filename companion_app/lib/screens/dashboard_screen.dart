@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:google_fonts/google_fonts.dart';
 
@@ -14,17 +15,11 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
-  final TextEditingController _ipController = TextEditingController(text: 'draupnir.local');
   int? _editingKeyIdx;
-  bool _useBluetooth = false;
 
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      context.read<DraupnirState>().connect(_ipController.text);
-    });
-  }
+  // No auto-connect on launch: BLE is the only transport now (the Wi-Fi/HTTP path is gone with
+  // the web UI), and a BLE scan is an explicit user action, not something to fire off in
+  // initState.
 
   @override
   Widget build(BuildContext context) {
@@ -37,74 +32,144 @@ class _DashboardScreenState extends State<DashboardScreen> {
           style: GoogleFonts.orbitron(fontWeight: FontWeight.bold),
         ),
         actions: [
-          if (state.profilesData != null) ...[
-            if (state.isBluetooth)
-              IconButton(
-                icon: const Icon(Icons.bluetooth_connected, color: Colors.blue),
-                tooltip: 'Connected via BLE. Tap to disconnect.',
-                onPressed: () => state.disconnectBluetooth(),
+          if (state.profilesData != null && state.isBluetooth)
+            IconButton(
+              icon: const Icon(Icons.bluetooth_connected, color: Colors.blue),
+              tooltip: 'Connected via BLE. Tap to disconnect.',
+              onPressed: () => state.disconnectBluetooth(),
+            ),
+          PopupMenuButton<String>(
+            icon: Badge(
+              isLabelVisible: state.debugLog.isNotEmpty,
+              label: Text('${state.debugLog.length}'),
+              child: const Icon(Icons.more_vert),
+            ),
+            onSelected: (val) {
+              switch (val) {
+                case 'refresh':
+                  state.fetchProfiles();
+                  break;
+                case 'settings':
+                  _showSettingsDialog(state);
+                  break;
+                case 'debug':
+                  _showDebugLog(state);
+                  break;
+              }
+            },
+            itemBuilder: (context) => [
+              if (state.profilesData != null)
+                const PopupMenuItem(
+                  value: 'refresh',
+                  child: ListTile(leading: Icon(Icons.refresh), title: Text('Refresh Profiles')),
+                ),
+              const PopupMenuItem(
+                value: 'settings',
+                child: ListTile(leading: Icon(Icons.settings), title: Text('Device Settings')),
               ),
-            _buildProfileSwitcher(state),
-            const SizedBox(width: 16),
-            _buildModeToggle(state),
-            const SizedBox(width: 16),
-            IconButton(
-              icon: const Icon(Icons.refresh),
-              onPressed: () => state.fetchProfiles(),
-            ),
-            IconButton(
-              icon: const Icon(Icons.settings),
-              onPressed: () => _showSettingsDialog(state),
-            ),
-          ],
-          const SizedBox(width: 16),
+              PopupMenuItem(
+                value: 'debug',
+                child: ListTile(
+                  leading: const Icon(Icons.bug_report_outlined),
+                  title: Text('Debug Log (${state.debugLog.length})'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(width: 8),
         ],
       ),
+      floatingActionButton: state.profilesData != null
+          ? FloatingActionButton.extended(
+              onPressed: () => state.toggleEditorMode(),
+              backgroundColor: state.isEditorMode ? AppTheme.surfaceHighlight : AppTheme.accent,
+              foregroundColor: state.isEditorMode ? Colors.white : Colors.black,
+              icon: Icon(state.isEditorMode ? Icons.edit : Icons.play_arrow),
+              label: Text(
+                state.isEditorMode ? 'EDIT MODE' : 'RUN MODE',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+            )
+          : null,
       body: Column(
         children: [
+          if (state.profilesData != null)
+            SizedBox(height: 48, child: _buildProfileTabs(state)),
           if (state.profilesData == null && !state.isLoading) _buildConnectionBar(state),
           if (state.isLoading)
             const Expanded(child: Center(child: CircularProgressIndicator()))
+          // Pairing is the OS's job now — standard BLE passkey pairing against the PIN shown on
+          // the knob — so this is guidance, not an action. There is deliberately no in-app
+          // "Pair" button: the old one drove a `cmd: "pair"` the firmware never implemented.
           else if (state.needsPairing)
             Expanded(
               child: Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const Icon(Icons.lock_outline, color: Colors.orange, size: 64),
-                    const SizedBox(height: 16),
-                    Text(
-                      state.error ?? 'Pairing Required',
-                      style: const TextStyle(color: Colors.orange, fontSize: 16, fontWeight: FontWeight.bold),
-                      textAlign: TextAlign.center,
-                    ),
-                    const SizedBox(height: 24),
-                    ElevatedButton.icon(
-                      icon: state.isPairing 
-                        ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                        : const Icon(Icons.link),
-                      label: Text(state.isPairing ? 'PAIRING...' : 'PAIR DEVICE'),
-                      style: ElevatedButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
-                        backgroundColor: Colors.orange,
-                        foregroundColor: Colors.white,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 32),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Icon(Icons.bluetooth_searching, color: Colors.orange, size: 64),
+                      const SizedBox(height: 16),
+                      const Text(
+                        'PAIRING REQUIRED',
+                        style: TextStyle(color: Colors.orange, fontSize: 16, fontWeight: FontWeight.bold),
+                        textAlign: TextAlign.center,
                       ),
-                      onPressed: state.isPairing ? null : () => state.pair(),
-                    ),
-                  ],
+                      const SizedBox(height: 12),
+                      Text(
+                        state.error ?? DraupnirState.pairingRequiredMessage,
+                        style: const TextStyle(color: Colors.white70, fontSize: 14),
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 24),
+                      ElevatedButton.icon(
+                        icon: const Icon(Icons.refresh),
+                        label: const Text('TRY AGAIN'),
+                        style: ElevatedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+                          backgroundColor: Colors.orange,
+                          foregroundColor: Colors.white,
+                        ),
+                        onPressed: state.isLoading ? null : () => state.connectBluetooth(),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             )
           else if (state.error != null)
             Expanded(
               child: Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const Icon(Icons.error_outline, color: Colors.red, size: 48),
-                    const SizedBox(height: 16),
-                    Text(state.error!, style: const TextStyle(color: Colors.red)),
-                  ],
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 32),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Icon(Icons.error_outline, color: Colors.red, size: 48),
+                      const SizedBox(height: 16),
+                      Text(
+                        state.error!,
+                        style: const TextStyle(color: Colors.red),
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 24),
+                      // Without this the app was a dead end on any disconnect: the error was
+                      // displayed with no action attached, so the only way back to a working
+                      // connection was force-closing and reopening the app. Retrying in place is
+                      // safe — the disconnect handler already nulls connectedDevice/rxChar/txChar,
+                      // and connectBluetooth() clears `error`, rescans, and rebuilds all of that
+                      // characteristic state from scratch.
+                      ElevatedButton.icon(
+                        icon: const Icon(Icons.bluetooth_searching),
+                        label: const Text('RECONNECT'),
+                        style: ElevatedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+                        ),
+                        onPressed: state.isLoading ? null : () => state.connectBluetooth(),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             )
@@ -126,46 +191,55 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
-  Widget _buildProfileSwitcher(DraupnirState state) {
+  Widget _buildProfileTabs(DraupnirState state) {
     final profiles = state.profilesData!['profiles'] as List;
-    return Row(
-      children: [
-        DropdownButton<int>(
-          value: state.activeProfileIdx,
-          dropdownColor: AppTheme.surfaceHighlight,
-          underline: const SizedBox(),
-          items: List.generate(profiles.length, (idx) {
-            Color profColor = AppTheme.accent;
-            if (profiles[idx]['color'] != null) {
-              try {
-                String hex = profiles[idx]['color'].toString().replaceAll('#', '');
-                profColor = Color(int.parse('FF$hex', radix: 16));
-              } catch (_) {}
-            }
-            return DropdownMenuItem(
-              value: idx,
-              child: Text(
-                profiles[idx]['name'] ?? 'Profile $idx',
-                style: GoogleFonts.orbitron(color: profColor, fontWeight: FontWeight.bold),
-              ),
-            );
-          }),
-          onChanged: (val) {
-            if (val != null) {
-              state.setActiveProfile(val);
-              setState(() => _editingKeyIdx = null);
-            }
-          },
-        ),
-        IconButton(
-          icon: const Icon(Icons.edit, color: Colors.grey),
-          onPressed: () => _showEditProfileDialog(state),
-        ),
-        IconButton(
-          icon: const Icon(Icons.add_circle_outline, color: AppTheme.accent),
-          onPressed: () => _showAddProfileDialog(state),
-        ),
-      ],
+    return ColoredBox(
+      color: AppTheme.surface,
+      child: Row(
+        children: [
+          Expanded(
+            child: ListView.builder(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              itemCount: profiles.length,
+              itemBuilder: (context, idx) {
+                Color profColor = AppTheme.accent;
+                if (profiles[idx]['color'] != null) {
+                  try {
+                    String hex = profiles[idx]['color'].toString().replaceAll('#', '');
+                    profColor = Color(int.parse('FF$hex', radix: 16));
+                  } catch (_) {}
+                }
+                final selected = state.activeProfileIdx == idx;
+                return Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+                  child: ChoiceChip(
+                    label: Text(
+                      profiles[idx]['name'] ?? 'Profile $idx',
+                      style: GoogleFonts.orbitron(
+                        fontWeight: FontWeight.bold,
+                        color: selected ? Colors.black : profColor,
+                      ),
+                    ),
+                    selected: selected,
+                    selectedColor: profColor,
+                    backgroundColor: AppTheme.surfaceHighlight,
+                    onSelected: (_) {
+                      state.setActiveProfile(idx);
+                      setState(() => _editingKeyIdx = null);
+                    },
+                  ),
+                );
+              },
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.add_circle_outline, color: AppTheme.accent, size: 20),
+            tooltip: 'New profile',
+            onPressed: () => _showAddProfileDialog(state),
+          ),
+        ],
+      ),
     );
   }
 
@@ -303,13 +377,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  if (!state.isBluetooth)
-                    TextField(
-                      controller: _ipController,
-                      decoration: const InputDecoration(labelText: 'Device IP / Hostname'),
-                    )
-                  else
-                    const Text('Connected via Bluetooth (BLE)', style: TextStyle(color: Colors.green, fontWeight: FontWeight.bold)),
+                  Text(
+                    state.isBluetooth ? 'Connected via Bluetooth (BLE)' : 'Not connected',
+                    style: TextStyle(
+                      color: state.isBluetooth ? Colors.green : Colors.grey,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
                   const SizedBox(height: 16),
                   const Text('Dial Orientation', style: TextStyle(fontWeight: FontWeight.bold)),
                   DropdownButton<int>(
@@ -333,9 +407,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('CANCEL')),
                 ElevatedButton(
                   onPressed: () {
-                    if (!state.isBluetooth) {
-                      state.connect(_ipController.text);
-                    }
                     if (state.orientation != currentOrientation) {
                       state.setOrientation(currentOrientation);
                     }
@@ -351,49 +422,52 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
-  Widget _buildModeToggle(DraupnirState state) {
-    return Container(
-      decoration: BoxDecoration(
-        color: AppTheme.surfaceHighlight,
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Row(
-        children: [
-          InkWell(
-            onTap: state.isEditorMode ? () => state.toggleEditorMode() : null,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              decoration: BoxDecoration(
-                color: !state.isEditorMode ? AppTheme.accent : Colors.transparent,
-                borderRadius: const BorderRadius.horizontal(left: Radius.circular(8)),
-              ),
-              child: Text(
-                'RUN MODE',
-                style: TextStyle(
-                  color: !state.isEditorMode ? Colors.black : Colors.white,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
+  void _showDebugLog(DraupnirState state) {
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          return AlertDialog(
+            title: const Text('BLE Debug Log'),
+            content: SizedBox(
+              width: double.maxFinite,
+              height: 400,
+              child: state.debugLog.isEmpty
+                  ? const Center(child: Text('No log entries yet.\nConnect via Bluetooth to see events.', textAlign: TextAlign.center))
+                  : ListView.builder(
+                      itemCount: state.debugLog.length,
+                      itemBuilder: (ctx, i) {
+                        final line = state.debugLog[i];
+                        Color color = Colors.white70;
+                        if (line.contains('[ERR]')) color = Colors.red;
+                        else if (line.contains('[RX]')) color = Colors.greenAccent;
+                        else if (line.contains('[TX]')) color = Colors.cyanAccent;
+                        else if (line.contains('[CONN]') || line.contains('[MTU]')) color = Colors.blueAccent;
+                        return Text(line, style: TextStyle(fontFamily: 'monospace', fontSize: 11, color: color));
+                      },
+                    ),
             ),
-          ),
-          InkWell(
-            onTap: !state.isEditorMode ? () => state.toggleEditorMode() : null,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              decoration: BoxDecoration(
-                color: state.isEditorMode ? AppTheme.accent : Colors.transparent,
-                borderRadius: const BorderRadius.horizontal(right: Radius.circular(8)),
+            actions: [
+              TextButton(
+                onPressed: () { state.clearDebugLog(); setDialogState(() {}); },
+                child: const Text('CLEAR'),
               ),
-              child: Text(
-                'EDIT MODE',
-                style: TextStyle(
-                  color: state.isEditorMode ? Colors.black : Colors.white,
-                  fontWeight: FontWeight.bold,
-                ),
+              TextButton(
+                onPressed: () async {
+                  final text = state.debugLog.join('\n');
+                  await Clipboard.setData(ClipboardData(text: text));
+                  if (ctx.mounted) {
+                    ScaffoldMessenger.of(ctx).showSnackBar(
+                      const SnackBar(content: Text('Debug log copied to clipboard'), duration: Duration(seconds: 2)),
+                    );
+                  }
+                },
+                child: const Text('COPY'),
               ),
-            ),
-          ),
-        ],
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('CLOSE')),
+            ],
+          );
+        },
       ),
     );
   }
@@ -402,80 +476,43 @@ class _DashboardScreenState extends State<DashboardScreen> {
     return Container(
       padding: const EdgeInsets.all(16),
       color: AppTheme.surface,
+      // BLE is the only transport. The Wi-Fi/IP branch here was the client half of the
+      // on-device web UI, which is cut permanently (spec v3 §1, §7).
       child: Column(
         children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              ChoiceChip(
-                label: const Text('Wi-Fi (Network)'),
-                selected: !_useBluetooth,
-                selectedColor: AppTheme.accent,
-                labelStyle: TextStyle(color: !_useBluetooth ? Colors.black : Colors.white),
-                onSelected: (val) {
-                  if (val) setState(() => _useBluetooth = false);
-                },
-              ),
-              const SizedBox(width: 16),
-              ChoiceChip(
-                label: const Text('Bluetooth (BLE)'),
-                selected: _useBluetooth,
-                selectedColor: AppTheme.accent,
-                labelStyle: TextStyle(color: _useBluetooth ? Colors.black : Colors.white),
-                onSelected: (val) {
-                  if (val) setState(() => _useBluetooth = true);
-                },
-              ),
-            ],
+          const Text(
+            'Pair "Draupnir" in your phone\'s Bluetooth settings first — the knob shows the PIN '
+            'on its screen.',
+            style: TextStyle(color: Colors.white54, fontSize: 12),
+            textAlign: TextAlign.center,
           ),
           const SizedBox(height: 16),
-          if (!_useBluetooth)
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _ipController,
-                    decoration: const InputDecoration(
-                      labelText: 'Device IP / Hostname',
-                      border: OutlineInputBorder(),
-                      isDense: true,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 16),
-                ElevatedButton(
-                  onPressed: () => state.connect(_ipController.text),
-                  child: const Text('CONNECT'),
-                ),
-              ],
-            )
-          else
-            Center(
-              child: ElevatedButton.icon(
-                icon: state.isScanningBle
-                    ? const SizedBox(
-                        width: 20,
-                        height: 20,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: Colors.black,
-                        ),
-                      )
-                    : const Icon(Icons.bluetooth),
-                label: Text(state.isScanningBle
-                    ? 'SCANNING FOR DRUAPNIR...'
-                    : 'CONNECT VIA BLUETOOTH'),
-                style: ElevatedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 32, vertical: 16),
-                  backgroundColor: AppTheme.accent,
-                  foregroundColor: Colors.black,
-                ),
-                onPressed: state.isScanningBle || state.isLoading
-                    ? null
-                    : () => state.connectBluetooth(),
+          Center(
+            child: ElevatedButton.icon(
+              icon: state.isScanningBle
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.black,
+                      ),
+                    )
+                  : const Icon(Icons.bluetooth),
+              label: Text(state.isScanningBle
+                  ? 'SCANNING FOR DRAUPNIR...'
+                  : 'CONNECT VIA BLUETOOTH'),
+              style: ElevatedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 32, vertical: 16),
+                backgroundColor: AppTheme.accent,
+                foregroundColor: Colors.black,
               ),
+              onPressed: state.isScanningBle || state.isLoading
+                  ? null
+                  : () => state.connectBluetooth(),
             ),
+          ),
         ],
       ),
     );
@@ -505,12 +542,21 @@ class _DashboardScreenState extends State<DashboardScreen> {
         children: [
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            crossAxisAlignment: CrossAxisAlignment.baseline,
-            textBaseline: TextBaseline.alphabetic,
             children: [
-              Text(
-                profileName,
-                style: GoogleFonts.orbitron(fontSize: 24, fontWeight: FontWeight.bold, color: profileColor),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  Text(
+                    profileName,
+                    style: GoogleFonts.orbitron(fontSize: 24, fontWeight: FontWeight.bold, color: profileColor),
+                  ),
+                  if (state.profilesData != null)
+                    IconButton(
+                      icon: const Icon(Icons.edit, color: Colors.grey, size: 20),
+                      tooltip: 'Edit current profile',
+                      onPressed: () => _showEditProfileDialog(state),
+                    ),
+                ],
               ),
               if (state.isEditorMode)
                 Text(
