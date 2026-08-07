@@ -127,13 +127,37 @@ any_running=0                                                  <- stopped across
 No crash, no reset; a later trigger ran normally. H3, H4 and the `bug_003` relocation all hold
 under the exact race they exist for.
 
+### H1 NEGATIVE TEST — PASSED ON HARDWARE 2026-08-07 ✅ (M6 done-criterion met)
+
+Run with nRF Connect as an unbonded central (OS bond forgotten first; pairing prompt declined
+on every attempt). Four connections, all `encrypted=0 authenticated=0 bonded=0`:
+
+| nRF Connect operation | Device result |
+|---|---|
+| write `0x626C6168` (`"blah"`) to RX `6E400002` | **no `[ble] cmd:` logged — ever** |
+| CCCD write `0x0100` on TX `6E400003` (×2) | never completed, no response |
+| CCCD **read** on `0x2902` | **succeeded**, returned `0x00-00` |
+
+`[ble] cmd:` count for the whole session: **zero**. An unbonded central wrote to RX and the
+command handler never received the bytes — refused at the GATT layer, not abandoned by the
+central. nRF shows no error code because Android swallows `Insufficient Authentication` and
+retries after bonding; the operation simply hangs until the bond fails and the link drops (~17 s).
+
+Precise statement of what is gated: **CCCD write is gated, CCCD read is not.** The unencrypted
+read leaks only whether notifications are enabled — no data, no control.
+
 ### NOT verified ❌
 
-- **The negative test — the milestone's definition of done — has not been run.** An unbonded
-  central (nRF Connect declaring NoInputNoOutput) must be *rejected* on an RX write AND on a TX
-  subscribe. Failed pairings observed so far disconnected on their own rather than being refused
-  by the GATT layer, which is suggestive but not conclusive. **M6 is not complete until this
-  runs.**
+- **The Just Works question — the last real unknown in H1.** Android reported
+  `PAIRING_VARIANT: CONSENT` (Just-Works-style consent, *not* passkey entry) on every negative-test
+  attempt. All were declined, so **what happens if it is accepted is untested.** If the device
+  completes such a pairing the result is `authenticated=0 bonded=1`, and since the CCCD is gated on
+  encryption only (`NOTIFY_INDICATE_AUTHEN` truncates — `ble_engine.cpp:511`), a Just-Works-bonded
+  central could then subscribe to TX.
+  > **One-action test:** connect with nRF Connect and **accept** the consent prompt, then read the
+  > device's `authentication complete` line. `authenticated=0 bonded=1` means the gap is real and
+  > the AUTHEN truncation needs a real workaround. A refusal confirms `SC_MITM_BOND` holds and the
+  > comment's assumption is proven rather than assumed.
 - **Heap across a save/reload cycle is not yet proven flat.** One cycle went 61,720 -> 61,392
   (−328 B), consistent with a larger `profilesDoc` (919 B) rather than a leak — the same "steps
   with document size, not per cycle" pattern seen before. One cycle cannot separate the two;

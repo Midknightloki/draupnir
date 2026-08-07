@@ -523,12 +523,20 @@ void ble_init() {
   // this device will not complete a Just Works pairing at all, so any encrypted link here is
   // necessarily an authenticated one. Revisit if the auth mode is ever relaxed.
   //
-  // THAT ARGUMENT IS UNVERIFIED. It is a reading of the configuration, not an observation: the
-  // H1 negative test -- an unbonded central declaring NoInputNoOutput must be rejected on both
-  // an RX write AND a TX subscribe -- has never been run on hardware. Until it is, treat the
-  // CCCD as gated on encryption only and do not lean on the MITM claim. Running that test is
-  // what makes M6 complete (docs/HANDOFF.md §5 step 3). Independently re-flagged by external
-  // audit 2026-08, which reached the same conclusion from the truncation alone.
+  // PARTLY VERIFIED 2026-08-07. The H1 negative test PASSED on hardware: an unbonded central
+  // (nRF Connect, pairing declined) wrote to RX and the command handler never saw the bytes --
+  // zero [ble] cmd: lines across four unencrypted connections -- and CCCD writes never completed.
+  // Enforcement is real. Note the CCCD *read* did succeed unencrypted (returns 0x0000); that
+  // leaks only whether notifications are on, no data and no control.
+  //
+  // STILL UNVERIFIED -- the Just Works case, which is the part that actually depends on the
+  // truncated bit. Android reported PAIRING_VARIANT: CONSENT (Just-Works-style consent, not
+  // passkey entry) on every attempt, and all were declined, so what happens when one is ACCEPTED
+  // is unknown. If this device completes such a pairing the result is authenticated=0 bonded=1,
+  // and because the CCCD is gated on encryption only, that central could then subscribe to TX.
+  // The MITM claim above is exactly what would prevent it, and it is still an inference.
+  // One-action test in docs/HANDOFF.md. Re-flagged independently by external audit 2026-08,
+  // which reached the same conclusion from the truncation alone.
   pTxCharacteristic = pService->createCharacteristic(
     CHARACTERISTIC_UUID_TX,
     BLECharacteristic::PROPERTY_NOTIFY | BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC
