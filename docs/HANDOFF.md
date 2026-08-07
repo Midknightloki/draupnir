@@ -305,8 +305,9 @@ alignment (M9). Spec §10.
   > handed the token to any central in `CONFIG_MODE` and persisted it to NVS, converting one
   > moment of physical access into permanent remote `RUN_MODE` access. Full reasoning is in the
   > header comment of `firmware/M5_M6_config/M5_M6_config.ino`.
-  > *Why the audit misread it:* this file's baseline commit is empty, so all 1,431 lines appear
-  > as additions and the token's absence reads as a deletion with no visible context.
+  > Verified against the real baseline: `origin/main:584` carries exactly that gate. (An earlier
+  > note here blamed the misread on an empty baseline — that was wrong. The PR targets `main`,
+  > which has full history, so the audit saw a genuine diff and still misjudged the direction.)
 - **TX CCCD is gated on encryption, not authentication.** `BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN`
   (0x10000) truncates away — `BLECharacteristic` stores properties in a `uint16_t`. The argument
   that this is harmless (`SC_MITM_BOND` won't complete Just Works, so any encrypted link is
@@ -352,7 +353,9 @@ alignment (M9). Spec §10.
   firmware drives it with SH8601 and works. Unresolved, low priority.
 - **`firmware/Waveshare_Knob_Config/`** is a superseded Adafruit_GFX port, still untracked, with
   leftover `refactor*.py` scripts. Safe to delete once nothing is owed to it.
-- **Branch `review/waveshare-m6-foundation` is pushed** and open as PR #1 against `master`. Note
-  `origin/master` is a bare "Initial commit" — it holds almost none of the tree, which is why
-  diff-scoped reviews of this PR see nearly every file as wholly new and lose all before/after
-  context. Weigh review findings against the file's own history, not the PR diff.
+- **Two long-lived branches exist and they are unrelated histories.** `main` is the real trunk and
+  is what PR #1 targets. `origin/master` is a bare "Initial commit" that holds almost none of the
+  tree, yet it is the repo's *default* branch (`origin/HEAD -> origin/master`), so tooling and
+  fresh clones land on the empty one. Diffing against `master` gives a meaningless 1,431-line
+  "all new" result — that mistake was made during this review. **Use `main`.** Worth deleting or
+  repointing `master` before it misleads anyone else.

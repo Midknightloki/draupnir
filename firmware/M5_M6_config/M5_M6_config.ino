@@ -46,8 +46,7 @@ AppMode currentMode = RUN_MODE;
 //
 // DO NOT "FIX" THIS BY RESTORING THE TOKEN. An external audit (2026-08) read the removal as the
 // cause of the gap and called it a blocking regression. It is not -- the token made things
-// strictly worse, and the diff misleads because this file's baseline commit is empty, so every
-// line reads as newly added:
+// strictly worse. Compare the gate before and after (baseline is origin/main:584):
 //
 //   Before:  if (currentMode != CONFIG_MODE && (token != pairingToken || !pairingToken.length()))
 //   After:   if (currentMode != CONFIG_MODE)
