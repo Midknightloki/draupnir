@@ -94,13 +94,51 @@ was the main risk hanging over M6. H2 (buffer bounds), H3 (use-after-free), and 
 are all in this build and it is stable — consistent with the theory that some of that instability
 *was* those defects. Not proof, but the risk is materially lower than it was.
 
+### H1 + H3 (post-`bug_003`) — VERIFIED ON HARDWARE 2026-08-07 ✅
+
+Flashed `0b02a3f`. Captured with a serial channel that no longer resets the board (see §7).
+
+**H1 positive path.** Pairing completes with authentication and bonding:
+
+```
+[ble] show passkey: 885833
+[ble] authentication complete, encrypted=1 authenticated=1 bonded=1
+[ble] cmd: {"cmd":"get_profiles"}   -> streamed 947 bytes
+```
+
+`authenticated=1` is the important field: MITM, **not** Just Works. That empirically confirms the
+`SC_MITM_BOND` reasoning in `ble_engine.cpp` that was previously only a reading of the config —
+so the `NOTIFY_INDICATE_AUTHEN` truncation is not exploitable *in this configuration*. Bonded
+reconnect then takes **105 ms** with no passkey prompt (vs ~29 s to pair fresh).
+
+**H3 with the relocated reload.** Save arriving while a toggle macro is running:
+
+```
+any_running=1  (~24 s)
+[ble] cmd: {"cmd":"save_profiles",...}
+[ble] save_profiles: committed 919 bytes                      <- H4 atomic write
+[ble] save_profiles: written; reload deferred to the display task  <- bug_003: engine only flags
+[diag] profiles changed via BLE, reloading + rebuilding ring UI    <- .ino, under lvgl_lock
+[diag] profiles_reload: deserializeJson done, err=Ok
+[diag] rebuild_ring_layout: active_count=4
+any_running=0                                                  <- stopped across the reload
+```
+
+No crash, no reset; a later trigger ran normally. H3, H4 and the `bug_003` relocation all hold
+under the exact race they exist for.
+
 ### NOT verified ❌
 
-- **H1 (`3607a28`) has never been flashed.** It is the whole point of M6.
-- None of the work order's per-task functional tests have been run (H2's overflow-recovery test,
-  H3's toggle-macro-during-save test, H4's corruption-recovery test, etc.).
-- The **negative test** — the milestone's definition of done — has not been run.
-- Companion app changes from H1 are compile-clean only; never run against the device.
+- **The negative test — the milestone's definition of done — has not been run.** An unbonded
+  central (nRF Connect declaring NoInputNoOutput) must be *rejected* on an RX write AND on a TX
+  subscribe. Failed pairings observed so far disconnected on their own rather than being refused
+  by the GATT layer, which is suggestive but not conclusive. **M6 is not complete until this
+  runs.**
+- **Heap across a save/reload cycle is not yet proven flat.** One cycle went 61,720 -> 61,392
+  (−328 B), consistent with a larger `profilesDoc` (919 B) rather than a leak — the same "steps
+  with document size, not per cycle" pattern seen before. One cycle cannot separate the two;
+  soak it over many.
+- H2's overflow-recovery test and H4's corruption-recovery test still have not been run.
 
 ---
 
@@ -256,6 +294,13 @@ alignment (M9). Spec §10.
 - **500 MB microSD installed, unused.** Recommendation: keep `profiles.json` in LittleFS (internal,
   always present, no eject/corruption risk, and H4 just hardened that path). The SD is a good home
   for **icon assets** at M9, which is the one thing likely to outgrow internal flash.
+- **The app finds the device by scanning ONLY** (`draupnir_state.dart:248-287`) and never consults
+  `FlutterBluePlus.systemDevices`. A peripheral does not advertise while a link is open, so if
+  Android holds a stale ACL connection the scan returns nothing and the app reports "No Draupnir
+  found" — presenting as *"it paired but the app won't connect."* **Observed 2026-08-07:** the
+  app connected on the first attempt immediately after a lingering link dropped (`[ble]
+  disconnected` at 00:46:53). Fix: check `systemDevices` first, fall back to scanning. Same root
+  cause as the earlier "no way to reconnect without restarting the app" complaint.
 - **`_looksLikeAuthFailure`** in the companion app is an untested string heuristic against platform
   GATT error text.
 - **`http` / `shared_preferences`** are now unused in `companion_app/pubspec.yaml`.
