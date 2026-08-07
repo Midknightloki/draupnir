@@ -436,8 +436,27 @@ static void encoder_task(void *arg) {
 
 void setup() {
   Serial.begin(115200);
+  // Refuse host-commanded reboots into the ROM bootloader. THIS IS WHAT WAS CAUSING THE
+  // "unexplained resets into download mode" and the serial_capture.ps1 "The port is closed"
+  // failures -- one bug, misfiled as two.
+  //
+  // USBCDC::_onLineState() (core USBCDC.cpp) runs a 4-state DTR/RTS machine and calls
+  // usb_persist_restart(RESTART_BOOTLOADER) on the final step:
+  //     !dtr&&rts  ->  dtr&&rts  ->  dtr&&!rts  ->  !dtr&&!rts  ->  BOOTLOADER
+  // Opening a .NET SerialPort walks the first three (RTS asserts transiently, then DTR applies,
+  // then RTS settles to the requested value); CLOSING it supplies the fourth. So any ordinary
+  // open/close of a capture session reset the board -- on close, which is why the capture that
+  // triggered it always looked clean and the NEXT one failed to find the port.
+  //
+  // Also disables the 1200-baud-touch reset (same guard, _onLineCoding).
+  //
+  // Nothing is lost: this board's auto-reset never worked anyway, so entering download mode is
+  // already a physical BOOT-hold + replug (docs/Toolchain_arduino-cli.md). Serial output is
+  // unaffected -- USBCDC::write() gates on tud_cdc_n_connected() (DTR), not on this machine.
+  Serial.enableReboot(false);
   delay(2000);
   Serial.println("[diag] setup start");
+  Serial.println("[diag] host-commanded bootloader reset DISABLED (enableReboot(false))");
   hid_init();
   Serial.println("[diag] hid_init done");
   USB.begin();

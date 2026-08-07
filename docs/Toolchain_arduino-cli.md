@@ -166,6 +166,32 @@ Expected build size: ~970 KB (29 %) flash, ~112 KB (34 %) RAM.
 **Do not use `arduino-cli monitor` for automated capture** — it treats a non-interactive stdin as
 an immediate quit. Use `scripts/serial_capture.ps1` (a .NET `SerialPort` loop) instead.
 
+### The "unexplained resets into the ROM bootloader" — SOLVED 2026-08-07
+
+This was the serial capture itself, not a firmware fault. The ESP32 core's
+`USBCDC::_onLineState()` runs a four-state DTR/RTS machine ending in a bootloader restart:
+
+```
+!dtr&&rts  ->  dtr&&rts  ->  dtr&&!rts  ->  !dtr&&!rts  ->  usb_persist_restart(RESTART_BOOTLOADER)
+```
+
+Opening a .NET `SerialPort` walks the first three steps no matter what DTR/RTS you request (RTS
+asserts transiently on open, DTR then applies, RTS then settles), and `Close()` supplies the
+fourth. **The board therefore reset on close** — so the capture that caused it always looked
+clean, and the *next* one died with `The port is closed`. That mismatch is why this read for
+weeks as random instability, and it is the likely reason H1's GATT flags were once rolled back
+as suspected of causing resets.
+
+Fixed firmware-side: **`Serial.enableReboot(false)`** in `Waveshare_LVGL_Test.ino` disarms the
+machine (and the 1200-baud-touch reset). Verified on hardware — two back-to-back capture
+sessions now both complete with the board still enumerated in run mode. Nothing is lost, since
+auto-reset never worked on this board anyway; download mode is still a physical BOOT-hold and
+replug. Serial output is unaffected: `USBCDC::write()` gates on `tud_cdc_n_connected()` (DTR),
+not on this state machine.
+
+> **`firmware/M5_M6_config` does NOT carry this call.** Capturing from the M5Dial will still
+> reset it on close until the same one-liner is ported.
+
 ---
 
 ## M5Stack Dial (second target)

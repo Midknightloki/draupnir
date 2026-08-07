@@ -239,6 +239,17 @@ alignment (M9). Spec §10.
   that this is harmless (`SC_MITM_BOND` won't complete Just Works, so any encrypted link is
   authenticated) is **a reading of the config, not an observation** — the H1 negative test has
   never been run. Don't lean on it until §5 step 3 is done. Re-flagged by the 2026-08 audit.
+- **~~Unexplained resets into the ROM bootloader~~ — SOLVED 2026-08-07, verified on hardware.**
+  It was `scripts/serial_capture.ps1`, via the core's four-state DTR/RTS bootloader-restart
+  machine: a .NET `SerialPort` open walks three steps and `Close()` supplies the fourth, so the
+  board reset **on close** — the guilty capture looked clean and the *next* one died with
+  `The port is closed`. Fixed by `Serial.enableReboot(false)`. See
+  `docs/Toolchain_arduino-cli.md`. Two prior diagnoses ("port contention, a harness quirk", and
+  a state-machine reading that cleared the script) were both wrong in the same direction —
+  treating it as noise. What settled it was checking the *board's enumeration* after a failure
+  instead of reasoning about the code. **Do that first next time.**
+  > This is the leading explanation for H1's GATT flags having been rolled back once as
+  > suspected of causing resets. Re-examine that assumption rather than inheriting it.
 - **PSRAM is disabled although 8 MB is present.** Deliberate — kept out of the M6 stability
   diagnosis. Now that H2–H7 is confirmed stable, enabling `PSRAM=opi` is a reasonable isolated next
   experiment; free heap is 62 KB, which is workable but not generous.

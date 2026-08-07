@@ -8,9 +8,21 @@ param(
 )
 
 $sp = New-Object System.IO.Ports.SerialPort $Port, $Baud, ([System.IO.Ports.Parity]::None), 8, ([System.IO.Ports.StopBits]::One)
-# RTS must stay false - toggling it pulses EN (reset) on this board's native USB-CDC.
-# DTR must be true - the ESP32 Arduino core's USBCDC gates transmit on the "terminal
-# open" line state; with DTR low, Serial.print() calls are silently dropped.
+# DTR must be true - USBCDC::write() drops output unless tud_cdc_n_connected() is true, which
+# tracks DTR. With DTR low, Serial.print() is silently discarded. RTS does not affect output.
+#
+# THESE SETTINGS DO NOT, BY THEMSELVES, PREVENT A RESET. An earlier comment here claimed RTS
+# "pulses EN"; that is the wrong mechanism and it made this script look safe when it was not.
+# The real one is a 4-state DTR/RTS machine in the core's USBCDC::_onLineState():
+#     !dtr&&rts  ->  dtr&&rts  ->  dtr&&!rts  ->  !dtr&&!rts  ->  RESTART_BOOTLOADER
+# Opening a .NET SerialPort walks the first three regardless of what is requested here (RTS
+# asserts transiently on open, DTR then applies, RTS then settles), and Close() supplies the
+# fourth. So the board reset into download mode on CLOSE -- meaning the guilty capture always
+# looked fine and the NEXT run failed with "The port is closed".
+#
+# The fix is firmware-side: Serial.enableReboot(false) in Waveshare_LVGL_Test.ino disarms that
+# machine entirely. This script is only safe against firmware carrying that call. If you capture
+# from a board WITHOUT it (e.g. firmware/M5_M6_config), expect the reset and budget a replug.
 $sp.DtrEnable = $true
 $sp.RtsEnable = $false
 $sp.ReadTimeout = 200
