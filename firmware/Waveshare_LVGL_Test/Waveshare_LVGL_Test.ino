@@ -349,7 +349,17 @@ static void screen_gesture_cb(lv_event_t *e) {
   // Swipe UP: open Settings. Refused while the pairing overlay owns the screen -- a passkey
   // being replaced by a menu mid-pairing is unrecoverable without restarting the pairing.
   if (dir == LV_DIR_TOP) {
-    if (ui_mode == UI_RING && !ble_pairing_active()) settings_open_requested = true;
+    if (ui_mode == UI_RING && !ble_pairing_active()) {
+      settings_open_requested = true;
+      // Mirrors the swipe-down path below, and for the same reason: without this, the finger
+      // lifting off the screen delivers a CLICKED on whatever wedge it ended over BEFORE loop()
+      // has drained settings_open_requested and flipped ui_mode out of UI_RING, so
+      // screen_click_cb's ui_mode guard does not fire. That queues a macros_request_fire() which
+      // outlives update_settings()'s macros_stop_all() -- the macro looks stopped for one tick
+      // and then starts right back up. Suppressing the release here removes the spurious CLICKED
+      // at the source instead of making the guard downstream defensive.
+      lv_indev_wait_release(indev);
+    }
     return;
   }
 

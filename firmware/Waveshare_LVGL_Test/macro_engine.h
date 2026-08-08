@@ -60,6 +60,12 @@ bool macros_is_running(int pos);
 // This exists because every ActiveMacro holds a JsonObject referencing profilesDoc's memory
 // pool, which deserializeJson() frees and reallocates on reload; a macro still running across
 // that boundary reads freed memory on its next macros_update() tick.
+//
+// Also drains fireQueue (see macro_engine.cpp): a fire can be queued after this stop was decided
+// but before it runs, and would otherwise survive to restart the macro this call just stopped.
+// That means a fire queued behind a MACRO_CMD_STOP_ALL sentinel is discarded too, not just
+// fires queued before it -- "stop all" that lets a still-queued tap start something a moment
+// later is not stopping all.
 void macros_stop_all();
 
 // Cross-task-safe form of macros_stop_all(), for the swipe-down "kill all" gesture, whose event

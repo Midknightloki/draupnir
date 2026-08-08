@@ -100,6 +100,35 @@ bool macros_any_running() {
 // currentActionIndex forever), and the shipped default profile contains one -- fire it, then
 // save profiles from the app, and the use-after-free is guaranteed.
 void macros_stop_all() {
+  // Drain fireQueue FIRST, before touching HID state or runningMacros[]. A fire can be queued
+  // (macros_request_fire()) after a stop was already decided but before this function runs --
+  // e.g. Settings opening: the swipe-up sets settings_open_requested, but the release from that
+  // same swipe can still land as a CLICKED while ui_mode is still UI_RING (loop() hasn't drained
+  // the request flag yet), queueing a fire. Left in the queue, that fire would survive this stop
+  // and be drained by the very next macros_update() tick, restarting the macro this call was
+  // supposed to have killed -- looks stopped for one tick, then isn't.
+  //
+  // Consequence, deliberate and worth flagging: a fire queued BEHIND a MACRO_CMD_STOP_ALL
+  // sentinel is now discarded too, not just fires queued ahead of it. Previously the swipe-down
+  // kill-all path let anything queued after the sentinel go on to fire normally once
+  // macros_update() reached it. "Stop all" that lets a still-queued tap start something a moment
+  // later is not stopping all, so this is the correct semantics -- but it IS a behaviour change
+  // to that existing path, hence written down here rather than left for someone to discover.
+  //
+  // Safe to call from inside macros_update()'s own drain loop, which is where the
+  // MACRO_CMD_STOP_ALL branch calls this: xQueueReceive with a 0 tick timeout returns false the
+  // instant the queue is empty, so this always terminates and never recurses back into
+  // macros_stop_all(). It just means this inner drain absorbs whatever the outer loop would have
+  // processed next, which is exactly the discard behaviour above.
+  int discarded = 0;
+  int pending;
+  while (fireQueue && xQueueReceive(fireQueue, &pending, 0) == pdTRUE) {
+    discarded++;
+  }
+  if (discarded > 0) {
+    Serial.printf("[diag] macros_stop_all: discarded %d pending fire(s) from the queue\n", discarded);
+  }
+
   // A macro interrupted mid-sequence can have modifiers or mouse buttons held down. Release them
   // before clearing state, or the host is left with e.g. a stuck Ctrl and no way to clear it.
   Keyboard.releaseAll();
