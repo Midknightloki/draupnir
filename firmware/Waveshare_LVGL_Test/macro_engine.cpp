@@ -1,7 +1,7 @@
 #include "macro_engine.h"
 #include "trace.h"
 #include <LittleFS.h>
-#include <Preferences.h>
+#include "device_state.h"
 #include "USBHIDKeyboard.h"
 #include "USBHIDConsumerControl.h"
 #include "USBHIDMouse.h"
@@ -12,7 +12,6 @@ static USBHIDKeyboard Keyboard;
 static USBHIDConsumerControl ConsumerControl;
 static USBHIDMouse Mouse;
 
-static Preferences prefs;
 static JsonDocument profilesDoc;
 static int activeProfileIdx = 0;
 
@@ -180,7 +179,7 @@ void profiles_reload() {
     return;
   }
 
-  activeProfileIdx = prefs.getInt("activeProfile", 0);
+  activeProfileIdx = state_active_profile(0);
   JsonArray profiles = profilesDoc["profiles"];
   Serial.printf("[diag] profiles_reload: activeProfileIdx=%d numProfiles=%u\n", activeProfileIdx, profiles.isNull() ? 0 : profiles.size());
   if (profiles.isNull() || activeProfileIdx >= (int)profiles.size()) activeProfileIdx = 0;
@@ -193,8 +192,7 @@ void profiles_init() {
     return;
   }
   Serial.println("[diag] profiles_init: LittleFS mounted");
-  prefs.begin("draupnir", false);
-  Serial.println("[diag] profiles_init: prefs.begin done");
+  state_init();
   profiles_reload();
 }
 
@@ -203,6 +201,13 @@ const char *profiles_active_name() {
   if (profiles.isNull() || activeProfileIdx >= (int)profiles.size()) return "No Profiles";
   JsonObject prof = profiles[activeProfileIdx];
   return prof["name"] | "Profile";
+}
+
+uint8_t profiles_default_brightness() {
+  int b = profilesDoc["settings"]["brightness"] | 160;
+  if (b < 0)   b = 0;
+  if (b > 255) b = 255;
+  return (uint8_t)b;
 }
 
 JsonObject profiles_find_macro(int pos) {

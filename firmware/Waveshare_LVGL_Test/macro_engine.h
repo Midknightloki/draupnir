@@ -26,6 +26,10 @@ void profiles_reload();
 const char *profiles_active_name();
 JsonObject profiles_find_macro(int pos);
 
+// The active document's settings.brightness -- the SEED for NVS brightness, never a source of
+// truth once NVS has been written (see device_state.h). 160 if absent or out of range.
+uint8_t profiles_default_brightness();
+
 // Serializes the whole loaded profiles.json document straight to `out` (e.g. a BLE chunk sink),
 // so callers never need direct access to the underlying JsonDocument.
 void profiles_serialize(Print &out);

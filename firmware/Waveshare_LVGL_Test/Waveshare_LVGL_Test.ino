@@ -6,6 +6,7 @@
 #include "lcd_config.h"
 #include "bidi_switch_knob.h"
 #include "macro_engine.h"
+#include "device_state.h"
 #include "ble_engine.h"
 #include "haptics.h"
 #include "trace.h"
@@ -500,8 +501,15 @@ void setup() {
 
   lcd_lvgl_Init();
   Serial.printf("[diag] lcd_lvgl_Init done heap=%u\n", ESP.getFreeHeap());
-  lcd_bl_pwm_bsp_init(LCD_PWM_MODE_255);
-  Serial.println("[diag] backlight init done");
+  // Brightness: NVS if it has ever been set on the device, else the profile document's
+  // settings.brightness as a seed. Was hardcoded to LCD_PWM_MODE_255, which meant
+  // settings.brightness existed in the schema and did nothing.
+  //
+  // Ordering is load-bearing: profiles_init() above has already run state_init() and loaded
+  // profilesDoc, so both the NVS handle and the seed are available here.
+  uint8_t boot_brightness = state_brightness(profiles_default_brightness());
+  lcd_bl_pwm_bsp_init(boot_brightness);
+  Serial.printf("[diag] backlight init done duty=%u\n", (unsigned)boot_brightness);
 
   if (lvgl_lock(-1)) {
     Serial.println("[diag] lvgl locked, building ring ui");
