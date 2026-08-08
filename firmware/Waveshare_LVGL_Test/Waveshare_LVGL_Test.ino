@@ -33,6 +33,67 @@ static lv_obj_t *macro_labels[NUM_MACRO_SLOTS];
 // rebuild_ring_layout() has to re-assert its z-order after re-creating the wedge labels (see the
 // comment there) and that function is defined earlier in this file.
 static lv_obj_t *pairing_overlay = nullptr;
+
+// ---- Settings menu ----------------------------------------------------------------------
+// ui_mode is owned by loop(). LVGL-task callbacks (touch, gesture) and encoder_task only ever
+// RAISE a request flag; loop() performs the transition under lvgl_lock(). Same pattern as
+// update_pairing_overlay()/update_profiles_reload(). See spec section 9.
+typedef enum { UI_RING, UI_SETTINGS_LIST, UI_SETTINGS_EDIT } ui_mode_t;
+static ui_mode_t ui_mode = UI_RING;
+
+static volatile bool settings_open_requested  = false;
+static volatile bool settings_close_requested = false;
+static volatile bool settings_enter_requested = false;
+
+static lv_obj_t *settings_overlay = nullptr;
+static lv_obj_t *settings_rows[4];          // sized for growth; SETTINGS_ITEM_COUNT is the truth
+static int settings_sel = 0;
+static unsigned long settings_last_activity = 0;
+
+#define SETTINGS_IDLE_TIMEOUT_MS 8000
+// Vertical distance between rows. The active row sits at the exact screen centre and the others
+// are offset from it, so scrolling moves the whole column past a fixed centre -- the slot
+// machine -- rather than moving a highlight down a static list.
+#define SETTINGS_ROW_PITCH 54
+
+// Backlight duty range. The floor is deliberately NOT 0: a knob that can be turned to a black
+// screen looks bricked and leaves no way to find the setting again. Step 16 gives ~15 detents
+// across the range. Duty is linear, so the low end feels perceptually coarse; gamma is a polish
+// item, not this milestone.
+#define BRIGHTNESS_MIN  20
+#define BRIGHTNESS_MAX  255
+#define BRIGHTNESS_STEP 16
+
+static uint8_t current_duty = BRIGHTNESS_MAX;  // real value assigned in setup()
+static bool    brightness_dirty = false;
+
+static int  brightness_get(void) { return current_duty; }
+
+// Live preview ONLY. NVS is written once, when Settings closes -- never per detent, and never
+// from the LVGL task, where a flash write would stall the renderer.
+static void brightness_apply(int duty) {
+  if (duty < BRIGHTNESS_MIN) duty = BRIGHTNESS_MIN;
+  if (duty > BRIGHTNESS_MAX) duty = BRIGHTNESS_MAX;
+  current_duty = (uint8_t)duty;
+  brightness_dirty = true;
+  setUpdutySubdivide(current_duty);
+}
+
+// Settings are declared as data, not as bespoke screens, so an M10 item is one table entry.
+// Every item is currently a knob-adjusted numeric value, so no kind discriminator is needed;
+// a non-numeric setting (a buzzer on/off, say) will need a labels array added here.
+typedef struct {
+  const char *name;
+  int         min, max, step;
+  int  (*get)(void);
+  void (*apply)(int);   // live preview while the knob turns
+} setting_item_t;
+
+static const setting_item_t SETTINGS_ITEMS[] = {
+  { "Brightness", BRIGHTNESS_MIN, BRIGHTNESS_MAX, BRIGHTNESS_STEP, brightness_get, brightness_apply },
+};
+#define SETTINGS_ITEM_COUNT ((int)(sizeof(SETTINGS_ITEMS) / sizeof(SETTINGS_ITEMS[0])))
+
 static int selected_idx = 0;
 static knob_handle_t s_knob = NULL;
 static EventGroupHandle_t knob_events = NULL;
@@ -135,13 +196,11 @@ static void rebuild_ring_layout(void) {
 
     macro_labels[v] = label;
   }
-  // LVGL 8 draws a screen's children in insertion order, so the labels just re-created above now
-  // sit AFTER pairing_overlay in scr's child list and would paint on top of it. Since this runs
-  // on every profile save, one edit is enough to leave a later re-pair rendering the passkey
-  // overlay with macro names bleeding through it. Re-assert the overlay's z-order.
-  //
-  // Guarded because the first call comes from build_ring_ui() before build_pairing_overlay().
-  if (pairing_overlay) lv_obj_move_foreground(pairing_overlay);
+  // Re-assert overlay z-order after re-creating the wedge labels above, or one profile save is
+  // enough to leave macro names bleeding through an overlay. Settings first, pairing last, so
+  // pairing always wins.
+  if (settings_overlay) lv_obj_move_foreground(settings_overlay);
+  if (pairing_overlay)  lv_obj_move_foreground(pairing_overlay);
 
   Serial.printf("[diag] rebuild_ring_layout: active_count=%d\n", active_count);
 }
@@ -230,6 +289,14 @@ static int wedge_index_from_point(lv_coord_t px, lv_coord_t py) {
 // has selected, without changing the selection. A tap on the ring itself selects and fires
 // that wedge. Taps outside the outer radius (round-glass bezel) are ignored.
 static void screen_click_cb(lv_event_t *e) {
+  // A tap while Settings is open activates the centred item. It must NEVER fall through to
+  // macros_request_fire() -- firing a macro from a menu tap is the wrong surprise on a device
+  // whose whole job is sending keystrokes.
+  if (ui_mode != UI_RING) {
+    settings_enter_requested = true;
+    return;
+  }
+
   if (active_count == 0) return;
   lv_indev_t *indev = lv_indev_get_act();
   if (!indev) return;
@@ -273,16 +340,29 @@ static void screen_gesture_cb(lv_event_t *e) {
   // ordinary taps would silently swallow every macro fire. Gated by DRAUPNIR_TRACE_INPUT.
   TRACE("[tap] GESTURE dir=%d (bottom=%d) any_running=%d\n",
                 (int)dir, (int)LV_DIR_BOTTOM, (int)macros_any_running());
-  if (dir != LV_DIR_BOTTOM) return;
-  if (!macros_any_running()) return;
 
+  // Swipe UP: open Settings. Refused while the pairing overlay owns the screen -- a passkey
+  // being replaced by a menu mid-pairing is unrecoverable without restarting the pairing.
+  if (dir == LV_DIR_TOP) {
+    if (ui_mode == UI_RING && !ble_pairing_active()) settings_open_requested = true;
+    return;
+  }
+
+  if (dir != LV_DIR_BOTTOM) return;
+
+  // Swipe DOWN inside Settings closes it. Safe to overload the panic gesture here ONLY because
+  // opening Settings stopped every running macro, so nothing can be running behind the menu
+  // (spec section 5). Do not reuse it as "back" anywhere a macro could still be live.
+  if (ui_mode != UI_RING) {
+    settings_close_requested = true;
+    return;
+  }
+
+  // Swipe DOWN on the ring: unchanged kill-all.
+  if (!macros_any_running()) return;
   Serial.println("[diag] swipe down -> kill all macros");
   macros_request_stop_all();
-  haptics_pulse(); // replaces the M5Dial's buzzer blip: eyes-free confirmation the gesture took
-
-  // Suppress the rest of this touch so the release does not also land as a CLICKED event on
-  // whatever wedge the finger happens to end over -- otherwise killing everything could
-  // immediately re-fire a macro.
+  haptics_pulse();
   lv_indev_wait_release(indev);
 }
 
@@ -392,6 +472,101 @@ static void update_profiles_reload(void) {
   ble_clear_profiles_dirty();
 }
 
+static void settings_layout(void) {
+  for (int i = 0; i < SETTINGS_ITEM_COUNT; i++) {
+    bool active = (i == settings_sel);
+    lv_obj_set_style_text_font(settings_rows[i], active ? &orbitron_24 : &orbitron_14, 0);
+    // LVGL's stock Montserrat has no bold face and no synthetic bold; Orbitron gives size a real
+    // partner in opacity. Size + contrast carry the hierarchy (spec section 5).
+    lv_obj_set_style_text_opa(settings_rows[i], active ? LV_OPA_COVER : LV_OPA_40, 0);
+    lv_obj_align(settings_rows[i], LV_ALIGN_CENTER, 0, (i - settings_sel) * SETTINGS_ROW_PITCH);
+  }
+}
+
+static void build_settings_overlay(void) {
+  lv_obj_t *scr = lv_scr_act();
+  settings_overlay = lv_obj_create(scr);
+  lv_obj_set_size(settings_overlay, EXAMPLE_LCD_H_RES, EXAMPLE_LCD_V_RES);
+  lv_obj_set_pos(settings_overlay, 0, 0);
+  lv_obj_set_style_bg_color(settings_overlay, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(settings_overlay, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(settings_overlay, 0, 0);
+  lv_obj_set_style_border_width(settings_overlay, 0, 0);
+  lv_obj_clear_flag(settings_overlay, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(settings_overlay, LV_OBJ_FLAG_HIDDEN);
+
+  // The two rails framing the centre slot -- the slot-machine affordance. Drawn first so the
+  // rows, created after, paint on top in LVGL's insertion-order z-stacking.
+  for (int i = 0; i < 2; i++) {
+    lv_obj_t *rail = lv_obj_create(settings_overlay);
+    lv_obj_set_size(rail, 170, 2);
+    lv_obj_set_style_bg_color(rail, lv_color_hex(0x404050), 0);
+    lv_obj_set_style_bg_opa(rail, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(rail, 0, 0);
+    lv_obj_set_style_radius(rail, 0, 0);
+    lv_obj_clear_flag(rail, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(rail, LV_ALIGN_CENTER, 0, (i == 0 ? -1 : 1) * (SETTINGS_ROW_PITCH / 2 + 8));
+  }
+
+  for (int i = 0; i < SETTINGS_ITEM_COUNT; i++) {
+    lv_obj_t *row = lv_label_create(settings_overlay);
+    lv_label_set_text(row, SETTINGS_ITEMS[i].name);
+    lv_obj_set_style_text_color(row, lv_color_white(), 0);
+    lv_obj_set_style_text_align(row, LV_TEXT_ALIGN_CENTER, 0);
+    settings_rows[i] = row;
+  }
+  settings_layout();
+}
+
+// Owns every Settings mode transition. Callbacks only raise flags (spec section 9).
+static void update_settings(void) {
+  if (settings_open_requested) {
+    // Lock FIRST, clear the flag after -- the H5 lesson. Clearing first meant one lock timeout
+    // consumed the transition permanently and the overlay never appeared again.
+    if (!lvgl_lock(200)) return;
+    settings_open_requested = false;
+
+    // Killing here rather than via macros_request_stop_all() from the gesture callback keeps
+    // "Settings is open" and "nothing is running" a single transition under one lock
+    // acquisition, instead of two that can land in either order -- and avoids killing macros in
+    // the case where the lock timed out and the overlay never opened. This runs on the loop
+    // task, so calling macros_stop_all() directly is allowed here and ONLY here.
+    macros_stop_all();
+
+    ui_mode = UI_SETTINGS_LIST;
+    settings_sel = 0;
+    settings_last_activity = millis();
+    settings_layout();
+    lv_obj_clear_flag(settings_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(settings_overlay);
+    if (pairing_overlay) lv_obj_move_foreground(pairing_overlay);
+    lvgl_unlock();
+    Serial.println("[diag] settings opened, macros stopped");
+    return;
+  }
+
+  if (ui_mode == UI_RING) return;
+
+  if (settings_enter_requested) {
+    settings_enter_requested = false;
+    // Task 4 turns this into "open the centred item's editor".
+    Serial.printf("[diag] settings: activate item %d (%s)\n",
+                  settings_sel, SETTINGS_ITEMS[settings_sel].name);
+    settings_last_activity = millis();
+  }
+
+  bool timed_out = (millis() - settings_last_activity > SETTINGS_IDLE_TIMEOUT_MS);
+  if (settings_close_requested || timed_out) {
+    if (!lvgl_lock(200)) return;
+    settings_close_requested = false;
+    ui_mode = UI_RING;
+    lv_obj_add_flag(settings_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_invalidate(lv_scr_act());
+    lvgl_unlock();
+    Serial.printf("[diag] settings closed (%s)\n", timed_out ? "idle timeout" : "swipe down");
+  }
+}
+
 static void build_ring_ui(void) {
   lv_obj_t *scr = lv_scr_act();
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
@@ -406,6 +581,7 @@ static void build_ring_ui(void) {
   rebuild_ring_layout();
   if (active_count > 0) select_idx(selected_idx);
 
+  build_settings_overlay();
   build_pairing_overlay();
 }
 
@@ -422,16 +598,30 @@ static void encoder_task(void *arg) {
     int delta = 0;
     if (bits & (1 << 0)) delta -= 1;
     if (bits & (1 << 1)) delta += 1;
-    if (delta != 0 && active_count > 0 && lvgl_lock(100)) {
-      // Re-check INSIDE the lock. The guard above runs before lvgl_lock() blocks, and a profile
-      // reload on the loop task can drop active_count to 0 while this task waits -- making the
-      // modulo below a divide-by-zero, which traps and reboots the S3. Capturing the pre-lock
-      // value into a local would not fix it: a shrunk count would still index out of range.
+    if (delta == 0) continue;
+    if (!lvgl_lock(100)) continue;
+
+    if (ui_mode == UI_SETTINGS_LIST) {
+      // Clamp, no wrap -- matching the profile list (spec section 5). With one item this is a
+      // no-op and the encoder does nothing here; that is expected, not a dead encoder.
+      int next = settings_sel + delta;
+      if (next < 0) next = 0;
+      if (next > SETTINGS_ITEM_COUNT - 1) next = SETTINGS_ITEM_COUNT - 1;
+      if (next != settings_sel) {
+        settings_sel = next;
+        settings_layout();
+      }
+      settings_last_activity = millis();
+    } else if (ui_mode == UI_RING) {
+      // Re-check active_count INSIDE the lock. The pre-lock world can change while this task
+      // waits: a profile reload on the loop task can drop it to 0, making the modulo a
+      // divide-by-zero, which traps and reboots the S3. Capturing a pre-lock copy would not
+      // help -- a shrunk count still indexes out of range.
       if (active_count > 0) {
         select_idx((selected_idx + delta + active_count) % active_count);
       }
-      lvgl_unlock();
     }
+    lvgl_unlock();
   }
 }
 
@@ -542,6 +732,7 @@ void loop() {
   ble_update();
   update_pairing_overlay();
   update_profiles_reload();
+  update_settings();
   update_running_pulse();
   if (millis() - last_loop_print > 3000) {
     last_loop_print = millis();
