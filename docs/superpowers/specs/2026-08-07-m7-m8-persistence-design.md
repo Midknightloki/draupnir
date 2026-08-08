@@ -12,10 +12,12 @@ matching the M5Dial firmware and the companion app.
 
 Spec §10 lists them separately:
 
-| # | Milestone |
-|---|---|
-| M7 | **Persistence** — write `activeProfile` + brightness to NVS and honor them at boot |
-| M8 | **On-device profile switching** with directional indicators |
+
+| #   | Milestone                                                                          |
+| --- | ---------------------------------------------------------------------------------- |
+| M7  | **Persistence** — write `activeProfile` + brightness to NVS and honor them at boot |
+| M8  | **On-device profile switching** with directional indicators                        |
+
 
 M7 alone cannot be finished. Spec §8 states the requirement as *"written on change and restored on
 boot — reading it without ever writing it is the same as not having it,"* and today
@@ -28,14 +30,16 @@ hand-off — so building them together avoids writing that twice.
 
 ## 2. Current state
 
-| Concern | Today |
-|---|---|
-| `activeProfileIdx` | read from NVS at `macro_engine.cpp:183`, **never written**; clamped in RAM only |
-| brightness | `settings.brightness: 160` in the default JSON, **never applied**; `Waveshare_LVGL_Test.ino:503` hardcodes `lcd_bl_pwm_bsp_init(LCD_PWM_MODE_255)` |
-| runtime brightness API | `setUpdutySubdivide(uint16_t duty)` — exists, 0–255, unused |
-| NVS owner | `static Preferences prefs` in `macro_engine.cpp`, namespace `draupnir` |
-| profile switching | none |
-| app brightness UI | **none** — confirmed with the owner |
+
+| Concern                | Today                                                                                                                                              |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `activeProfileIdx`     | read from NVS at `macro_engine.cpp:183`, **never written**; clamped in RAM only                                                                    |
+| brightness             | `settings.brightness: 160` in the default JSON, **never applied**; `Waveshare_LVGL_Test.ino:503` hardcodes `lcd_bl_pwm_bsp_init(LCD_PWM_MODE_255)` |
+| runtime brightness API | `setUpdutySubdivide(uint16_t duty)` — exists, 0–255, unused                                                                                        |
+| NVS owner              | `static Preferences prefs` in `macro_engine.cpp`, namespace `draupnir`                                                                             |
+| profile switching      | none                                                                                                                                               |
+| app brightness UI      | **none** — confirmed with the owner                                                                                                                |
+
 
 ## 3. Storage model
 
@@ -119,24 +123,45 @@ declare them and retire `&lv_font_montserrat_14` as the default.
 
 ## 5. Settings menu
 
-**Swipe up opens Settings.** A vertical list that scrolls like a slot machine: the active item sits
-at the centre of the screen, neighbours above and below are dimmed. The encoder scrolls; a centre
-tap activates the centred item.
+**Swipe up opens Settings and stops every running macro. Swipe down closes it.**
 
-Two rows for now — `Brightness` and `Close` — so the list opens like this, with nothing above the
-first item:
+A vertical list that scrolls like a slot machine: the active item sits at the centre of the screen,
+neighbours above and below are dimmed. The encoder scrolls; a centre tap activates the centred item.
+
+One row for now — `Brightness` — so the list opens like this:
 
 ```
-         Brightness          <- active: centred, 24px, full white
        ---------------
-           Close             <- dimmed, ~40% opacity, 14px
+          Brightness          <- active: centred, 24px, full white
+       ---------------
 ```
+
+With a single item the list is **degenerate — it cannot scroll**, and the encoder does nothing while
+the list is showing. That is expected, not a fault; noted so it is not chased as a bug during §11.
 
 This is coherent with the ring UI's existing rule that **a centre tap acts on whatever is
 selected** — here the selection is literally in the centre of the screen.
 
 The list does not wrap: scrolling stops at the first and last item, matching the clamp-don't-wrap
 choice §7 makes for profiles.
+
+### Why opening Settings kills running macros
+
+It is what makes `swipe down = close` safe. Swipe-down is the kill-all panic gesture on the ring,
+and an earlier draft of this design kept it as kill-all *inside* Settings too, on the grounds that a
+runaway `toggle` macro spamming the host must never become unkillable behind a menu. Killing on
+entry removes the conflict at its source: by the time Settings is open there is nothing left to
+kill, so swipe-down is free to mean "close".
+
+It is also right on its own terms. Opening Settings is a deliberate stop-what-you-are-doing action,
+and the gesture that reaches it is the one your thumb already knows for "make it stop".
+
+**One exception, stated precisely.** Local input cannot start a macro while Settings is open — taps
+route to the menu and the encoder scrolls — but the BLE `trigger` command still can
+(`ble_engine.cpp:257`), and it is not gated on UI state. A bonded central deliberately test-firing
+while the owner is in Settings would leave a macro running behind the menu. Recovery is one extra
+gesture: swipe down to close, swipe down again to kill. Left ungated on purpose — silently
+rejecting the app's test-fire because a menu happens to be open is the worse failure.
 
 ### Emphasis
 
@@ -146,22 +171,25 @@ real weight contrast available; LVGL's stock Montserrat set has no bold face and
 
 ### Items are a table, not hand-written screens
 
-Other settings will use the same knob-scroll-then-tap interaction, so items are declared as data:
+Other settings will use the same knob-scroll-then-tap interaction, so items are declared as data
+rather than as bespoke screens:
 
 ```c
-typedef enum { SETTING_RANGE, SETTING_ACTION } setting_kind_t;
-
 typedef struct {
-  const char     *name;
-  setting_kind_t  kind;
-  int             min, max, step;   // RANGE only
-  int  (*get)(void);                // RANGE only
-  void (*apply)(int);               // RANGE: live preview. ACTION: invoked on tap.
+  const char *name;
+  int         min, max, step;
+  int  (*get)(void);        // current value
+  void (*apply)(int);       // live preview while the knob turns
 } setting_item_t;
 ```
 
-`Brightness` is a `SETTING_RANGE`; `Close` is a `SETTING_ACTION`. An M10 buzzer or haptics toggle
-becomes one table entry, not a new screen.
+`Brightness` is the only entry today. With the `Close` row gone (swipe-down closes), every item is
+now a knob-adjusted value and the table needs no kind discriminator — an earlier draft carried a
+`SETTING_RANGE` / `SETTING_ACTION` enum that would now have exactly one member in use.
+
+**Extension point:** a non-numeric setting — an M10 buzzer toggle, say — needs a way to render `0`
+and `1` as `Off` and `On`. Add an optional labels array at that point, when there is a real second
+item to design against. Not speculated on here.
 
 ## 5a. Typography — Orbitron
 
@@ -184,11 +212,13 @@ Node 24 / npm 12 are present, so `npx lv_font_conv` runs without a global instal
 mapping one-for-one onto what the UI uses today so no element changes size as a side effect of the
 font change:
 
-| Size | Used by |
-|---|---|
-| 12 | wedge labels (unchanged from today) |
-| 14 | dimmed Settings rows, gauge label, centre label |
-| 24 | Settings active row, gauge value |
+
+| Size | Used by                                         |
+| ---- | ----------------------------------------------- |
+| 12   | wedge labels (unchanged from today)             |
+| 14   | dimmed Settings rows, gauge label, centre label |
+| 24   | Settings active row, gauge value                |
+
 
 Range `0x20-0x7F` — ASCII only; macro names outside it already do not render today.
 `--bpp 4` for antialiasing on a 360×360 AMOLED. Roughly 10–25 KB per size in flash.
@@ -202,15 +232,15 @@ declares them, and `LV_FONT_DEFAULT` moves off `&lv_font_montserrat_14`.
 ### Three things to settle at generation time
 
 1. **Weight.** M5GFX bundles *Orbitron Light*, from an older static release. Current Google Fonts
-   Orbitron is a variable font spanning **400–900 with no Light (300)**. Verify what the obtained
-   TTF actually offers. If Light is unavailable, Regular is the closest and the Waveshare text will
-   read slightly heavier than the M5Dial's — acceptable, but it is a real difference, not parity.
+ Orbitron is a variable font spanning **400–900 with no Light (300)**. Verify what the obtained
+ TTF actually offers. If Light is unavailable, Regular is the closest and the Waveshare text will
+ read slightly heavier than the M5Dial's — acceptable, but it is a real difference, not parity.
 2. **Weight contrast for §5.** If a heavier cut (Bold/Black) is obtainable, generate it at 24 px and
-   use it for the Settings active row. This is a genuine improvement over the size-and-opacity
-   workaround Montserrat forced, and is why §5's constraint was rewritten.
+ use it for the Settings active row. This is a genuine improvement over the size-and-opacity
+ workaround Montserrat forced, and is why §5's constraint was rewritten.
 3. **Licence.** Orbitron is **SIL OFL 1.1**, not MIT. In an MIT-licensed open-source repo the OFL
-   text and the font's copyright notice ship alongside the generated `.c` files. Note it in the
-   repo's licence documentation — the OFL permits this, but only with the notice retained.
+ text and the font's copyright notice ship alongside the generated `.c` files. Note it in the
+ repo's licence documentation — the OFL permits this, but only with the notice retained.
 
 ### Known cost — Orbitron is wide
 
@@ -247,11 +277,13 @@ convention, so the gauge reads as the same object the rest of the UI is built fr
 The encoder adjusts duty **live** via `setUpdutySubdivide()`, so you judge the actual panel rather
 than a number. A tap commits and returns to the list.
 
-| Constant | Value | Reason |
-|---|---|---|
-| `BRIGHTNESS_MIN` | 20 | **Deliberately not 0.** A knob that can be turned to a black screen looks bricked and leaves no way to find it again. |
-| `BRIGHTNESS_MAX` | 255 | LEDC 8-bit full duty |
-| `BRIGHTNESS_STEP` | 16 | ~15 detents min→max — enough resolution, few enough to cross quickly |
+
+| Constant          | Value | Reason                                                                                                                |
+| ----------------- | ----- | --------------------------------------------------------------------------------------------------------------------- |
+| `BRIGHTNESS_MIN`  | 20    | **Deliberately not 0.** A knob that can be turned to a black screen looks bricked and leaves no way to find it again. |
+| `BRIGHTNESS_MAX`  | 255   | LEDC 8-bit full duty                                                                                                  |
+| `BRIGHTNESS_STEP` | 16    | ~15 detents min→max — enough resolution, few enough to cross quickly                                                  |
+
 
 Displayed as `(duty - MIN) * 100 / (MAX - MIN)` percent.
 
@@ -262,18 +294,25 @@ polish item, not this milestone.
 
 | Gesture | Behaviour |
 |---|---|
-| `Close` row, or 8 s idle | close Settings; commit brightness if changed |
-| swipe up again | close — symmetric with opening |
+| **swipe down** | close Settings; commit brightness if changed |
+| 8 s idle | close Settings; commit brightness if changed |
 | tap (in editor) | commit, return to the list |
-| **swipe down** | **kill all macros — everywhere, always, including inside Settings** |
+| swipe up | ignored — Settings is already open |
 | swipe left/right | ignored while Settings is open |
 
-**Swipe-down stays the panic gesture in every mode.** Reusing it as menu "back" would make a runaway
-`toggle` macro unkillable in exactly the moment you are in a menu. One NVS write is not worth that.
-That is why `Close` is a row rather than a gesture.
+**Swipe down closes from anywhere in Settings**, list or editor, rather than backing out one level
+at a time. With a single item a level-at-a-time model would cost two swipes to leave the only
+screen there is. Revisit when a second setting lands and there is a list worth returning to — the
+choice is between "swipe down always leaves" and "swipe down goes back one level", and only the
+second is worth the extra gesture once the list is real.
+
+This is safe only because **swipe-up killed every running macro on the way in** (§5). Swipe-down is
+the panic gesture on the ring; it can be reused as "close" here precisely because nothing can be
+running behind the menu.
 
 **One NVS write per Settings session**, on exit, from the loop task — never per detent, never on the
 LVGL task, where a flash write would stall the renderer.
+
 
 ## 7. Profile switching
 
@@ -329,12 +368,19 @@ Every rule in CLAUDE.md and spec §5 holds. Restated for what this milestone add
 
 | Runs on | Does |
 |---|---|
-| `screen_gesture_cb` (LVGL task) | sets flags only — `settings_requested`, `profile_switch_delta` |
+| `screen_gesture_cb` (LVGL task) | sets flags only — `settings_requested`, `settings_close_requested`, `profile_switch_delta` |
 | `screen_click_cb` (LVGL task) | routes taps; **when Settings is open it must return without firing a macro** |
 | `encoder_task` | routes by mode: ring select · list scroll · live brightness. All under `lvgl_lock()`, as today. |
 | `loop()` | `update_settings()` and `update_profile_switch()` own every mode transition, the idle timeout, the NVS write, `macros_stop_all()`, and `rebuild_ring_layout()` |
 
 `current_duty` is read and written only under `lvgl_lock()`, so no new lock is introduced.
+
+**The kill-on-open happens in `loop()`, not the gesture callback.** `update_settings()` calls
+`macros_stop_all()` directly — it is on the loop task, so it may — in the same step that raises the
+overlay. Routing it through `macros_request_stop_all()` from the callback would work, but would let
+the kill and the mode change land in either order, and would still kill macros in the case where the
+overlay never opens because `lvgl_lock()` timed out. Doing both under one lock acquisition keeps
+"Settings is open" and "nothing is running" a single transition rather than two racing ones.
 
 **Lock-failure handling follows the H5 lesson:** acquire the lock *before* consuming a pending
 transition. A lock timeout must leave the flag set so the next tick retries — committing first meant
@@ -343,6 +389,7 @@ a single 50 ms timeout consumed the transition permanently.
 `profile_switch_delta` is assigned (not accumulated) by the gesture callback and zeroed by `loop()`,
 avoiding a cross-core read-modify-write. A very fast double-swipe may register as one switch;
 acceptable, and documented at the declaration.
+
 
 ### Overlay z-order
 
@@ -365,25 +412,50 @@ exercise §7 without app setup.
 
 Per CLAUDE.md, each item is confirmed on hardware; nothing is claimed that was not observed.
 
-0. Boot → **every string renders in Orbitron**, none missing or boxed. Check the ring's wedge labels
+**Typography**
+
+1. Boot → **every string renders in Orbitron**, none missing or boxed. Check the ring's wedge labels
    specifically: confirm how much earlier they truncate than with Montserrat, at both a low macro
    count (fat wedges) and a high one (narrow wedges). This decides whether §5a's fallback is needed.
-1. Erase NVS, boot → brightness is the JSON seed (160), not 255.
-2. Swipe up → Settings; slot-machine scroll tracks the encoder; centre item legible at 24 px, and
-   the active row is clearly distinguishable from its dimmed neighbours.
-3. Tap `Brightness` → gauge; encoder changes the **panel** live; percentage tracks.
-4. Tap → returns to list. `Close` → ring.
-5. **Power cycle → brightness persists.**
-6. Swipe left/right → profile switches; toast shows the name; indicators appear/vanish correctly at
-   both ends of the list.
-7. Tap each indicator → switches. Tap centre with no indicator on that side → **fires**.
-8. **Power cycle → boots into the last-used profile.**
-9. Fire the `Caps Lock` toggle so it loops, then swipe to switch → macro stops, no crash, no reset
-   (H3 class regression test).
-10. With a macro running, swipe **down inside Settings** → macro stops.
-11. Delete a profile from the app so the stored index is out of range → boots clamped **and NVS is
-    corrected** (verify the second boot does not re-clamp).
-12. Heap stable across the whole session — no per-cycle drift.
+
+**Brightness + persistence**
+
+2. Erase NVS, boot → brightness is the JSON seed (160), not 255.
+3. Swipe up → Settings opens; centre item legible at 24 px and clearly distinct from a dimmed
+   neighbour. With one item the list cannot scroll — confirm that, rather than treating it as a
+   dead encoder (§5).
+4. Tap `Brightness` → gauge; encoder changes the **panel** live; percentage tracks; the arc fills
+   left-to-right as the knob turns clockwise.
+5. Tap → returns to the list. Swipe down → ring.
+6. Swipe down from inside the **gauge** → also returns to the ring, brightness committed.
+7. Leave Settings idle 8 s → closes on its own, brightness committed.
+8. **Power cycle → brightness persists.**
+9. Turn brightness to minimum → screen is still readable. This is what `BRIGHTNESS_MIN = 20` exists
+   for; if it is not readable, raise the floor.
+
+**Kill-on-open (§5)**
+
+10. Fire the `Caps Lock` toggle so it loops, then **swipe up** → macro stops *and* Settings opens.
+    Confirm both, not just the overlay.
+11. While in Settings, fire a macro over BLE `trigger` → it runs (the documented exception). Swipe
+    down, swipe down again → it stops.
+
+**Profile switching**
+
+12. Swipe left/right → profile switches; toast shows the name for ~1.5 s then reverts; indicators
+    appear and vanish correctly at both ends of the list.
+13. Tap each indicator → switches. Tap centre with no indicator on that side → **fires**.
+14. Fire the `Caps Lock` toggle so it loops, then swipe to switch → macro stops, no crash, no reset.
+    This is the H3-class regression test on a new trigger.
+15. **Power cycle → boots into the last-used profile.**
+16. Delete a profile from the app so the stored index is out of range → boots clamped **and NVS is
+    corrected**. Verify the *second* boot does not re-clamp — that is what proves the write landed.
+
+**Throughout**
+
+17. Heap stable across the whole session — no per-cycle drift.
+18. No resets. Capture with `scripts/serial_capture.ps1`, not `arduino-cli monitor`.
+
 
 ## 12. Out of scope
 
@@ -392,6 +464,7 @@ Per CLAUDE.md, each item is confirmed on hardware; nothing is claimed that was n
 - Non-ASCII glyph coverage. The generated Orbitron range is `0x20-0x7F`, matching what renders today.
 - M8b (`pos` uncapping, schema v3), M9 icons, M10 polish items.
 - M5Dial parity — deferred by the board sequencing in spec §3. `device_state.{h,cpp}` is written to
-  port unchanged.
+port unchanged.
 - The unrun M6 tests (H2 overflow-recovery, H4 corruption-recovery, heap soak). Still open, tracked
-  in `docs/HANDOFF.md` §3.
+in `docs/HANDOFF.md` §3.
+
