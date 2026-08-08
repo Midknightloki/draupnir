@@ -16,7 +16,7 @@ void hid_init();
 void profiles_init();
 
 // Re-reads /profiles.json (already written by a BLE save_profiles command) into profilesDoc,
-// without touching LittleFS.begin()/prefs.begin() again -- those are one-time setup calls, done
+// without touching LittleFS.begin()/state_init() again -- those are one-time setup calls, done
 // only by profiles_init(). Mirrors M5_M6_config.ino's loadProfiles(), which profiles_init()
 // itself is built on top of.
 void profiles_reload();
