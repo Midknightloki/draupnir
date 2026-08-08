@@ -22,6 +22,16 @@
 #define RING_MID_R ((RING_OUTER_R + RING_INNER_R) / 2)
 #define WEDGE_GAP_DEG 2.0f
 
+// Profile indicators live INSIDE the inner hole: the ring band is full of wedges, and outside
+// RING_OUTER_R there are only 8 px on a 360 px panel. That puts them in the tap-to-fire zone,
+// so their hot zones switch profiles rather than firing -- something that looks tappable inside
+// the fire zone must not fire a macro. INDICATOR_CX + INDICATOR_HALF_W must stay < RING_INNER_R.
+#define INDICATOR_CX      72
+#define INDICATOR_HALF_W  14
+#define INDICATOR_HALF_H  12
+#define HOTZONE_MIN_DX    60
+#define HOTZONE_MAX_DY    40
+
 // active_positions[v] = the profiles.json "pos" (0-15) shown at wedge v. selected_idx and all
 // wedge/label indices below are in terms of v (0..active_count-1), not raw pos -- macros_fire()
 // and profiles_find_macro() still take a real pos, so callers go through active_positions[].
@@ -271,6 +281,37 @@ static void ring_draw_event_cb(lv_event_t *e) {
       lv_draw_arc(draw_ctx, &run, &center_pt, RING_OUTER_R, (uint16_t)lroundf(start), (uint16_t)lroundf(end));
     }
   }
+
+  // Drawn in the active profile's own colour, and only when a profile exists in that direction.
+  // screen_click_cb() gates its hot zones on the same condition, so at either end of the list a
+  // tap there falls through and fires instead of switching.
+  int pcount = profiles_count();
+  int pidx   = profiles_active_index();
+  if (pcount > 1) {
+    lv_draw_rect_dsc_t tri;            // lv_draw_polygon takes a RECT dsc, not an arc/tri one
+    lv_draw_rect_dsc_init(&tri);
+    tri.bg_color = lv_color_hex(parse_hex_color(profiles_active_color(), 0xFFFFFF));
+    tri.bg_opa   = LV_OPA_COVER;
+    const lv_coord_t cx = EXAMPLE_LCD_H_RES / 2;
+    const lv_coord_t cy = EXAMPLE_LCD_V_RES / 2;
+
+    if (pidx > 0) {                    // points left = previous
+      lv_point_t p[3] = {
+        { (lv_coord_t)(cx - INDICATOR_CX - INDICATOR_HALF_W), cy },
+        { (lv_coord_t)(cx - INDICATOR_CX + INDICATOR_HALF_W), (lv_coord_t)(cy - INDICATOR_HALF_H) },
+        { (lv_coord_t)(cx - INDICATOR_CX + INDICATOR_HALF_W), (lv_coord_t)(cy + INDICATOR_HALF_H) },
+      };
+      lv_draw_polygon(draw_ctx, &tri, p, 3);
+    }
+    if (pidx < pcount - 1) {           // points right = next
+      lv_point_t p[3] = {
+        { (lv_coord_t)(cx + INDICATOR_CX + INDICATOR_HALF_W), cy },
+        { (lv_coord_t)(cx + INDICATOR_CX - INDICATOR_HALF_W), (lv_coord_t)(cy - INDICATOR_HALF_H) },
+        { (lv_coord_t)(cx + INDICATOR_CX - INDICATOR_HALF_W), (lv_coord_t)(cy + INDICATOR_HALF_H) },
+      };
+      lv_draw_polygon(draw_ctx, &tri, p, 3);
+    }
+  }
 }
 
 static void update_center_label(int idx) {
@@ -327,6 +368,23 @@ static void screen_click_cb(lv_event_t *e) {
                 (int)p.x, (int)p.y, dist, RING_INNER_R, RING_OUTER_R, active_count);
 
   if (dist < RING_INNER_R) {
+    // The indicator hot zones. Live ONLY while their indicator is showing, so at either end of
+    // the profile list the tap falls straight through and fires as it always has. The middle
+    // ~120 px stays a comfortable fire target.
+    int pcount = profiles_count();
+    int pidx   = profiles_active_index();
+    if (fabsf(dy) < HOTZONE_MAX_DY && fabsf(dx) > HOTZONE_MIN_DX) {
+      if (dx < 0 && pidx > 0) {
+        TRACE("[tap] -> indicator prev\n");
+        profile_switch_delta = -1;
+        return;
+      }
+      if (dx > 0 && pidx < pcount - 1) {
+        TRACE("[tap] -> indicator next\n");
+        profile_switch_delta = 1;
+        return;
+      }
+    }
     TRACE("[tap] -> center, fire pos=%d\n", active_positions[selected_idx]);
     macros_request_fire(active_positions[selected_idx]);
   } else if (dist <= RING_OUTER_R + 10) {
