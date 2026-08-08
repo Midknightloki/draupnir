@@ -498,6 +498,12 @@ static void build_settings_overlay(void) {
   lv_obj_set_style_radius(settings_overlay, 0, 0);
   lv_obj_set_style_border_width(settings_overlay, 0, 0);
   lv_obj_clear_flag(settings_overlay, LV_OBJ_FLAG_SCROLLABLE);
+  // lv_obj_create() defaults every new object to LV_OBJ_FLAG_CLICKABLE (core/lv_obj.c:436), and
+  // lv_obj_hit_test() requires that flag to report a hit (core/lv_obj_pos.c:950). A full-screen
+  // container left clickable wins lv_indev_search_obj()'s hit test before it ever reaches `scr`,
+  // silently swallowing every tap meant for screen_click_cb -- the only LV_EVENT_CLICKED handler
+  // in this file. Clear it so taps fall through to the screen.
+  lv_obj_clear_flag(settings_overlay, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_flag(settings_overlay, LV_OBJ_FLAG_HIDDEN);
 
   settings_list_panel = lv_obj_create(settings_overlay);
@@ -506,6 +512,9 @@ static void build_settings_overlay(void) {
   lv_obj_set_style_bg_opa(settings_list_panel, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(settings_list_panel, 0, 0);
   lv_obj_clear_flag(settings_list_panel, LV_OBJ_FLAG_SCROLLABLE);
+  // Same lv_obj_create() default as settings_overlay above: clickable-by-default means this
+  // full-screen panel steals the hit test from `scr` before screen_click_cb ever runs. Clear it.
+  lv_obj_clear_flag(settings_list_panel, LV_OBJ_FLAG_CLICKABLE);
 
   // The two rails framing the centre slot -- the slot-machine affordance. Drawn first so the
   // rows, created after, paint on top in LVGL's insertion-order z-stacking.
@@ -535,6 +544,11 @@ static void build_settings_overlay(void) {
   lv_obj_set_style_bg_opa(settings_edit_panel, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(settings_edit_panel, 0, 0);
   lv_obj_clear_flag(settings_edit_panel, LV_OBJ_FLAG_SCROLLABLE);
+  // Same lv_obj_create() default as settings_overlay/settings_list_panel above: clickable-by-
+  // default means this full-screen panel steals the hit test from `scr` before screen_click_cb
+  // ever runs -- clearing LV_OBJ_FLAG_CLICKABLE on gauge_arc alone isn't enough, since this panel
+  // sits underneath it and wins the hit test first. Clear it here too.
+  lv_obj_clear_flag(settings_edit_panel, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_flag(settings_edit_panel, LV_OBJ_FLAG_HIDDEN);
 
   // Half-moon gauge across the TOP. LVGL arc angles put 0 deg at 3 o'clock and increase
@@ -570,8 +584,13 @@ static void build_settings_overlay(void) {
   lv_obj_align(gauge_label, LV_ALIGN_CENTER, 0, 52);
 }
 
-// 0..100 across the usable duty range, so the floor reads as 0% rather than 8%.
+// 0..100 across the usable duty range, so the floor reads as 0% rather than 8%. Clamped for
+// display only -- current_duty itself is never clamped here, so the boot value stays honest to
+// whatever was actually stored (e.g. a pre-M7 profiles.json brightness below BRIGHTNESS_MIN,
+// which would otherwise print as a negative percentage until the encoder is first turned).
 static int duty_to_pct(int duty) {
+  if (duty < BRIGHTNESS_MIN) return 0;
+  if (duty > BRIGHTNESS_MAX) return 100;
   return ((duty - BRIGHTNESS_MIN) * 100) / (BRIGHTNESS_MAX - BRIGHTNESS_MIN);
 }
 
