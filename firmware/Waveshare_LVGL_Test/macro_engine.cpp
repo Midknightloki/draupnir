@@ -40,6 +40,16 @@ static const char *defaultProfilesJson = R"=====(
         ] },
         { "pos": 4, "name": "Caps Lock", "color": "#A030E0", "mode": "toggle", "actions": [ { "type": "key", "key": "CAPSLOCK" } ] }
       ]
+    },
+    {
+      "name": "Media",
+      "color": "#30C060",
+      "macros": [
+        { "pos": 0, "name": "Play/Pause", "color": "#30C060", "mode": "play_once", "actions": [ { "type": "consumer", "code": "PLAY_PAUSE" } ] },
+        { "pos": 1, "name": "Next", "color": "#3080E0", "mode": "play_once", "actions": [ { "type": "consumer", "code": "NEXT" } ] },
+        { "pos": 2, "name": "Prev", "color": "#E0A030", "mode": "play_once", "actions": [ { "type": "consumer", "code": "PREV" } ] },
+        { "pos": 3, "name": "Vol Up", "color": "#A030E0", "mode": "play_once", "actions": [ { "type": "consumer", "code": "VOL_UP" } ] }
+      ]
     }
   ]
 }
