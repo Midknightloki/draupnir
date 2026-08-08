@@ -46,6 +46,11 @@ static volatile bool settings_close_requested = false;
 static volatile bool settings_enter_requested = false;
 
 static lv_obj_t *settings_overlay = nullptr;
+static lv_obj_t *settings_list_panel = nullptr;
+static lv_obj_t *settings_edit_panel = nullptr;
+static lv_obj_t *gauge_arc   = nullptr;
+static lv_obj_t *gauge_value = nullptr;
+static lv_obj_t *gauge_label = nullptr;
 static lv_obj_t *settings_rows[4];          // sized for growth; SETTINGS_ITEM_COUNT is the truth
 static int settings_sel = 0;
 static unsigned long settings_last_activity = 0;
@@ -495,10 +500,17 @@ static void build_settings_overlay(void) {
   lv_obj_clear_flag(settings_overlay, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(settings_overlay, LV_OBJ_FLAG_HIDDEN);
 
+  settings_list_panel = lv_obj_create(settings_overlay);
+  lv_obj_set_size(settings_list_panel, EXAMPLE_LCD_H_RES, EXAMPLE_LCD_V_RES);
+  lv_obj_center(settings_list_panel);
+  lv_obj_set_style_bg_opa(settings_list_panel, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(settings_list_panel, 0, 0);
+  lv_obj_clear_flag(settings_list_panel, LV_OBJ_FLAG_SCROLLABLE);
+
   // The two rails framing the centre slot -- the slot-machine affordance. Drawn first so the
   // rows, created after, paint on top in LVGL's insertion-order z-stacking.
   for (int i = 0; i < 2; i++) {
-    lv_obj_t *rail = lv_obj_create(settings_overlay);
+    lv_obj_t *rail = lv_obj_create(settings_list_panel);
     lv_obj_set_size(rail, 170, 2);
     lv_obj_set_style_bg_color(rail, lv_color_hex(0x404050), 0);
     lv_obj_set_style_bg_opa(rail, LV_OPA_COVER, 0);
@@ -509,13 +521,76 @@ static void build_settings_overlay(void) {
   }
 
   for (int i = 0; i < SETTINGS_ITEM_COUNT; i++) {
-    lv_obj_t *row = lv_label_create(settings_overlay);
+    lv_obj_t *row = lv_label_create(settings_list_panel);
     lv_label_set_text(row, SETTINGS_ITEMS[i].name);
     lv_obj_set_style_text_color(row, lv_color_white(), 0);
     lv_obj_set_style_text_align(row, LV_TEXT_ALIGN_CENTER, 0);
     settings_rows[i] = row;
   }
   settings_layout();
+
+  settings_edit_panel = lv_obj_create(settings_overlay);
+  lv_obj_set_size(settings_edit_panel, EXAMPLE_LCD_H_RES, EXAMPLE_LCD_V_RES);
+  lv_obj_center(settings_edit_panel);
+  lv_obj_set_style_bg_opa(settings_edit_panel, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(settings_edit_panel, 0, 0);
+  lv_obj_clear_flag(settings_edit_panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(settings_edit_panel, LV_OBJ_FLAG_HIDDEN);
+
+  // Half-moon gauge across the TOP. LVGL arc angles put 0 deg at 3 o'clock and increase
+  // clockwise -- the same convention wedge_center_angle() uses -- so 180..360 is 9 o'clock
+  // through 12 to 3 o'clock, and the indicator fills left to right as the value rises. That
+  // matches a clockwise knob turn, and reuses the ring's own geometry so the gauge reads as the
+  // same object the rest of the UI is built from.
+  gauge_arc = lv_arc_create(settings_edit_panel);
+  lv_obj_set_size(gauge_arc, 300, 300);
+  lv_obj_align(gauge_arc, LV_ALIGN_CENTER, 0, 0);
+  lv_arc_set_rotation(gauge_arc, 0);
+  lv_arc_set_bg_angles(gauge_arc, 180, 360);
+  lv_arc_set_range(gauge_arc, 0, 100);
+  lv_arc_set_value(gauge_arc, 0);
+  lv_obj_remove_style(gauge_arc, NULL, LV_PART_KNOB);      // encoder drives it, not a drag handle
+  lv_obj_clear_flag(gauge_arc, LV_OBJ_FLAG_CLICKABLE);     // taps must reach the screen click cb
+  lv_obj_set_style_arc_width(gauge_arc, 18, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(gauge_arc, 18, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(gauge_arc, lv_color_hex(0x303040), LV_PART_MAIN);
+  lv_obj_set_style_arc_color(gauge_arc, lv_color_white(), LV_PART_INDICATOR);
+
+  gauge_value = lv_label_create(settings_edit_panel);
+  lv_obj_set_style_text_font(gauge_value, &orbitron_24, 0);
+  lv_obj_set_style_text_color(gauge_value, lv_color_white(), 0);
+  lv_label_set_text(gauge_value, "0%");
+  lv_obj_align(gauge_value, LV_ALIGN_CENTER, 0, 0);
+
+  gauge_label = lv_label_create(settings_edit_panel);
+  lv_obj_set_style_text_font(gauge_label, &orbitron_14, 0);
+  lv_obj_set_style_text_color(gauge_label, lv_color_white(), 0);
+  lv_obj_set_style_text_opa(gauge_label, LV_OPA_60, 0);
+  lv_label_set_text(gauge_label, "Brightness");
+  lv_obj_align(gauge_label, LV_ALIGN_CENTER, 0, 52);
+}
+
+// 0..100 across the usable duty range, so the floor reads as 0% rather than 8%.
+static int duty_to_pct(int duty) {
+  return ((duty - BRIGHTNESS_MIN) * 100) / (BRIGHTNESS_MAX - BRIGHTNESS_MIN);
+}
+
+static void gauge_refresh(void) {
+  const setting_item_t *it = &SETTINGS_ITEMS[settings_sel];
+  int pct = duty_to_pct(it->get());
+  lv_arc_set_value(gauge_arc, pct);
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d%%", pct);
+  lv_label_set_text(gauge_value, buf);
+  lv_label_set_text(gauge_label, it->name);
+}
+
+// One NVS write per Settings session, from the loop task. state_set_brightness() skips an
+// identical write, so a session that changed nothing costs a read and no wear.
+static void settings_commit(void) {
+  if (!brightness_dirty) return;
+  state_set_brightness(current_duty);
+  brightness_dirty = false;
 }
 
 // Owns every Settings mode transition. Callbacks only raise flags (spec section 9).
@@ -537,6 +612,8 @@ static void update_settings(void) {
     settings_sel = 0;
     settings_last_activity = millis();
     settings_layout();
+    lv_obj_add_flag(settings_edit_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(settings_list_panel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(settings_overlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(settings_overlay);
     if (pairing_overlay) lv_obj_move_foreground(pairing_overlay);
@@ -548,18 +625,34 @@ static void update_settings(void) {
   if (ui_mode == UI_RING) return;
 
   if (settings_enter_requested) {
+    if (!lvgl_lock(200)) return;   // flag stays set; next tick retries
     settings_enter_requested = false;
-    // Task 4 turns this into "open the centred item's editor".
-    Serial.printf("[diag] settings: activate item %d (%s)\n",
-                  settings_sel, SETTINGS_ITEMS[settings_sel].name);
+    if (ui_mode == UI_SETTINGS_LIST) {
+      ui_mode = UI_SETTINGS_EDIT;
+      gauge_refresh();
+      lv_obj_add_flag(settings_list_panel, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_clear_flag(settings_edit_panel, LV_OBJ_FLAG_HIDDEN);
+      Serial.printf("[diag] settings: editing %s\n", SETTINGS_ITEMS[settings_sel].name);
+    } else {
+      ui_mode = UI_SETTINGS_LIST;
+      lv_obj_add_flag(settings_edit_panel, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_clear_flag(settings_list_panel, LV_OBJ_FLAG_HIDDEN);
+      settings_commit();
+      Serial.println("[diag] settings: back to list");
+    }
     settings_last_activity = millis();
+    lvgl_unlock();
+    return;
   }
 
   bool timed_out = (millis() - settings_last_activity > SETTINGS_IDLE_TIMEOUT_MS);
   if (settings_close_requested || timed_out) {
     if (!lvgl_lock(200)) return;
     settings_close_requested = false;
+    settings_commit();
     ui_mode = UI_RING;
+    lv_obj_add_flag(settings_edit_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(settings_list_panel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(settings_overlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_invalidate(lv_scr_act());
     lvgl_unlock();
@@ -611,6 +704,11 @@ static void encoder_task(void *arg) {
         settings_sel = next;
         settings_layout();
       }
+      settings_last_activity = millis();
+    } else if (ui_mode == UI_SETTINGS_EDIT) {
+      const setting_item_t *it = &SETTINGS_ITEMS[settings_sel];
+      it->apply(it->get() + delta * it->step);   // live preview: the panel changes as you turn
+      gauge_refresh();
       settings_last_activity = millis();
     } else if (ui_mode == UI_RING) {
       // Re-check active_count INSIDE the lock. The pre-lock world can change while this task
@@ -699,6 +797,7 @@ void setup() {
   // profilesDoc, so both the NVS handle and the seed are available here.
   uint8_t boot_brightness = state_brightness(profiles_default_brightness());
   lcd_bl_pwm_bsp_init(boot_brightness);
+  current_duty = boot_brightness;  // so the gauge opens at the real value, not BRIGHTNESS_MAX
   Serial.printf("[diag] backlight init done duty=%u\n", (unsigned)boot_brightness);
 
   if (lvgl_lock(-1)) {
