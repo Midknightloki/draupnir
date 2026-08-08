@@ -40,3 +40,7 @@ companion_app/.dart_tool/
 companion_app/build/
 companion_app/android/local.properties
 companion_app/android/.gradle/
+
+# Font build inputs (TTF sources for lv_font_conv). The generated LVGL .c font tables are what
+# get committed; the source TTF is a build input, not source.
+tools/fonts/

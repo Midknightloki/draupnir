@@ -124,7 +124,7 @@ static void rebuild_ring_layout(void) {
     float y = EXAMPLE_LCD_V_RES / 2.0f + RING_MID_R * sinf(rad);
 
     lv_obj_t *label = lv_label_create(scr);
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(label, &orbitron_12, 0);
     lv_obj_set_style_text_color(label, lv_color_white(), 0);
     lv_obj_set_width(label, (lv_coord_t)chord);
     lv_label_set_long_mode(label, LV_LABEL_LONG_DOT); // single line, truncates with "..." -- never overflows vertically
