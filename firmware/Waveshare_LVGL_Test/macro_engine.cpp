@@ -221,7 +221,13 @@ void profiles_reload() {
   activeProfileIdx = state_active_profile(0);
   JsonArray profiles = profilesDoc["profiles"];
   Serial.printf("[diag] profiles_reload: activeProfileIdx=%d numProfiles=%u\n", activeProfileIdx, profiles.isNull() ? 0 : profiles.size());
-  if (profiles.isNull() || activeProfileIdx >= (int)profiles.size()) activeProfileIdx = 0;
+  if (profiles.isNull() || activeProfileIdx >= (int)profiles.size()) {
+    activeProfileIdx = 0;
+    // Write the correction back. Clamping in RAM only left a stale out-of-range index in NVS
+    // forever, re-clamped silently on every boot -- "reading it without ever writing it is the
+    // same as not having it" (spec section 8).
+    state_set_active_profile(activeProfileIdx);
+  }
 }
 
 void profiles_init() {
@@ -240,6 +246,32 @@ const char *profiles_active_name() {
   if (profiles.isNull() || activeProfileIdx >= (int)profiles.size()) return "No Profiles";
   JsonObject prof = profiles[activeProfileIdx];
   return prof["name"] | "Profile";
+}
+
+const char *profiles_active_color() {
+  JsonArray profiles = profilesDoc["profiles"];
+  if (profiles.isNull() || activeProfileIdx >= (int)profiles.size()) return "#FFFFFF";
+  JsonObject prof = profiles[activeProfileIdx];
+  return prof["color"] | "#FFFFFF";
+}
+
+int profiles_count() {
+  JsonArray profiles = profilesDoc["profiles"];
+  return profiles.isNull() ? 0 : (int)profiles.size();
+}
+
+int profiles_active_index() {
+  return activeProfileIdx;
+}
+
+bool profiles_set_active(int idx) {
+  if (idx < 0 || idx >= profiles_count()) return false;
+  if (idx == activeProfileIdx) return false;
+  macros_stop_all();
+  activeProfileIdx = idx;
+  state_set_active_profile(activeProfileIdx);
+  Serial.printf("[diag] profile -> %d (%s)\n", activeProfileIdx, profiles_active_name());
+  return true;
 }
 
 uint8_t profiles_default_brightness() {

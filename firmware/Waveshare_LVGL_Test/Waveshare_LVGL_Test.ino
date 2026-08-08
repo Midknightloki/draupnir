@@ -99,6 +99,15 @@ static const setting_item_t SETTINGS_ITEMS[] = {
 };
 #define SETTINGS_ITEM_COUNT ((int)(sizeof(SETTINGS_ITEMS) / sizeof(SETTINGS_ITEMS[0])))
 
+// Assigned (never accumulated) by the gesture callback and zeroed by loop(), so there is no
+// cross-core read-modify-write. A very fast double-swipe may register as one switch; acceptable.
+static volatile int8_t profile_switch_delta = 0;
+
+// A switch silently re-legends the whole ring, so the profile name is shown briefly to say what
+// changed. 0 = no toast pending.
+static unsigned long profile_toast_until = 0;
+#define PROFILE_TOAST_MS 1500
+
 static int selected_idx = 0;
 static knob_handle_t s_knob = NULL;
 static EventGroupHandle_t knob_events = NULL;
@@ -358,6 +367,21 @@ static void screen_gesture_cb(lv_event_t *e) {
       // outlives update_settings()'s macros_stop_all() -- the macro looks stopped for one tick
       // and then starts right back up. Suppressing the release here removes the spurious CLICKED
       // at the source instead of making the guard downstream defensive.
+      lv_indev_wait_release(indev);
+    }
+    return;
+  }
+
+  // Horizontal swipes switch profiles, matching M5_M6_config.ino:1375-1380 so the same gesture
+  // means the same thing on both boards: swipe left = next, swipe right = previous.
+  // Ignored while Settings or the pairing overlay owns the screen.
+  if (dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) {
+    if (ui_mode == UI_RING && !ble_pairing_active()) {
+      profile_switch_delta = (dir == LV_DIR_LEFT) ? 1 : -1;
+      // Same H1/H5-class exposure as the swipe-up path above: the finger lifting off delivers a
+      // CLICKED on whatever wedge it ended over before loop() has drained profile_switch_delta,
+      // which would queue a spurious macros_request_fire() against the profile just switched
+      // away from. Suppress the release at the source instead of guarding downstream.
       lv_indev_wait_release(indev);
     }
     return;
@@ -689,6 +713,36 @@ static void update_settings(void) {
   }
 }
 
+// Runs the switch on the loop task: profiles_set_active() calls macros_stop_all() (loop-only)
+// and rebuild_ring_layout() needs lvgl_lock(). Same hand-off update_profiles_reload() uses.
+static void update_profile_switch(void) {
+  int delta = profile_switch_delta;
+  if (delta == 0) return;
+  // Lock FIRST; only consume the request once the lock is held (the H5 lesson).
+  if (!lvgl_lock(200)) return;
+  profile_switch_delta = 0;
+
+  if (profiles_set_active(profiles_active_index() + delta)) {
+    rebuild_ring_layout();
+    selected_idx = 0;
+    if (active_count > 0) select_idx(selected_idx);
+    lv_label_set_text(center_label, profiles_active_name());
+    profile_toast_until = millis() + PROFILE_TOAST_MS;
+  }
+  lvgl_unlock();
+}
+
+static void update_profile_toast(void) {
+  if (profile_toast_until == 0) return;
+  if (millis() < profile_toast_until) return;
+  // Leave the deadline set on lock failure so the next tick retries, or the profile name stays
+  // burned into the centre label.
+  if (!lvgl_lock(50)) return;
+  profile_toast_until = 0;
+  update_center_label(selected_idx);
+  lvgl_unlock();
+}
+
 static void build_ring_ui(void) {
   lv_obj_t *scr = lv_scr_act();
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
@@ -861,6 +915,8 @@ void loop() {
   update_pairing_overlay();
   update_profiles_reload();
   update_settings();
+  update_profile_switch();
+  update_profile_toast();
   update_running_pulse();
   if (millis() - last_loop_print > 3000) {
     last_loop_print = millis();

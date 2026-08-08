@@ -30,6 +30,23 @@ JsonObject profiles_find_macro(int pos);
 // truth once NVS has been written (see device_state.h). 160 if absent or out of range.
 uint8_t profiles_default_brightness();
 
+// Active profile's "color" (e.g. "#3080E0"), "#FFFFFF" if absent. Used for the ring's
+// directional profile indicators.
+const char *profiles_active_color();
+
+int profiles_count();
+int profiles_active_index();
+
+// Switches the active profile. Returns false (and does nothing) if `idx` is out of range or
+// already active. Stops every running macro first and persists the new index to NVS.
+//
+// loop()-task ONLY, same constraint as macros_fire(): it calls macros_stop_all(), which mutates
+// runningMacros[] with no locking. Every ActiveMacro also holds a JsonObject into the profile
+// being switched away from, so skipping the stop is the H3 use-after-free on a new trigger.
+//
+// The CALLER is responsible for rebuilding the ring UI afterwards, under lvgl_lock().
+bool profiles_set_active(int idx);
+
 // Serializes the whole loaded profiles.json document straight to `out` (e.g. a BLE chunk sink),
 // so callers never need direct access to the underlying JsonDocument.
 void profiles_serialize(Print &out);
