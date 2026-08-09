@@ -26,9 +26,10 @@
 // RING_OUTER_R there are only 8 px on a 360 px panel. That puts them in the tap-to-fire zone,
 // so their hot zones switch profiles rather than firing -- something that looks tappable inside
 // the fire zone must not fire a macro. INDICATOR_CX + INDICATOR_HALF_W must stay < RING_INNER_R.
+// Shortened for visual compactness per owner feedback: bounding box now 11x12 instead of 17x14.
 #define INDICATOR_CX      72
-#define INDICATOR_HALF_W  8
-#define INDICATOR_HALF_H  7
+#define INDICATOR_HALF_W  5    // was 8
+#define INDICATOR_HALF_H  6    // was 7
 // The hot zone is intentionally larger than the visual chevron -- a small hint with a generous
 // tap target, not an oversight. Do not shrink these to match INDICATOR_HALF_W/H.
 #define HOTZONE_MIN_DX    60
