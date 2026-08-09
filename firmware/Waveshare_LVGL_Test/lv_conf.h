@@ -371,7 +371,7 @@
 #define LV_FONT_MONTSERRAT_22 0
 #define LV_FONT_MONTSERRAT_24 0
 #define LV_FONT_MONTSERRAT_26 0
-#define LV_FONT_MONTSERRAT_28 0
+#define LV_FONT_MONTSERRAT_28 1
 #define LV_FONT_MONTSERRAT_30 0
 #define LV_FONT_MONTSERRAT_32 0
 #define LV_FONT_MONTSERRAT_34 0
@@ -396,7 +396,7 @@
 /*Optionally declare custom fonts here.
  *You can use these fonts as default font too and they will be available globally.
  *E.g. #define LV_FONT_CUSTOM_DECLARE   LV_FONT_DECLARE(my_font_1) LV_FONT_DECLARE(my_font_2)*/
-#define LV_FONT_CUSTOM_DECLARE   LV_FONT_DECLARE(orbitron_12) LV_FONT_DECLARE(orbitron_14) LV_FONT_DECLARE(orbitron_24)
+#define LV_FONT_CUSTOM_DECLARE   LV_FONT_DECLARE(orbitron_12) LV_FONT_DECLARE(orbitron_14) LV_FONT_DECLARE(orbitron_24) LV_FONT_DECLARE(orbitron_bold_24)
 
 /*Always set a default font*/
 #define LV_FONT_DEFAULT &orbitron_14

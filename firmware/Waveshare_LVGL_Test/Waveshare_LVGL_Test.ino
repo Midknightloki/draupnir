@@ -19,19 +19,16 @@
 // bigger wedges instead of wasted screen space on empty ones.
 #define RING_OUTER_R 172
 #define RING_INNER_R 92
-#define RING_MID_R ((RING_OUTER_R + RING_INNER_R) / 2)
 #define WEDGE_GAP_DEG 2.0f
 
 // Profile indicators live INSIDE the inner hole: the ring band is full of wedges, and outside
 // RING_OUTER_R there are only 8 px on a 360 px panel. That puts them in the tap-to-fire zone,
 // so their hot zones switch profiles rather than firing -- something that looks tappable inside
-// the fire zone must not fire a macro. INDICATOR_CX + INDICATOR_HALF_W must stay < RING_INNER_R.
-// Lengthened and thinned per owner feedback to read like a real angle bracket ❯.
+// the fire zone must not fire a macro. Drawn as the real LV_SYMBOL_LEFT/RIGHT glyphs (Montserrat
+// 28, see ring_draw_event_cb) rather than hand-drawn strokes -- see the note there.
 #define INDICATOR_CX      72
-#define INDICATOR_HALF_W  7    // was 5
-#define INDICATOR_HALF_H  9    // was 6
-// The hot zone is intentionally larger than the visual chevron -- a small hint with a generous
-// tap target, not an oversight. Do not shrink these to match INDICATOR_HALF_W/H.
+// The hot zone is intentionally larger than the visual glyph -- a small hint with a generous
+// tap target, not an oversight. Do not shrink these to match the glyph's own metrics.
 #define HOTZONE_MIN_DX    60
 #define HOTZONE_MAX_DY    40
 
@@ -40,12 +37,6 @@
 // and profiles_find_macro() still take a real pos, so callers go through active_positions[].
 static int active_positions[NUM_MACRO_SLOTS];
 static int active_count = 0;
-
-static lv_obj_t *macro_labels[NUM_MACRO_SLOTS];
-// Declared up here rather than beside the rest of the pairing UI below, because
-// rebuild_ring_layout() has to re-assert its z-order after re-creating the wedge labels (see the
-// comment there) and that function is defined earlier in this file.
-static lv_obj_t *pairing_overlay = nullptr;
 
 // ---- Settings menu ----------------------------------------------------------------------
 // ui_mode is owned by loop(). LVGL-task callbacks (touch, gesture) and encoder_task only ever
@@ -116,15 +107,12 @@ static const setting_item_t SETTINGS_ITEMS[] = {
 // cross-core read-modify-write. A very fast double-swipe may register as one switch; acceptable.
 static volatile int8_t profile_switch_delta = 0;
 
-// A switch silently re-legends the whole ring, so the profile name is shown briefly to say what
-// changed. 0 = no toast pending.
-static unsigned long profile_toast_until = 0;
-#define PROFILE_TOAST_MS 1500
-
 static int selected_idx = 0;
 static knob_handle_t s_knob = NULL;
 static EventGroupHandle_t knob_events = NULL;
-static lv_obj_t *center_label;
+static lv_obj_t *centre_macro   = nullptr;    // selected macro name
+static lv_obj_t *centre_profile = nullptr;    // active profile name -- always visible now, so no
+                                               // separate toast is needed to say what changed.
 
 static uint32_t parse_hex_color(const char *hex, uint32_t fallback) {
   if (hex == nullptr || strlen(hex) < 6) return fallback;
@@ -174,61 +162,24 @@ static void scan_active_positions(void) {
 // 3 o'clock and makes increasing angle go CLOCKWISE on screen. The +270 offset rotates that
 // so v=0 lands at 12 o'clock; since both v and the angle unit increase clockwise, no direction
 // flip is needed between them.
+// (v - selected_idx) puts the SELECTED wedge at the +270 origin -- 12 o'clock -- and rotates
+// every other wedge around it. The ring moves under a fixed selection point rather than a
+// highlight travelling around a fixed ring.
 static float wedge_center_angle(int v, int count) {
   float wedge_deg = 360.0f / count;
-  float a = fmodf(v * wedge_deg + 270.0f, 360.0f);
+  float a = fmodf((v - selected_idx) * wedge_deg + 270.0f, 360.0f);
   if (a < 0.0f) a += 360.0f;
   return a;
 }
 
-// Rebuilds the label objects for the currently active macros. Safe to call again later (once
-// profile edits arrive over BLE) -- deletes any previously-created labels first.
+// Rescans the active macro set and refreshes the centre stack. No wedge objects exist any more
+// (task 8 deleted the per-wedge labels -- wedges are plain colour arcs drawn in
+// ring_draw_event_cb), so there is nothing left here to re-create or re-parent. Kept as its own
+// function, under its original name, because several callers (profile switch, BLE profile
+// reload, initial build) depend on calling it as one step.
 static void rebuild_ring_layout(void) {
-  for (int i = 0; i < NUM_MACRO_SLOTS; i++) {
-    if (macro_labels[i]) {
-      lv_obj_del(macro_labels[i]);
-      macro_labels[i] = NULL;
-    }
-  }
-
   scan_active_positions();
-  if (active_count == 0) {
-    lv_label_set_text(center_label, "(no macros)");
-    return;
-  }
-
-  float wedge_deg = 360.0f / active_count;
-  float half_span = wedge_deg / 2.0f - WEDGE_GAP_DEG / 2.0f;
-  // Chord width available at the wedge's mid-radius, so text wraps to what's actually there
-  // instead of a fixed guess -- this is what was overflowing before at 16 fixed slots.
-  float chord = 2.0f * RING_MID_R * sinf(half_span * (float)M_PI / 180.0f) - 6.0f;
-  if (chord < 20.0f) chord = 20.0f;
-
-  lv_obj_t *scr = lv_scr_act();
-  for (int v = 0; v < active_count; v++) {
-    JsonObject macro = profiles_find_macro(active_positions[v]);
-    float angle = wedge_center_angle(v, active_count);
-    float rad = angle * (float)M_PI / 180.0f;
-    float x = EXAMPLE_LCD_H_RES / 2.0f + RING_MID_R * cosf(rad);
-    float y = EXAMPLE_LCD_V_RES / 2.0f + RING_MID_R * sinf(rad);
-
-    lv_obj_t *label = lv_label_create(scr);
-    lv_obj_set_style_text_font(label, &orbitron_12, 0);
-    lv_obj_set_style_text_color(label, lv_color_white(), 0);
-    lv_obj_set_width(label, (lv_coord_t)chord);
-    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT); // single line, truncates with "..." -- never overflows vertically
-    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_text(label, macro.isNull() ? "" : (const char *)(macro["name"] | "?"));
-    lv_obj_set_pos(label, (lv_coord_t)(x - chord / 2.0f), (lv_coord_t)(y - 9));
-
-    macro_labels[v] = label;
-  }
-  // Re-assert overlay z-order after re-creating the wedge labels above, or one profile save is
-  // enough to leave macro names bleeding through an overlay. Settings first, pairing last, so
-  // pairing always wins.
-  if (settings_overlay) lv_obj_move_foreground(settings_overlay);
-  if (pairing_overlay)  lv_obj_move_foreground(pairing_overlay);
-
+  update_centre_stack();
   Serial.printf("[diag] rebuild_ring_layout: active_count=%d\n", active_count);
 }
 
@@ -285,60 +236,82 @@ static void ring_draw_event_cb(lv_event_t *e) {
     }
   }
 
+  // Tinted bloom -- fakes a glow with stacked arcs, since LVGL 8 has no blur. Colour follows the
+  // SELECTED macro so the centre text and the top wedge read as one object.
+  if (active_count > 0) {
+    JsonObject selm = profiles_find_macro(active_positions[selected_idx]);
+    uint32_t glow = selm.isNull() ? 0xFFFFFF
+                                  : parse_hex_color(selm["color"] | "#FFFFFF", 0xFFFFFF);
+    static const struct { int16_t inset; lv_opa_t opa; int16_t w; } BLOOM[] = {
+      { 0, 90, 6 }, { 6, 50, 8 }, { 14, 22, 10 }, { 24, 8, 12 },
+    };
+    for (unsigned i = 0; i < sizeof(BLOOM) / sizeof(BLOOM[0]); i++) {
+      lv_draw_arc_dsc_t b;
+      lv_draw_arc_dsc_init(&b);
+      b.color = lv_color_hex(glow);
+      b.opa   = BLOOM[i].opa;
+      b.width = BLOOM[i].w;
+      lv_draw_arc(draw_ctx, &b, &center_pt, RING_INNER_R - BLOOM[i].inset, 0, 360);
+    }
+  }
+
   // Drawn in the active profile's own colour, and only when a profile exists in that direction.
   // screen_click_cb() gates its hot zones on the same condition, so at either end of the list a
   // tap there falls through and fires instead of switching.
   int pcount = profiles_count();
   int pidx   = profiles_active_index();
   if (pcount > 1) {
-    // Hollow chevron, not a filled triangle -- a hint, not a control. Two rounded strokes from
-    // the apex out to the top/bottom points.
-    lv_draw_line_dsc_t chev;
-    lv_draw_line_dsc_init(&chev);
-    chev.color       = lv_color_hex(parse_hex_color(profiles_active_color(), 0xFFFFFF));
-    chev.opa         = LV_OPA_COVER;
-    chev.width       = 2;
-    chev.round_start = 1;
-    chev.round_end   = 1;
+    // A real FontAwesome chevron glyph, not hand-drawn strokes -- three iterations of tuning
+    // lv_draw_line stroke width/length/caps failed to read as a ❯; a typeface glyph has shaping
+    // two straight lines do not. LV_SYMBOL_LEFT/RIGHT are already compiled into
+    // lv_font_montserrat_28 (LV_FONT_MONTSERRAT_28 enabled in lv_conf.h for task 8).
     const lv_coord_t cx = EXAMPLE_LCD_H_RES / 2;
     const lv_coord_t cy = EXAMPLE_LCD_V_RES / 2;
 
-    if (pidx > 0) {                    // points left = previous
-      lv_point_t p[3] = {
-        { (lv_coord_t)(cx - INDICATOR_CX - INDICATOR_HALF_W), cy },
-        { (lv_coord_t)(cx - INDICATOR_CX + INDICATOR_HALF_W), (lv_coord_t)(cy - INDICATOR_HALF_H) },
-        { (lv_coord_t)(cx - INDICATOR_CX + INDICATOR_HALF_W), (lv_coord_t)(cy + INDICATOR_HALF_H) },
-      };
-      lv_draw_line(draw_ctx, &chev, &p[0], &p[1]);
-      lv_draw_line(draw_ctx, &chev, &p[0], &p[2]);
+    lv_draw_label_dsc_t sym;
+    lv_draw_label_dsc_init(&sym);
+    sym.font  = &lv_font_montserrat_28;
+    sym.color = lv_color_hex(parse_hex_color(profiles_active_color(), 0xFFFFFF));
+    sym.opa   = LV_OPA_COVER;
+    sym.align = LV_TEXT_ALIGN_CENTER;
+
+    if (pidx > 0) {
+      lv_area_t a = { (lv_coord_t)(cx - INDICATOR_CX - 20), (lv_coord_t)(cy - 20),
+                      (lv_coord_t)(cx - INDICATOR_CX + 20), (lv_coord_t)(cy + 20) };
+      lv_draw_label(draw_ctx, &sym, &a, LV_SYMBOL_LEFT, NULL);
     }
-    if (pidx < pcount - 1) {           // points right = next
-      lv_point_t p[3] = {
-        { (lv_coord_t)(cx + INDICATOR_CX + INDICATOR_HALF_W), cy },
-        { (lv_coord_t)(cx + INDICATOR_CX - INDICATOR_HALF_W), (lv_coord_t)(cy - INDICATOR_HALF_H) },
-        { (lv_coord_t)(cx + INDICATOR_CX - INDICATOR_HALF_W), (lv_coord_t)(cy + INDICATOR_HALF_H) },
-      };
-      lv_draw_line(draw_ctx, &chev, &p[0], &p[1]);
-      lv_draw_line(draw_ctx, &chev, &p[0], &p[2]);
+    if (pidx < pcount - 1) {
+      lv_area_t a = { (lv_coord_t)(cx + INDICATOR_CX - 20), (lv_coord_t)(cy - 20),
+                      (lv_coord_t)(cx + INDICATOR_CX + 20), (lv_coord_t)(cy + 20) };
+      lv_draw_label(draw_ctx, &sym, &a, LV_SYMBOL_RIGHT, NULL);
     }
   }
 }
 
-static void update_center_label(int idx) {
-  if (active_count == 0) return;
-  JsonObject macro = profiles_find_macro(active_positions[idx]);
-  lv_label_set_text(center_label, macro.isNull() ? "?" : (const char *)(macro["name"] | "?"));
+// Call under lvgl_lock(). Both lines change together -- the macro name follows the selection,
+// the profile name follows a profile switch, and a switch changes both.
+static void update_centre_stack(void) {
+  if (active_count == 0) {
+    lv_label_set_text(centre_macro, "(no macros)");
+  } else {
+    JsonObject m = profiles_find_macro(active_positions[selected_idx]);
+    lv_label_set_text(centre_macro, m.isNull() ? "?" : (const char *)(m["name"] | "?"));
+  }
+  lv_label_set_text(centre_profile, profiles_active_name());
 }
 
 static void select_idx(int idx) {
   selected_idx = idx;
-  update_center_label(selected_idx);
+  update_centre_stack();
   lv_obj_invalidate(lv_scr_act());
 }
 
 // Inverse of wedge_center_angle() -- maps a tap point to a wedge index using the same angle
 // convention (atan2f already returns angle in exactly lv_draw_arc's units, since that
 // convention IS the standard x=R*cos/y=R*sin parametrization; see wedge_center_angle's comment).
+// MUST stay in lockstep with wedge_center_angle()'s (v - selected_idx) rotation: the angle here
+// is relative to the selected wedge at 12 o'clock, so the rel->absolute step below re-adds
+// selected_idx to get back to a real wedge index.
 static int wedge_index_from_point(lv_coord_t px, lv_coord_t py) {
   if (active_count == 0) return 0;
   float dx = (float)px - EXAMPLE_LCD_H_RES / 2.0f;
@@ -346,7 +319,8 @@ static int wedge_index_from_point(lv_coord_t px, lv_coord_t py) {
   float angle = atan2f(dy, dx) * 180.0f / (float)M_PI;
   if (angle < 0.0f) angle += 360.0f;
   float wedge_deg = 360.0f / active_count;
-  int idx = (int)lroundf((angle - 270.0f) / wedge_deg);
+  int rel = (int)lroundf((angle - 270.0f) / wedge_deg);   // offset FROM the selected wedge
+  int idx = rel + selected_idx;                            // back to an absolute wedge index
   return ((idx % active_count) + active_count) % active_count;
 }
 
@@ -512,7 +486,7 @@ static void update_running_pulse(void) {
 // Full-screen overlay shown while ble_pairing_active() is true, on top of the ring (created
 // after it, so it draws later/on top in LVGL's default per-screen z-order). Hidden the rest of
 // the time.
-// pairing_overlay itself is declared at the top of this file (see the note there).
+static lv_obj_t *pairing_overlay = nullptr;
 static lv_obj_t *pairing_label = nullptr;
 
 static void build_pairing_overlay(void) {
@@ -794,20 +768,7 @@ static void update_profile_switch(void) {
     rebuild_ring_layout();
     selected_idx = 0;
     if (active_count > 0) select_idx(selected_idx);
-    lv_label_set_text(center_label, profiles_active_name());
-    profile_toast_until = millis() + PROFILE_TOAST_MS;
   }
-  lvgl_unlock();
-}
-
-static void update_profile_toast(void) {
-  if (profile_toast_until == 0) return;
-  if (millis() < profile_toast_until) return;
-  // Leave the deadline set on lock failure so the next tick retries, or the profile name stays
-  // burned into the centre label.
-  if (!lvgl_lock(50)) return;
-  profile_toast_until = 0;
-  update_center_label(selected_idx);
   lvgl_unlock();
 }
 
@@ -821,20 +782,35 @@ static void build_ring_ui(void) {
   // LVGL suppresses gestures entirely while a touch is scrolling something --
   // indev_gesture() returns immediately if proc->types.pointer.scroll_obj is set, before the
   // gesture thresholds are even consulted. lv_obj_create() makes every object scrollable by
-  // default, including the screen, and the ring's wedge labels are absolutely positioned wide
-  // enough to overflow it horizontally (chord can reach ~177 px at 4 macros, putting the
-  // 3 o'clock label's right edge near x=400 on a 360 px panel). The screen was therefore
-  // horizontally scrollable, and every horizontal swipe scrolled instead of gesturing --
-  // which is why profile switching could not be triggered at all while swipe-up, with far
-  // less vertical overflow, worked only intermittently.
+  // default, including the screen, and the ring USED TO carry one absolutely-positioned wedge
+  // label per macro, wide enough to overflow it horizontally (chord could reach ~177 px at 4
+  // macros, putting the 3 o'clock label's right edge near x=400 on a 360 px panel). The screen
+  // was therefore horizontally scrollable, and every horizontal swipe scrolled instead of
+  // gesturing -- which is why profile switching could not be triggered at all while swipe-up,
+  // with far less vertical overflow, worked only intermittently.
   //
-  // Nothing here is meant to scroll: the ring is hand-drawn in ring_draw_event_cb and the
-  // labels are absolutely positioned. Found by hardware testing.
+  // Task 8 deleted the wedge labels (the ring is now plain colour arcs, see ring_draw_event_cb),
+  // but the guard stays: the centre stack below is also absolutely positioned (lv_obj_align with
+  // an offset, not lv_obj_center), and any future absolutely-positioned object that can extend
+  // past the display bounds would silently reopen this exact bug. Found by hardware testing.
   lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-  center_label = lv_label_create(scr);
-  lv_obj_set_style_text_color(center_label, lv_color_white(), 0);
-  lv_obj_center(center_label);
+  centre_macro = lv_label_create(scr);
+  lv_obj_set_style_text_font(centre_macro, &orbitron_bold_24, 0);
+  lv_obj_set_style_text_color(centre_macro, lv_color_white(), 0);
+  lv_obj_set_width(centre_macro, 150);
+  lv_obj_set_style_text_align(centre_macro, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_long_mode(centre_macro, LV_LABEL_LONG_DOT);
+  lv_obj_align(centre_macro, LV_ALIGN_CENTER, 0, -12);
+
+  centre_profile = lv_label_create(scr);
+  lv_obj_set_style_text_font(centre_profile, &orbitron_14, 0);
+  lv_obj_set_style_text_color(centre_profile, lv_color_white(), 0);
+  lv_obj_set_style_text_opa(centre_profile, LV_OPA_50, 0);
+  lv_obj_set_width(centre_profile, 150);
+  lv_obj_set_style_text_align(centre_profile, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_long_mode(centre_profile, LV_LABEL_LONG_DOT);
+  lv_obj_align(centre_profile, LV_ALIGN_CENTER, 0, 18);
 
   rebuild_ring_layout();
   if (active_count > 0) select_idx(selected_idx);
@@ -1003,7 +979,6 @@ void loop() {
   update_profiles_reload();
   update_settings();
   update_profile_switch();
-  update_profile_toast();
   update_running_pulse();
   if (millis() - last_loop_print > 3000) {
     last_loop_print = millis();
