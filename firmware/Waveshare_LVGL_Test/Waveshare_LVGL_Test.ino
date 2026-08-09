@@ -19,6 +19,7 @@
 // bigger wedges instead of wasted screen space on empty ones.
 #define RING_OUTER_R 172
 #define RING_INNER_R 92
+#define RING_MID_R ((RING_OUTER_R + RING_INNER_R) / 2)
 #define WEDGE_GAP_DEG 2.0f
 
 // Profile indicators live INSIDE the inner hole: the ring band is full of wedges, and outside
@@ -120,6 +121,21 @@ static uint32_t parse_hex_color(const char *hex, uint32_t fallback) {
   return (uint32_t)strtol(hex + offset, nullptr, 16) & 0xFFFFFF;
 }
 
+// Black or white, whichever contrasts better against `bg`. WCAG relative luminance with the
+// sRGB transfer curve; 0.179 is the crossover where black overtakes white.
+//
+// This CANNOT reach a high contrast ratio on a mid-tone colour -- measured against the shipped
+// palette the best available is 9.24:1 on #E0A030, 5.29:1 on #3080E0 and only 4.63:1 on
+// #E03030 -- and users choose these colours, so no palette work fixes it. That is precisely
+// why the authoritative name lives in the centre on black. This is the secondary cue.
+static lv_color_t contrast_on(uint32_t bg) {
+  float c[3] = { ((bg >> 16) & 0xFF) / 255.0f, ((bg >> 8) & 0xFF) / 255.0f, (bg & 0xFF) / 255.0f };
+  for (int i = 0; i < 3; i++)
+    c[i] = (c[i] <= 0.03928f) ? (c[i] / 12.92f) : powf((c[i] + 0.055f) / 1.055f, 2.4f);
+  float L = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
+  return (L > 0.179f) ? lv_color_black() : lv_color_white();
+}
+
 #define EMPTY_SLOT_COLOR 0x242430
 
 // The running indicator modulates the wedge's BRIGHTNESS rather than tinting it a fixed colour.
@@ -155,6 +171,12 @@ static void scan_active_positions(void) {
   }
 }
 
+// Ring rotation in degrees, animated. wedge_center_angle() reads ring_rot; the selection sets
+// ring_rot_target and loop() eases toward it. A whole-wedge snap (90 deg at 4 macros) is
+// impossible to follow -- the owner read it as random rather than fast.
+static float ring_rot = 0.0f;         // current, what is drawn
+static float ring_rot_target = 0.0f;  // continuous: NOT wrapped, so easing takes the short way
+
 // Center angle (in lv_draw_arc's own angle units) of wedge v, given `count` total wedges.
 // Verified directly against lv_arc.c's own knob-placement code (the one part of LVGL
 // guaranteed to use its angle units correctly): knob_x = R*sin(angle+90) = R*cos(angle),
@@ -162,12 +184,14 @@ static void scan_active_positions(void) {
 // 3 o'clock and makes increasing angle go CLOCKWISE on screen. The +270 offset rotates that
 // so v=0 lands at 12 o'clock; since both v and the angle unit increase clockwise, no direction
 // flip is needed between them.
-// (v - selected_idx) puts the SELECTED wedge at the +270 origin -- 12 o'clock -- and rotates
-// every other wedge around it. The ring moves under a fixed selection point rather than a
-// highlight travelling around a fixed ring.
+// v*wedge_deg - ring_rot puts the wedge at ring_rot's own origin at the +270 point -- 12
+// o'clock -- and rotates every other wedge around it. The ring moves under a fixed selection
+// point rather than a highlight travelling around a fixed ring. When ring_rot equals
+// selected_idx*wedge_deg (the settled state), wedge selected_idx sits at 12 o'clock, matching
+// the pre-animation behaviour; mid-animation, ring_rot is whatever loop() has eased it to.
 static float wedge_center_angle(int v, int count) {
   float wedge_deg = 360.0f / count;
-  float a = fmodf((v - selected_idx) * wedge_deg + 270.0f, 360.0f);
+  float a = fmodf(v * wedge_deg - ring_rot + 270.0f, 360.0f);
   if (a < 0.0f) a += 360.0f;
   return a;
 }
@@ -212,6 +236,25 @@ static void ring_draw_event_cb(lv_event_t *e) {
     dsc.width = RING_OUTER_R - RING_INNER_R;
     lv_draw_arc(draw_ctx, &dsc, &center_pt, RING_OUTER_R, (uint16_t)lroundf(start), (uint16_t)lroundf(end));
 
+    // Macro name on the wedge, in whichever of black/white contrasts better against that
+    // wedge's own colour. This is a SECONDARY cue -- the centre stack carries the authoritative
+    // name at 21:1 on black -- so the ~4.6:1 worst case here is adequate, where it was not when
+    // this was the only name on screen.
+    if (!macro.isNull()) {
+      float rad = center * (float)M_PI / 180.0f;
+      lv_coord_t lx = (lv_coord_t)(EXAMPLE_LCD_H_RES / 2.0f + RING_MID_R * cosf(rad));
+      lv_coord_t ly = (lv_coord_t)(EXAMPLE_LCD_V_RES / 2.0f + RING_MID_R * sinf(rad));
+      lv_draw_label_dsc_t wl;
+      lv_draw_label_dsc_init(&wl);
+      wl.font  = &orbitron_12;
+      wl.color = contrast_on(color);
+      wl.opa   = LV_OPA_COVER;
+      wl.align = LV_TEXT_ALIGN_CENTER;
+      lv_area_t wa = { (lv_coord_t)(lx - 42), (lv_coord_t)(ly - 8),
+                       (lv_coord_t)(lx + 42), (lv_coord_t)(ly + 8) };
+      lv_draw_label(draw_ctx, &wl, &wa, (const char *)(macro["name"] | "?"), NULL);
+    }
+
     if (v == selected_idx) {
       lv_draw_arc_dsc_t hl;
       lv_draw_arc_dsc_init(&hl);
@@ -243,7 +286,7 @@ static void ring_draw_event_cb(lv_event_t *e) {
     uint32_t glow = selm.isNull() ? 0xFFFFFF
                                   : parse_hex_color(selm["color"] | "#FFFFFF", 0xFFFFFF);
     static const struct { int16_t inset; lv_opa_t opa; int16_t w; } BLOOM[] = {
-      { 0, 90, 6 }, { 6, 50, 8 }, { 14, 22, 10 }, { 24, 8, 12 },
+      { 0, 140, 6 }, { 6, 80, 8 }, { 14, 40, 10 }, { 24, 16, 12 },
     };
     for (unsigned i = 0; i < sizeof(BLOOM) / sizeof(BLOOM[0]); i++) {
       lv_draw_arc_dsc_t b;
@@ -302,6 +345,12 @@ static void update_centre_stack(void) {
 
 static void select_idx(int idx) {
   selected_idx = idx;
+  // Shortest angular path. ring_rot_target is deliberately NOT wrapped to 0..360: wrapping it
+  // would make a 3->0 selection step animate 270 degrees the long way round.
+  float wedge_deg = 360.0f / (active_count > 0 ? active_count : 1);
+  float desired = selected_idx * wedge_deg;
+  float d = fmodf(desired - fmodf(ring_rot_target, 360.0f) + 540.0f, 360.0f) - 180.0f;
+  ring_rot_target += d;
   update_centre_stack();
   lv_obj_invalidate(lv_scr_act());
 }
@@ -309,9 +358,9 @@ static void select_idx(int idx) {
 // Inverse of wedge_center_angle() -- maps a tap point to a wedge index using the same angle
 // convention (atan2f already returns angle in exactly lv_draw_arc's units, since that
 // convention IS the standard x=R*cos/y=R*sin parametrization; see wedge_center_angle's comment).
-// MUST stay in lockstep with wedge_center_angle()'s (v - selected_idx) rotation: the angle here
-// is relative to the selected wedge at 12 o'clock, so the rel->absolute step below re-adds
-// selected_idx to get back to a real wedge index.
+// MUST stay in lockstep with wedge_center_angle()'s use of ring_rot -- both read the same
+// animated offset, so a tap hits the wedge that is visually under the finger even mid-animation,
+// not wherever it will end up once the ease settles.
 static int wedge_index_from_point(lv_coord_t px, lv_coord_t py) {
   if (active_count == 0) return 0;
   float dx = (float)px - EXAMPLE_LCD_H_RES / 2.0f;
@@ -319,14 +368,14 @@ static int wedge_index_from_point(lv_coord_t px, lv_coord_t py) {
   float angle = atan2f(dy, dx) * 180.0f / (float)M_PI;
   if (angle < 0.0f) angle += 360.0f;
   float wedge_deg = 360.0f / active_count;
-  int rel = (int)lroundf((angle - 270.0f) / wedge_deg);   // offset FROM the selected wedge
-  int idx = rel + selected_idx;                            // back to an absolute wedge index
-  return ((idx % active_count) + active_count) % active_count;
+  int rel = (int)lroundf((angle - 270.0f + ring_rot) / wedge_deg);
+  return ((rel % active_count) + active_count) % active_count;
 }
 
 // A tap inside the inner radius (the center label area) fires whatever the encoder currently
-// has selected, without changing the selection. A tap on the ring itself selects and fires
-// that wedge. Taps outside the outer radius (round-glass bezel) are ignored.
+// has selected, without changing the selection. A tap on the ring itself fires that wedge
+// without changing the selection either -- the knob is the only thing that moves the ring.
+// Taps outside the outer radius (round-glass bezel) are ignored.
 static void screen_click_cb(lv_event_t *e) {
   // A tap while Settings is open activates the centred item. It must NEVER fall through to
   // macros_request_fire() -- firing a macro from a menu tap is the wrong surprise on a device
@@ -373,8 +422,10 @@ static void screen_click_cb(lv_event_t *e) {
     macros_request_fire(active_positions[selected_idx]);
   } else if (dist <= RING_OUTER_R + 10) {
     int idx = wedge_index_from_point(p.x, p.y);
-    TRACE("[tap] -> wedge v=%d fire pos=%d\n", idx, active_positions[idx]);
-    select_idx(idx);
+    // Fire WITHOUT selecting. Since Task 8 the ring rotates, so select_idx() would spin the
+    // tapped wedge up to 12 o'clock -- the owner reported that as unexpected. The knob owns
+    // selection; a tap is a shortcut to fire, nothing more.
+    TRACE("[tap] -> wedge v=%d fire pos=%d (no reselect)\n", idx, active_positions[idx]);
     macros_request_fire(active_positions[idx]);
   } else {
     TRACE("[tap] -> outside ring, ignored\n");
@@ -481,6 +532,23 @@ static void update_running_pulse(void) {
     lv_obj_invalidate(lv_scr_act());
     lvgl_unlock();
   }
+}
+
+// Eases ring_rot toward ring_rot_target. Runs on the loop task under lvgl_lock(), matching
+// update_running_pulse() -- an lv_timer would run on the LVGL task and race the writes made
+// from encoder_task.
+static unsigned long last_ring_anim = 0;
+static void update_ring_rotation(void) {
+  if (ring_rot == ring_rot_target) return;
+  unsigned long now = millis();
+  if (now - last_ring_anim < 16) return;   // ~60 fps
+  last_ring_anim = now;
+  if (!lvgl_lock(50)) return;              // leave the delta pending; next tick retries
+  float diff = ring_rot_target - ring_rot;
+  if (fabsf(diff) < 0.5f) ring_rot = ring_rot_target;
+  else                    ring_rot += diff * 0.30f;   // exponential ease
+  lv_obj_invalidate(lv_scr_act());
+  lvgl_unlock();
 }
 
 // Full-screen overlay shown while ble_pairing_active() is true, on top of the ring (created
@@ -806,7 +874,7 @@ static void build_ring_ui(void) {
   centre_profile = lv_label_create(scr);
   lv_obj_set_style_text_font(centre_profile, &orbitron_14, 0);
   lv_obj_set_style_text_color(centre_profile, lv_color_white(), 0);
-  lv_obj_set_style_text_opa(centre_profile, LV_OPA_50, 0);
+  lv_obj_set_style_text_opa(centre_profile, LV_OPA_80, 0);
   lv_obj_set_width(centre_profile, 150);
   lv_obj_set_style_text_align(centre_profile, LV_TEXT_ALIGN_CENTER, 0);
   lv_label_set_long_mode(centre_profile, LV_LABEL_LONG_DOT);
@@ -857,7 +925,9 @@ static void encoder_task(void *arg) {
       // divide-by-zero, which traps and reboots the S3. Capturing a pre-lock copy would not
       // help -- a shrunk count still indexes out of range.
       if (active_count > 0) {
-        select_idx((selected_idx + delta + active_count) % active_count);
+        // MINUS delta: turning the knob clockwise spins the RING clockwise, bringing the wedge
+        // counter-clockwise of the top up to the selector. The dial is attached to the knob.
+        select_idx((selected_idx - delta + active_count) % active_count);
       }
     }
     lvgl_unlock();
@@ -980,6 +1050,7 @@ void loop() {
   update_settings();
   update_profile_switch();
   update_running_pulse();
+  update_ring_rotation();
   if (millis() - last_loop_print > 3000) {
     last_loop_print = millis();
     // any_running is the important new field: a "toggle" macro never terminates, so one left
