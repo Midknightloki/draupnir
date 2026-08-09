@@ -27,8 +27,10 @@
 // so their hot zones switch profiles rather than firing -- something that looks tappable inside
 // the fire zone must not fire a macro. INDICATOR_CX + INDICATOR_HALF_W must stay < RING_INNER_R.
 #define INDICATOR_CX      72
-#define INDICATOR_HALF_W  14
-#define INDICATOR_HALF_H  12
+#define INDICATOR_HALF_W  8
+#define INDICATOR_HALF_H  7
+// The hot zone is intentionally larger than the visual chevron -- a small hint with a generous
+// tap target, not an oversight. Do not shrink these to match INDICATOR_HALF_W/H.
 #define HOTZONE_MIN_DX    60
 #define HOTZONE_MAX_DY    40
 
@@ -288,10 +290,15 @@ static void ring_draw_event_cb(lv_event_t *e) {
   int pcount = profiles_count();
   int pidx   = profiles_active_index();
   if (pcount > 1) {
-    lv_draw_rect_dsc_t tri;            // lv_draw_polygon takes a RECT dsc, not an arc/tri one
-    lv_draw_rect_dsc_init(&tri);
-    tri.bg_color = lv_color_hex(parse_hex_color(profiles_active_color(), 0xFFFFFF));
-    tri.bg_opa   = LV_OPA_COVER;
+    // Hollow chevron, not a filled triangle -- a hint, not a control. Two rounded strokes from
+    // the apex out to the top/bottom points.
+    lv_draw_line_dsc_t chev;
+    lv_draw_line_dsc_init(&chev);
+    chev.color       = lv_color_hex(parse_hex_color(profiles_active_color(), 0xFFFFFF));
+    chev.opa         = LV_OPA_COVER;
+    chev.width       = 3;
+    chev.round_start = 1;
+    chev.round_end   = 1;
     const lv_coord_t cx = EXAMPLE_LCD_H_RES / 2;
     const lv_coord_t cy = EXAMPLE_LCD_V_RES / 2;
 
@@ -301,7 +308,8 @@ static void ring_draw_event_cb(lv_event_t *e) {
         { (lv_coord_t)(cx - INDICATOR_CX + INDICATOR_HALF_W), (lv_coord_t)(cy - INDICATOR_HALF_H) },
         { (lv_coord_t)(cx - INDICATOR_CX + INDICATOR_HALF_W), (lv_coord_t)(cy + INDICATOR_HALF_H) },
       };
-      lv_draw_polygon(draw_ctx, &tri, p, 3);
+      lv_draw_line(draw_ctx, &chev, &p[0], &p[1]);
+      lv_draw_line(draw_ctx, &chev, &p[0], &p[2]);
     }
     if (pidx < pcount - 1) {           // points right = next
       lv_point_t p[3] = {
@@ -309,7 +317,8 @@ static void ring_draw_event_cb(lv_event_t *e) {
         { (lv_coord_t)(cx + INDICATOR_CX - INDICATOR_HALF_W), (lv_coord_t)(cy - INDICATOR_HALF_H) },
         { (lv_coord_t)(cx + INDICATOR_CX - INDICATOR_HALF_W), (lv_coord_t)(cy + INDICATOR_HALF_H) },
       };
-      lv_draw_polygon(draw_ctx, &tri, p, 3);
+      lv_draw_line(draw_ctx, &chev, &p[0], &p[1]);
+      lv_draw_line(draw_ctx, &chev, &p[0], &p[2]);
     }
   }
 }
