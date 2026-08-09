@@ -808,6 +808,20 @@ static void build_ring_ui(void) {
   lv_obj_add_event_cb(scr, screen_click_cb, LV_EVENT_CLICKED, NULL);
   lv_obj_add_event_cb(scr, screen_gesture_cb, LV_EVENT_GESTURE, NULL);
 
+  // LVGL suppresses gestures entirely while a touch is scrolling something --
+  // indev_gesture() returns immediately if proc->types.pointer.scroll_obj is set, before the
+  // gesture thresholds are even consulted. lv_obj_create() makes every object scrollable by
+  // default, including the screen, and the ring's wedge labels are absolutely positioned wide
+  // enough to overflow it horizontally (chord can reach ~177 px at 4 macros, putting the
+  // 3 o'clock label's right edge near x=400 on a 360 px panel). The screen was therefore
+  // horizontally scrollable, and every horizontal swipe scrolled instead of gesturing --
+  // which is why profile switching could not be triggered at all while swipe-up, with far
+  // less vertical overflow, worked only intermittently.
+  //
+  // Nothing here is meant to scroll: the ring is hand-drawn in ring_draw_event_cb and the
+  // labels are absolutely positioned. Found by hardware testing.
+  lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
   center_label = lv_label_create(scr);
   lv_obj_set_style_text_color(center_label, lv_color_white(), 0);
   lv_obj_center(center_label);
