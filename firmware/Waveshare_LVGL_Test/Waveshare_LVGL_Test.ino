@@ -26,10 +26,10 @@
 // RING_OUTER_R there are only 8 px on a 360 px panel. That puts them in the tap-to-fire zone,
 // so their hot zones switch profiles rather than firing -- something that looks tappable inside
 // the fire zone must not fire a macro. INDICATOR_CX + INDICATOR_HALF_W must stay < RING_INNER_R.
-// Shortened for visual compactness per owner feedback: bounding box now 11x12 instead of 17x14.
+// Lengthened and thinned per owner feedback to read like a real angle bracket ❯.
 #define INDICATOR_CX      72
-#define INDICATOR_HALF_W  5    // was 8
-#define INDICATOR_HALF_H  6    // was 7
+#define INDICATOR_HALF_W  7    // was 5
+#define INDICATOR_HALF_H  9    // was 6
 // The hot zone is intentionally larger than the visual chevron -- a small hint with a generous
 // tap target, not an oversight. Do not shrink these to match INDICATOR_HALF_W/H.
 #define HOTZONE_MIN_DX    60
@@ -297,7 +297,7 @@ static void ring_draw_event_cb(lv_event_t *e) {
     lv_draw_line_dsc_init(&chev);
     chev.color       = lv_color_hex(parse_hex_color(profiles_active_color(), 0xFFFFFF));
     chev.opa         = LV_OPA_COVER;
-    chev.width       = 3;
+    chev.width       = 2;
     chev.round_start = 1;
     chev.round_end   = 1;
     const lv_coord_t cx = EXAMPLE_LCD_H_RES / 2;
@@ -910,6 +910,11 @@ void setup() {
   Serial.enableReboot(false);
   delay(2000);
   Serial.println("[diag] setup start");
+  // Build stamp. Without this there is no way to tell from a serial capture which firmware is
+  // actually on the board -- the flash pipeline is a BOOT-hold replug, an upload, and a second
+  // physical replug, and a miss at any step is silent. One wasted debugging cycle was spent
+  // asking whether a change had been flashed at all.
+  Serial.printf("[diag] build %s %s\n", __DATE__, __TIME__);
   Serial.println("[diag] host-commanded bootloader reset DISABLED (enableReboot(false))");
   hid_init();
   Serial.println("[diag] hid_init done");
