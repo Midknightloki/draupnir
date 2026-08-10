@@ -121,19 +121,15 @@ static uint32_t parse_hex_color(const char *hex, uint32_t fallback) {
   return (uint32_t)strtol(hex + offset, nullptr, 16) & 0xFFFFFF;
 }
 
-// Black or white, whichever contrasts better against `bg`. WCAG relative luminance with the
-// sRGB transfer curve; 0.179 is the crossover where black overtakes white.
-//
-// This CANNOT reach a high contrast ratio on a mid-tone colour -- measured against the shipped
-// palette the best available is 9.24:1 on #E0A030, 5.29:1 on #3080E0 and only 4.63:1 on
-// #E03030 -- and users choose these colours, so no palette work fixes it. That is precisely
-// why the authoritative name lives in the centre on black. This is the secondary cue.
-static lv_color_t contrast_on(uint32_t bg) {
-  float c[3] = { ((bg >> 16) & 0xFF) / 255.0f, ((bg >> 8) & 0xFF) / 255.0f, (bg & 0xFF) / 255.0f };
-  for (int i = 0; i < 3; i++)
-    c[i] = (c[i] <= 0.03928f) ? (c[i] / 12.92f) : powf((c[i] + 0.055f) / 1.055f, 2.4f);
-  float L = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
-  return (L > 0.179f) ? lv_color_black() : lv_color_white();
+// Mix a colour toward white by `f` (0..1). Used to light the selected wedge in its own hue
+// rather than washing it out with a neutral highlight -- macro colours are user-chosen, so any
+// fixed highlight colour is invisible on someone's palette.
+static uint32_t brighten(uint32_t c, float f) {
+  uint8_t r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+  r = (uint8_t)(r + (255.0f - r) * f);
+  g = (uint8_t)(g + (255.0f - g) * f);
+  b = (uint8_t)(b + (255.0f - b) * f);
+  return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 }
 
 #define EMPTY_SLOT_COLOR 0x242430
@@ -236,32 +232,66 @@ static void ring_draw_event_cb(lv_event_t *e) {
     dsc.width = RING_OUTER_R - RING_INNER_R;
     lv_draw_arc(draw_ctx, &dsc, &center_pt, RING_OUTER_R, (uint16_t)lroundf(start), (uint16_t)lroundf(end));
 
-    // Macro name on the wedge, in whichever of black/white contrasts better against that
-    // wedge's own colour. This is a SECONDARY cue -- the centre stack carries the authoritative
-    // name at 21:1 on black -- so the ~4.6:1 worst case here is adequate, where it was not when
-    // this was the only name on screen.
+    // Macro name on the wedge, white with a black outline so it is legible on every wedge colour
+    // without the text colour changing between wedges. This is a SECONDARY cue -- the centre
+    // stack carries the authoritative name at 21:1 on black.
     if (!macro.isNull()) {
       float rad = center * (float)M_PI / 180.0f;
       lv_coord_t lx = (lv_coord_t)(EXAMPLE_LCD_H_RES / 2.0f + RING_MID_R * cosf(rad));
       lv_coord_t ly = (lv_coord_t)(EXAMPLE_LCD_V_RES / 2.0f + RING_MID_R * sinf(rad));
+      static const int8_t OUTLINE_OFS[8][2] = {
+        {-1,-1}, {0,-1}, {1,-1}, {-1,0}, {1,0}, {-1,1}, {0,1}, {1,1},
+      };
+      const char *nm = (const char *)(macro["name"] | "?");
       lv_draw_label_dsc_t wl;
       lv_draw_label_dsc_init(&wl);
       wl.font  = &orbitron_12;
-      wl.color = contrast_on(color);
       wl.opa   = LV_OPA_COVER;
       wl.align = LV_TEXT_ALIGN_CENTER;
+
+      // Eight black copies first, then white on top. LVGL has no text stroke; this is what an
+      // outline costs. It is what makes the label legible on EVERY wedge colour instead of
+      // only on the dark ones.
+      wl.color = lv_color_black();
+      for (int o = 0; o < 8; o++) {
+        lv_area_t oa = { (lv_coord_t)(lx - 42 + OUTLINE_OFS[o][0]),
+                         (lv_coord_t)(ly -  8 + OUTLINE_OFS[o][1]),
+                         (lv_coord_t)(lx + 42 + OUTLINE_OFS[o][0]),
+                         (lv_coord_t)(ly +  8 + OUTLINE_OFS[o][1]) };
+        lv_draw_label(draw_ctx, &wl, &oa, nm, NULL);
+      }
+      wl.color = lv_color_white();
       lv_area_t wa = { (lv_coord_t)(lx - 42), (lv_coord_t)(ly - 8),
                        (lv_coord_t)(lx + 42), (lv_coord_t)(ly + 8) };
-      lv_draw_label(draw_ctx, &wl, &wa, (const char *)(macro["name"] | "?"), NULL);
+      lv_draw_label(draw_ctx, &wl, &wa, nm, NULL);
     }
 
     if (v == selected_idx) {
-      lv_draw_arc_dsc_t hl;
-      lv_draw_arc_dsc_init(&hl);
-      hl.color = lv_color_white();
-      hl.width = 4;
-      lv_draw_arc(draw_ctx, &hl, &center_pt, RING_OUTER_R, (uint16_t)lroundf(start), (uint16_t)lroundf(end));
-      lv_draw_arc(draw_ctx, &hl, &center_pt, RING_INNER_R + 4, (uint16_t)lroundf(start), (uint16_t)lroundf(end));
+      // Selection = the slice lighting up (owner mockup), not a border around it. LVGL 8 has no
+      // blur, so the glow is stacked arcs at falling opacity. lv_draw_arc's `radius` is the
+      // OUTER edge and `width` extends INWARD, so wider passes bleed toward the centre and can
+      // never overflow the panel.
+      uint32_t lit = brighten(color, 0.55f);
+      static const struct { int16_t extra; lv_opa_t opa; } SEL_GLOW[] = {
+        { 22, 28 }, { 12, 48 },
+      };
+      for (unsigned g = 0; g < sizeof(SEL_GLOW) / sizeof(SEL_GLOW[0]); g++) {
+        lv_draw_arc_dsc_t gl;
+        lv_draw_arc_dsc_init(&gl);
+        gl.color = lv_color_hex(lit);
+        gl.opa   = SEL_GLOW[g].opa;
+        gl.width = (RING_OUTER_R - RING_INNER_R) + SEL_GLOW[g].extra;
+        lv_draw_arc(draw_ctx, &gl, &center_pt, RING_OUTER_R,
+                    (uint16_t)lroundf(start), (uint16_t)lroundf(end));
+      }
+      // The wash itself -- mockup uses 24% opacity, which is 61/255.
+      lv_draw_arc_dsc_t wash;
+      lv_draw_arc_dsc_init(&wash);
+      wash.color = lv_color_hex(lit);
+      wash.opa   = 61;
+      wash.width = RING_OUTER_R - RING_INNER_R;
+      lv_draw_arc(draw_ctx, &wash, &center_pt, RING_OUTER_R,
+                  (uint16_t)lroundf(start), (uint16_t)lroundf(end));
     }
 
     // Drawn last so it wins over the white selection highlight when a wedge is both selected and
@@ -285,16 +315,21 @@ static void ring_draw_event_cb(lv_event_t *e) {
     JsonObject selm = profiles_find_macro(active_positions[selected_idx]);
     uint32_t glow = selm.isNull() ? 0xFFFFFF
                                   : parse_hex_color(selm["color"] | "#FFFFFF", 0xFFFFFF);
-    static const struct { int16_t inset; lv_opa_t opa; int16_t w; } BLOOM[] = {
-      { 0, 140, 6 }, { 6, 80, 8 }, { 14, 40, 10 }, { 24, 16, 12 },
+    // A crisp 2px ring at the wedge band's inner edge, with a soft halo bleeding both ways.
+    // Mockup construction. `radius` is the arc's OUTER edge and `width` extends inward, so each
+    // entry's span is (radius - width) .. radius.
+    static const struct { int16_t radius_ofs; int16_t w; lv_opa_t opa; } HALO[] = {
+      { 10, 24, 22 },   // spans 78..102 -- wide, faint, straddles the ring
+      {  6, 14, 45 },   // spans 84..98  -- tighter, brighter
+      {  1,  2, 255 },  // spans 91..93  -- the crisp ring itself
     };
-    for (unsigned i = 0; i < sizeof(BLOOM) / sizeof(BLOOM[0]); i++) {
+    for (unsigned i = 0; i < sizeof(HALO) / sizeof(HALO[0]); i++) {
       lv_draw_arc_dsc_t b;
       lv_draw_arc_dsc_init(&b);
       b.color = lv_color_hex(glow);
-      b.opa   = BLOOM[i].opa;
-      b.width = BLOOM[i].w;
-      lv_draw_arc(draw_ctx, &b, &center_pt, RING_INNER_R - BLOOM[i].inset, 0, 360);
+      b.opa   = HALO[i].opa;
+      b.width = HALO[i].w;
+      lv_draw_arc(draw_ctx, &b, &center_pt, RING_INNER_R + HALO[i].radius_ofs, 0, 360);
     }
   }
 
