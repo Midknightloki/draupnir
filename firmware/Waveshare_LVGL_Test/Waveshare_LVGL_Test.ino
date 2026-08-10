@@ -581,7 +581,7 @@ static void update_ring_rotation(void) {
   if (!lvgl_lock(50)) return;              // leave the delta pending; next tick retries
   float diff = ring_rot_target - ring_rot;
   if (fabsf(diff) < 0.5f) ring_rot = ring_rot_target;
-  else                    ring_rot += diff * 0.30f;   // exponential ease
+  else                    ring_rot += diff * 0.45f;   // ease (0.45f; owner requested faster post-hardware-test; 90° settles ~140ms vs 230ms at 0.30f)
   lv_obj_invalidate(lv_scr_act());
   lvgl_unlock();
 }
