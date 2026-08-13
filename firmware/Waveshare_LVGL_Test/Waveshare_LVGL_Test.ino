@@ -110,7 +110,7 @@ static volatile int8_t profile_switch_delta = 0;
 
 static int selected_idx = 0;
 static knob_handle_t s_knob = NULL;
-static EventGroupHandle_t knob_events = NULL;
+static QueueHandle_t knob_queue = nullptr;   // int8_t deltas, one per knob event
 static lv_obj_t *centre_macro   = nullptr;    // selected macro name
 static lv_obj_t *centre_profile = nullptr;    // active profile name -- always visible now, so no
                                                // separate toast is needed to say what changed.
@@ -922,19 +922,26 @@ static void build_ring_ui(void) {
   build_pairing_overlay();
 }
 
+// Callbacks run on the esp_timer task, not in an ISR -- plain xQueueSend (not the FromISR variant)
+// is correct here.
 static void _knob_left_cb(void *arg, void *data) {
-  xEventGroupSetBits(knob_events, (1 << 0));
+  int8_t d = -1;
+  if (knob_queue) xQueueSend(knob_queue, &d, 0);
 }
 static void _knob_right_cb(void *arg, void *data) {
-  xEventGroupSetBits(knob_events, (1 << 1));
+  int8_t d = +1;
+  if (knob_queue) xQueueSend(knob_queue, &d, 0);
 }
 
 static void encoder_task(void *arg) {
   for (;;) {
-    EventBits_t bits = xEventGroupWaitBits(knob_events, 0x03, pdTRUE, pdFALSE, portMAX_DELAY);
-    int delta = 0;
-    if (bits & (1 << 0)) delta -= 1;
-    if (bits & (1 << 1)) delta += 1;
+    int8_t d;
+    if (xQueueReceive(knob_queue, &d, portMAX_DELAY) != pdTRUE) continue;
+    int delta = d;
+    // Coalesce anything already queued. Unlike the event group this replaced, nothing is lost:
+    // every event contributes exactly once to the accumulated delta.
+    while (xQueueReceive(knob_queue, &d, 0) == pdTRUE) delta += d;
+    TRACE("[knob] delta=%d t=%lu\n", delta, (unsigned long)millis());
     if (delta == 0) continue;
     if (!lvgl_lock(100)) continue;
 
@@ -1060,7 +1067,7 @@ void setup() {
     Serial.println("[diag] FAILED to acquire lvgl lock");
   }
 
-  knob_events = xEventGroupCreate();
+  knob_queue = xQueueCreate(32, sizeof(int8_t));
   knob_config_t cfg = {
     .gpio_encoder_a = ENCODER_ECA_PIN,
     .gpio_encoder_b = ENCODER_ECB_PIN,
