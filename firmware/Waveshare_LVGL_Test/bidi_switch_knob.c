@@ -146,7 +146,17 @@ static void process_knob_channel(uint8_t current_level, uint8_t *prev_level,
     {
         if (current_level != *prev_level)
             *debounce_cnt = 0;
-        else
+        else if (*debounce_cnt < 255)
+            /* Saturate, don't wrap. debounce_cnt is uint8_t and ticks once per
+             * TICKS_INTERVAL (3 ms) poll while the contact is held low. Left to
+             * wrap, 256 samples = 768 ms of held contact rolls it back to 0, so
+             * a long-held click makes the release edge's ++(*debounce_cnt) >=
+             * DEBOUNCE_TICKS test read 1 >= 2 (false) instead of true, and the
+             * click is silently dropped. Measured on hardware via the raw-pin
+             * capture: A=1 B=0 at t=29546 -> A=1 B=1 at t=30314 (768 ms low)
+             * produced no knob event. Saturating is safe because debounce_cnt
+             * is only ever compared against DEBOUNCE_TICKS (2); anything at or
+             * above that threshold behaves identically. */
             (*debounce_cnt)++;
     }
     else
