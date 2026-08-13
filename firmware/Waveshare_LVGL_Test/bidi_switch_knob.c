@@ -18,7 +18,12 @@
 static const char *TAG = "Knob";
 
 #define TICKS_INTERVAL 3
-#define DEBOUNCE_TICKS 2
+
+// A detented encoder completes one full quadrature cycle per click = 4 transitions.
+// If hardware testing shows one physical click producing two events, this is too low;
+// if it shows every other click doing nothing, it is too high. It is the one number to
+// adjust, and the symptom tells you which way.
+#define KNOB_COUNTS_PER_DETENT 4
 
 #define KNOB_CHECK(a, str, ret_val)                               \
     if (!(a))                                                     \
@@ -40,14 +45,13 @@ static const char *TAG = "Knob";
 
 typedef struct Knob
 {
-    bool encoder_a_change;                          /*<! true means Encoder A phase Inverted*/
-    bool encoder_b_change;                          /*<! true means Encoder B phase Inverted*/
-    uint8_t debounce_a_cnt;                         /*!< Encoder A phase debounce count */
-    uint8_t debounce_b_cnt;                         /*!< Encoder B phase debounce count */
-    uint8_t encoder_a_level;                        /*!< Encoder A phase current level */
-    uint8_t encoder_b_level;                        /*!< Encoder B phase current Level */
+    uint8_t quad_state;                             /*!< Previous quadrature state, (A<<1)|B */
+    int8_t quad_accum;                              /*!< Sub-detent transition accumulator; carries
+                                                          the remainder across polls so a slow,
+                                                          partial turn doesn't lose movement */
     knob_event_t event;                             /*!< Current event */
-    int count_value;                                /*!< Knob count */
+    int count_value;                                /*!< Knob count, in DETENTS (net movement),
+                                                          not raw quadrature transitions */
     uint8_t (*hal_knob_level)(void *hardware_data); /*!< Get current level */
     void *encoder_a;                                /*!< Encoder A phase gpio number */
     void *encoder_b;                                /*!< Encoder B phase gpio number */
@@ -60,45 +64,49 @@ static knob_dev_t *s_head_handle = NULL;
 static esp_timer_handle_t s_knob_timer_handle;
 static bool s_is_timer_running = false;
 
-// 判定函数
-static void process_knob_channel(uint8_t current_level, uint8_t *prev_level,
-                                 uint8_t *debounce_cnt, int *count_value,
-                                 knob_event_t event, bool is_increment, knob_dev_t *knob)
-{
-    if (current_level == 0)
-    {
-        if (current_level != *prev_level)
-            *debounce_cnt = 0;
-        else
-            (*debounce_cnt)++;
-    }
-    else
-    {
-        if (current_level != *prev_level && ++(*debounce_cnt) >= DEBOUNCE_TICKS)
-        {
-            *debounce_cnt = 0;
-            *count_value += is_increment ? 1 : -1;
-            knob->event = event;
-            CALL_EVENT_CB(event);
-        }
-        else
-            *debounce_cnt = 0;
-    }
-    *prev_level = current_level;
-}
+// Quadrature transition table, indexed by (prev_state << 2) | curr_state where
+// state = (A << 1) | B. One direction walks 00->01->11->10->00, the other reverses it.
+// Entries that are 0 are either "no movement" or an ILLEGAL double transition -- the latter
+// means a bounced or missed edge, and absorbing it is the whole point of decoding phase
+// rather than counting edges per pin.
+static const int8_t QUAD_TABLE[16] = {
+   0, +1, -1,  0,
+  -1,  0,  0, +1,
+  +1,  0,  0, -1,
+   0, -1, +1,  0,
+};
 
 static void knob_handler(knob_dev_t *knob)
 {
     uint8_t pha_value = knob->hal_knob_level(knob->encoder_a);
     uint8_t phb_value = knob->hal_knob_level(knob->encoder_b);
+    uint8_t curr_state = (uint8_t)((pha_value << 1) | phb_value);
 
-    process_knob_channel(pha_value, &knob->encoder_a_level,
-                         &knob->debounce_a_cnt, &knob->count_value,
-                         KNOB_RIGHT, true, knob);
+    int8_t step = QUAD_TABLE[(knob->quad_state << 2) | curr_state];
+    knob->quad_state = curr_state;
 
-    process_knob_channel(phb_value, &knob->encoder_b_level,
-                         &knob->debounce_b_cnt, &knob->count_value,
-                         KNOB_LEFT, false, knob);
+    if (step == 0)
+    {
+        // No movement, or an illegal double transition (bounce/missed sample) -- absorbed.
+        return;
+    }
+
+    knob->quad_accum += step;
+
+    if (knob->quad_accum >= KNOB_COUNTS_PER_DETENT)
+    {
+        knob->quad_accum -= KNOB_COUNTS_PER_DETENT; // carry remainder, don't zero it
+        knob->count_value += 1;
+        knob->event = KNOB_RIGHT;
+        CALL_EVENT_CB(KNOB_RIGHT);
+    }
+    else if (knob->quad_accum <= -KNOB_COUNTS_PER_DETENT)
+    {
+        knob->quad_accum += KNOB_COUNTS_PER_DETENT; // carry remainder, don't zero it
+        knob->count_value -= 1;
+        knob->event = KNOB_LEFT;
+        CALL_EVENT_CB(KNOB_LEFT);
+    }
 }
 
 // 这是timer的回调函数，定期执行
@@ -129,8 +137,12 @@ knob_handle_t iot_knob_create(const knob_config_t *config)
     knob->encoder_a = (void *)(long)config->gpio_encoder_a;
     knob->encoder_b = (void *)(long)config->gpio_encoder_b;
 
-    knob->encoder_a_level = knob->hal_knob_level(knob->encoder_a);
-    knob->encoder_b_level = knob->hal_knob_level(knob->encoder_b);
+    {
+        uint8_t pha_value = knob->hal_knob_level(knob->encoder_a);
+        uint8_t phb_value = knob->hal_knob_level(knob->encoder_b);
+        knob->quad_state = (uint8_t)((pha_value << 1) | phb_value);
+    }
+    knob->quad_accum = 0;
 
     knob->event = KNOB_NONE;
 
