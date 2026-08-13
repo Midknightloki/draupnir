@@ -170,6 +170,29 @@ extern "C"
      */
     uint8_t knob_gpio_get_key_level(void *gpio_num);
 
+    /**
+     * @brief Diagnostic only. Pops one raw (A,B) sample transition.
+     *
+     * Records are pushed by the driver's timer callback whenever the packed pin state
+     * (A << 1) | B changes from the previously recorded sample -- this does not touch or
+     * observe the decode/debounce logic in any way, it just mirrors what the pins did.
+     *
+     * @param state Packed pin state: bit1 = A, bit0 = B.
+     * @param t_ms Millisecond timestamp (esp_timer_get_time() / 1000) of the sample.
+     * @return 1 and fills the outputs when an entry was available, 0 when the buffer is empty.
+     *
+     * Safe to call from a different task than the producer: single-producer/single-consumer
+     * ring with masked indices, no critical section needed.
+     */
+    int knob_debug_pop(uint8_t *state, uint32_t *t_ms);
+
+    /**
+     * @brief True if samples were dropped because the consumer fell behind.
+     *
+     * Sticky; cleared by this call.
+     */
+    int knob_debug_overflowed(void);
+
 #ifdef __cplusplus
 }
 #endif

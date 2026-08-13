@@ -1085,6 +1085,19 @@ void setup() {
 
 static unsigned long last_loop_print = 0;
 void loop() {
+#if DRAUPNIR_TRACE_INPUT
+  // Raw electrical picture from the knob driver's ring buffer -- drained every tick (not just
+  // when the [diag] heartbeat fires) so the buffer stays shallow and never has to overflow
+  // under normal polling. Diagnostic only; the driver's decode/debounce path is untouched.
+  {
+    uint8_t st; uint32_t t;
+    while (knob_debug_pop(&st, &t)) {
+      Serial.printf("[quad] A=%u B=%u t=%lu\n",
+                    (unsigned)((st >> 1) & 1), (unsigned)(st & 1), (unsigned long)t);
+    }
+    if (knob_debug_overflowed()) Serial.println("[quad] OVERFLOW -- samples dropped");
+  }
+#endif
   macros_update();
   ble_update();
   update_pairing_overlay();

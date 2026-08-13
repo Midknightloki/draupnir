@@ -60,6 +60,83 @@ static knob_dev_t *s_head_handle = NULL;
 static esp_timer_handle_t s_knob_timer_handle;
 static bool s_is_timer_running = false;
 
+// --- Diagnostic raw-pin ring buffer -----------------------------------------------------
+//
+// Records the packed (A,B) pin state every time it changes, independent of and without
+// touching the decode/debounce logic above. Single-producer (esp_timer task, via
+// knob_handler()) / single-consumer (loop task, via knob_debug_pop()) ring buffer. Capacity
+// is a power of two so head/tail can be masked instead of compared, which is what makes this
+// safe without a critical section: each side only ever advances its own index.
+//
+// On overflow the newest sample is dropped (not the oldest) and a sticky flag is set --
+// losing the oldest samples would destroy exactly the transition sequence we're trying to
+// read.
+#define KNOB_DEBUG_RING_CAP 128
+#define KNOB_DEBUG_RING_MASK (KNOB_DEBUG_RING_CAP - 1)
+
+typedef struct
+{
+    uint8_t state;
+    uint32_t t_ms;
+} knob_debug_sample_t;
+
+static knob_debug_sample_t s_debug_ring[KNOB_DEBUG_RING_CAP];
+static volatile uint32_t s_debug_head = 0; /*!< next slot to write (producer-owned) */
+static volatile uint32_t s_debug_tail = 0; /*!< next slot to read (consumer-owned) */
+static volatile uint8_t s_debug_overflow = 0;
+static uint8_t s_debug_last_state = 0xFF; /*!< sentinel: no sample recorded yet */
+
+static void knob_debug_record(uint8_t pha_value, uint8_t phb_value)
+{
+    uint8_t state = (uint8_t)(((pha_value & 1) << 1) | (phb_value & 1));
+    if (state == s_debug_last_state)
+    {
+        return;
+    }
+    s_debug_last_state = state;
+
+    uint32_t head = s_debug_head;
+    uint32_t next_head = head + 1;
+    if ((next_head - s_debug_tail) > KNOB_DEBUG_RING_CAP)
+    {
+        /* Buffer full: drop this newest sample, keep the unread history. */
+        s_debug_overflow = 1;
+        return;
+    }
+
+    s_debug_ring[head & KNOB_DEBUG_RING_MASK].state = state;
+    s_debug_ring[head & KNOB_DEBUG_RING_MASK].t_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    s_debug_head = next_head;
+}
+
+int knob_debug_pop(uint8_t *state, uint32_t *t_ms)
+{
+    uint32_t tail = s_debug_tail;
+    if (tail == s_debug_head)
+    {
+        return 0;
+    }
+    knob_debug_sample_t sample = s_debug_ring[tail & KNOB_DEBUG_RING_MASK];
+    s_debug_tail = tail + 1;
+    if (state)
+    {
+        *state = sample.state;
+    }
+    if (t_ms)
+    {
+        *t_ms = sample.t_ms;
+    }
+    return 1;
+}
+
+int knob_debug_overflowed(void)
+{
+    uint8_t was = s_debug_overflow;
+    s_debug_overflow = 0;
+    return was;
+}
+// --- End diagnostic raw-pin ring buffer -------------------------------------------------
+
 // 判定函数
 static void process_knob_channel(uint8_t current_level, uint8_t *prev_level,
                                  uint8_t *debounce_cnt, int *count_value,
@@ -91,6 +168,8 @@ static void knob_handler(knob_dev_t *knob)
 {
     uint8_t pha_value = knob->hal_knob_level(knob->encoder_a);
     uint8_t phb_value = knob->hal_knob_level(knob->encoder_b);
+
+    knob_debug_record(pha_value, phb_value);
 
     process_knob_channel(pha_value, &knob->encoder_a_level,
                          &knob->debounce_a_cnt, &knob->count_value,
