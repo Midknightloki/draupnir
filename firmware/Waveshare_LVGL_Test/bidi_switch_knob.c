@@ -20,6 +20,13 @@ static const char *TAG = "Knob";
 #define TICKS_INTERVAL 3
 #define DEBOUNCE_TICKS 2
 
+// Mirrors DRAUPNIR_TRACE_INPUT from trace.h. Can't just #include trace.h here: this is a plain
+// C translation unit, and trace.h pulls in <Arduino.h>, which is a C++ header (classes,
+// overloads) and will not compile under a C compiler. Keep this in sync by hand -- it only ever
+// toggles between the same two states (0/1) that trace.h defines, and both are checked into the
+// same commit whenever one changes.
+#define KNOB_DEBUG_TRACE_INPUT 0
+
 #define KNOB_CHECK(a, str, ret_val)                               \
     if (!(a))                                                     \
     {                                                             \
@@ -146,17 +153,26 @@ static void process_knob_channel(uint8_t current_level, uint8_t *prev_level,
     {
         if (current_level != *prev_level)
             *debounce_cnt = 0;
-        else if (*debounce_cnt < 255)
-            /* Saturate, don't wrap. debounce_cnt is uint8_t and ticks once per
-             * TICKS_INTERVAL (3 ms) poll while the contact is held low. Left to
-             * wrap, 256 samples = 768 ms of held contact rolls it back to 0, so
-             * a long-held click makes the release edge's ++(*debounce_cnt) >=
-             * DEBOUNCE_TICKS test read 1 >= 2 (false) instead of true, and the
-             * click is silently dropped. Measured on hardware via the raw-pin
-             * capture: A=1 B=0 at t=29546 -> A=1 B=1 at t=30314 (768 ms low)
-             * produced no knob event. Saturating is safe because debounce_cnt
-             * is only ever compared against DEBOUNCE_TICKS (2); anything at or
-             * above that threshold behaves identically. */
+        else if (*debounce_cnt < DEBOUNCE_TICKS)
+            /* Saturate at DEBOUNCE_TICKS, NOT at the uint8_t type maximum (255).
+             * debounce_cnt ticks once per TICKS_INTERVAL (3 ms) poll while the
+             * contact is held low. The release edge tests it with a PRE-increment
+             * (++(*debounce_cnt) >= DEBOUNCE_TICKS below), so whatever value we
+             * saturate at here arrives at that comparison one higher.
+             *
+             * Saturating at 255 still wraps: 255 + 1 (the release edge's own
+             * pre-increment) overflows uint8_t to 0, and 0 >= 2 is false, so a
+             * long-held click is dropped -- this is what "768 ms held contact
+             * produces no event" was, measured on hardware via the raw-pin
+             * capture (A=1 B=0 at t=29546 -> A=1 B=1 at t=30314). Saturating at
+             * 255 only moves the wrap from the increment into the comparison;
+             * it does not remove it.
+             *
+             * Saturating at DEBOUNCE_TICKS is correct because debounce_cnt is
+             * ONLY ever compared against DEBOUNCE_TICKS (2): once held long
+             * enough to reach the threshold, further held ticks must keep
+             * comparing >= true, never wrap back to false. Do not "tidy" this
+             * back to 255 -- that is the bug, not a stricter version of the fix. */
             (*debounce_cnt)++;
     }
     else
@@ -179,7 +195,12 @@ static void knob_handler(knob_dev_t *knob)
     uint8_t pha_value = knob->hal_knob_level(knob->encoder_a);
     uint8_t phb_value = knob->hal_knob_level(knob->encoder_b);
 
+#if KNOB_DEBUG_TRACE_INPUT
+    // Only the .ino's DRAUPNIR_TRACE_INPUT path ever drains this ring (knob_debug_pop() in
+    // loop()); without this gate a production build fills the ring once and then every 3 ms
+    // poll does a compare-and-drop against s_debug_last_state forever, for no consumer.
     knob_debug_record(pha_value, phb_value);
+#endif
 
     process_knob_channel(pha_value, &knob->encoder_a_level,
                          &knob->debounce_a_cnt, &knob->count_value,

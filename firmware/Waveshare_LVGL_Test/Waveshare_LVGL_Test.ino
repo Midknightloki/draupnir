@@ -121,6 +121,46 @@ static uint32_t parse_hex_color(const char *hex, uint32_t fallback) {
   return (uint32_t)strtol(hex + offset, nullptr, 16) & 0xFFFFFF;
 }
 
+// lv_draw_label does NOT clip to the lv_area_t passed to it -- that area only sets the wrap
+// width (lv_draw_label.c:109) and the alignment offset (:174); a name wider than max_w wraps to
+// a second line that paints ~14px below the box, over the ring band and the neighbouring wedge,
+// in all nine outline/fill copies. Truncate with an ellipsis instead of relying on clipping that
+// doesn't exist.
+//
+// Writes the (possibly truncated) name into out_buf and returns out_buf, so callers can pass the
+// result straight to lv_draw_label without a second copy.
+static const char *wedge_label_fit(const char *name, char *out_buf, size_t out_buf_sz, lv_coord_t max_w) {
+  if (name == nullptr) name = "?";
+  size_t len = strlen(name);
+  if (len >= out_buf_sz) len = out_buf_sz - 1;
+  memcpy(out_buf, name, len);
+  out_buf[len] = '\0';
+
+  if (lv_txt_get_width(out_buf, (uint32_t)strlen(out_buf), &orbitron_12, 0, LV_TEXT_FLAG_NONE) <= max_w) {
+    return out_buf;
+  }
+
+  // Too wide: drop characters from the end until "<what's left>..." fits, or there is nothing
+  // left to drop. Reserve room for the ellipsis up front so the loop below never has to re-check
+  // buffer space, only pixel width.
+  size_t ellipsis_room = (out_buf_sz >= 4) ? 3 : 0;
+  size_t max_keep = (out_buf_sz > ellipsis_room) ? (out_buf_sz - 1 - ellipsis_room) : 0;
+  if (len > max_keep) {
+    len = max_keep;
+    out_buf[len] = '\0';
+  }
+  while (len > 1 &&
+         lv_txt_get_width(out_buf, (uint32_t)len, &orbitron_12, 0, LV_TEXT_FLAG_NONE) > max_w) {
+    len--;
+    out_buf[len] = '\0';
+  }
+  if (ellipsis_room > 0) {
+    memcpy(out_buf + len, "...", 3);
+    out_buf[len + 3] = '\0';
+  }
+  return out_buf;
+}
+
 // Mix a colour toward white by `f` (0..1). Used to light the selected wedge in its own hue
 // rather than washing it out with a neutral highlight -- macro colours are user-chosen, so any
 // fixed highlight colour is invisible on someone's palette.
@@ -242,7 +282,11 @@ static void ring_draw_event_cb(lv_event_t *e) {
       static const int8_t OUTLINE_OFS[8][2] = {
         {-1,-1}, {0,-1}, {1,-1}, {-1,0}, {1,0}, {-1,1}, {0,1}, {1,1},
       };
-      const char *nm = (const char *)(macro["name"] | "?");
+      // lv_draw_label does NOT clip to `coords` -- coords only sets the wrap width, so an
+      // over-long name wraps to a second line that paints outside the box, nine times over,
+      // across the neighbouring wedge. Truncate to fit instead (see wedge_label_fit()).
+      char nmbuf[24];
+      const char *nm = wedge_label_fit((const char *)(macro["name"] | "?"), nmbuf, sizeof(nmbuf), 84);
       lv_draw_label_dsc_t wl;
       lv_draw_label_dsc_init(&wl);
       wl.font  = &orbitron_12;
@@ -294,9 +338,10 @@ static void ring_draw_event_cb(lv_event_t *e) {
                   (uint16_t)lroundf(start), (uint16_t)lroundf(end));
     }
 
-    // Drawn last so it wins over the white selection highlight when a wedge is both selected and
-    // running -- "running" is the more urgent state, and a macro looping unnoticed is exactly the
-    // failure this indicator exists to prevent.
+    // Drawn last so it wins over the selection wash (a brightened tint in the wedge's own hue,
+    // not white -- selection stopped being a flat white highlight in the mockup rework) when a
+    // wedge is both selected and running -- "running" is the more urgent state, and a macro
+    // looping unnoticed is exactly the failure this indicator exists to prevent.
     if (macros_is_running(active_positions[v])) {
       bool lighten = true;
       lv_opa_t opa = pulse_overlay(&lighten);
@@ -478,6 +523,17 @@ static void screen_gesture_cb(lv_event_t *e) {
   lv_indev_t *indev = lv_indev_get_act();
   if (!indev) return;
   lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+
+  // This touch is a gesture, so it is never also a tap -- whatever we decide below, including
+  // deciding to ignore it. LVGL delivers LV_EVENT_CLICKED on release regardless of the gesture
+  // (indev_proc_release, core/lv_indev.c), and wait_until_release is the only suppressor.
+  //
+  // Doing this per-branch has now failed three times: a swipe-up re-firing the macro Settings
+  // had just stopped, a no-op swipe-down FIRING a macro when nothing was running, and a swipe
+  // the handler explicitly refused activating a Settings item. There is no path where a swipe
+  // should also count as a tap, so this belongs here rather than at each accepting branch.
+  lv_indev_wait_release(indev);
+
   // LVGL delivers GESTURE or CLICKED for a touch, never both, so a gesture misfiring on
   // ordinary taps would silently swallow every macro fire. Gated by DRAUPNIR_TRACE_INPUT.
   TRACE("[tap] GESTURE dir=%d (bottom=%d) any_running=%d\n",
@@ -488,14 +544,6 @@ static void screen_gesture_cb(lv_event_t *e) {
   if (dir == LV_DIR_TOP) {
     if (ui_mode == UI_RING && !ble_pairing_active()) {
       settings_open_requested = true;
-      // Mirrors the swipe-down path below, and for the same reason: without this, the finger
-      // lifting off the screen delivers a CLICKED on whatever wedge it ended over BEFORE loop()
-      // has drained settings_open_requested and flipped ui_mode out of UI_RING, so
-      // screen_click_cb's ui_mode guard does not fire. That queues a macros_request_fire() which
-      // outlives update_settings()'s macros_stop_all() -- the macro looks stopped for one tick
-      // and then starts right back up. Suppressing the release here removes the spurious CLICKED
-      // at the source instead of making the guard downstream defensive.
-      lv_indev_wait_release(indev);
     }
     return;
   }
@@ -506,11 +554,6 @@ static void screen_gesture_cb(lv_event_t *e) {
   if (dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) {
     if (ui_mode == UI_RING && !ble_pairing_active()) {
       profile_switch_delta = (dir == LV_DIR_LEFT) ? 1 : -1;
-      // Same H1/H5-class exposure as the swipe-up path above: the finger lifting off delivers a
-      // CLICKED on whatever wedge it ended over before loop() has drained profile_switch_delta,
-      // which would queue a spurious macros_request_fire() against the profile just switched
-      // away from. Suppress the release at the source instead of guarding downstream.
-      lv_indev_wait_release(indev);
     }
     return;
   }
@@ -530,7 +573,6 @@ static void screen_gesture_cb(lv_event_t *e) {
   Serial.println("[diag] swipe down -> kill all macros");
   macros_request_stop_all();
   haptics_pulse();
-  lv_indev_wait_release(indev);
 }
 
 // The running pulse is time-driven, so something has to repaint while a macro runs. Done here
@@ -785,10 +827,15 @@ static void gauge_refresh(void) {
 
 // One NVS write per Settings session, from the loop task. state_set_brightness() skips an
 // identical write, so a session that changed nothing costs a read and no wear.
-static void settings_commit(void) {
-  if (!brightness_dirty) return;
-  state_set_brightness(current_duty);
+//
+// Split from the write itself: this only captures whether a write is needed and the value to
+// write, so callers can do it while still holding lvgl_lock() and perform the actual flash
+// write only after releasing it (see the call sites -- M4).
+static bool settings_commit_prepare(uint8_t *out_duty) {
+  if (!brightness_dirty) return false;
+  *out_duty = current_duty;
   brightness_dirty = false;
+  return true;
 }
 
 // Owns every Settings mode transition. Callbacks only raise flags (spec section 9).
@@ -798,6 +845,12 @@ static void update_settings(void) {
     // consumed the transition permanently and the overlay never appeared again.
     if (!lvgl_lock(200)) return;
     settings_open_requested = false;
+    // A CLICKED landing between loop()'s read of settings_enter_requested and this open branch
+    // can leave that flag (or a stale close request) set from the session that just ended --
+    // consumed on the NEXT open, jumping straight into the brightness editor instead of the
+    // list. Clear both here so nothing leaks across a close/reopen.
+    settings_enter_requested = false;
+    settings_close_requested = false;
 
     // Killing here rather than via macros_request_stop_all() from the gesture callback keeps
     // "Settings is open" and "nothing is running" a single transition under one lock
@@ -825,6 +878,8 @@ static void update_settings(void) {
   if (settings_enter_requested) {
     if (!lvgl_lock(200)) return;   // flag stays set; next tick retries
     settings_enter_requested = false;
+    bool commit_pending = false;
+    uint8_t commit_duty = 0;
     if (ui_mode == UI_SETTINGS_LIST) {
       ui_mode = UI_SETTINGS_EDIT;
       gauge_refresh();
@@ -835,11 +890,15 @@ static void update_settings(void) {
       ui_mode = UI_SETTINGS_LIST;
       lv_obj_add_flag(settings_edit_panel, LV_OBJ_FLAG_HIDDEN);
       lv_obj_clear_flag(settings_list_panel, LV_OBJ_FLAG_HIDDEN);
-      settings_commit();
+      commit_pending = settings_commit_prepare(&commit_duty);
       Serial.println("[diag] settings: back to list");
     }
     settings_last_activity = millis();
     lvgl_unlock();
+    // NVS write happens here, AFTER releasing lvgl_lock() -- the whole point of deferring it to
+    // the loop task was that a flash write stalls; doing it while still holding the LVGL mutex
+    // stalls the renderer exactly the same, just from inside the lock instead of outside it.
+    if (commit_pending) state_set_brightness(commit_duty);
     return;
   }
 
@@ -847,13 +906,16 @@ static void update_settings(void) {
   if (settings_close_requested || timed_out) {
     if (!lvgl_lock(200)) return;
     settings_close_requested = false;
-    settings_commit();
+    uint8_t commit_duty = 0;
+    bool commit_pending = settings_commit_prepare(&commit_duty);
     ui_mode = UI_RING;
     lv_obj_add_flag(settings_edit_panel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(settings_list_panel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(settings_overlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_invalidate(lv_scr_act());
     lvgl_unlock();
+    // Same reason as above: write after unlock, not while holding the LVGL mutex.
+    if (commit_pending) state_set_brightness(commit_duty);
     Serial.printf("[diag] settings closed (%s)\n", timed_out ? "idle timeout" : "swipe down");
   }
 }

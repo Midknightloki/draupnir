@@ -221,7 +221,7 @@ void profiles_reload() {
   activeProfileIdx = state_active_profile(0);
   JsonArray profiles = profilesDoc["profiles"];
   Serial.printf("[diag] profiles_reload: activeProfileIdx=%d numProfiles=%u\n", activeProfileIdx, profiles.isNull() ? 0 : profiles.size());
-  if (profiles.isNull() || activeProfileIdx >= (int)profiles.size()) {
+  if (profiles.isNull() || activeProfileIdx < 0 || activeProfileIdx >= (int)profiles.size()) {
     activeProfileIdx = 0;
     // Write the correction back. Clamping in RAM only left a stale out-of-range index in NVS
     // forever, re-clamped silently on every boot -- "reading it without ever writing it is the
