@@ -27,6 +27,29 @@ class _EditorPanelState extends State<EditorPanel> {
   late String _mode;
   late String _selectedIcon;
 
+  // Options for the "key" action dropdown. Displayed uppercase for readability, but a single
+  // alphabetic letter is stored lowercase (see _keyStorageValue) -- case must never be the only
+  // thing that carries Shift into the schema. Digits and named keys (ENTER, F1, ...) are
+  // case-insensitive on the firmware side (getSpecialKeyCode() upper-cases them), so they are
+  // stored exactly as displayed.
+  static const List<String> _keyDropdownOptions = [
+    'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
+    '1','2','3','4','5','6','7','8','9','0',
+    'ENTER','SPACE','TAB','ESC','BACKSPACE','DELETE',
+    'UP','DOWN','LEFT','RIGHT','PRINTSCREEN',
+    'F1','F2','F3','F4','F5','F6','F7','F8','F9','F10','F11','F12',
+  ];
+
+  /// Converts a selected dropdown option to the value persisted in the profile. A single
+  /// alphabetic letter is folded to lowercase so it can never be mistaken for an implicit Shift
+  /// by the firmware's key-press path; everything else (digits, named keys) is stored as-is.
+  static String _keyStorageValue(String option) {
+    if (option.length == 1 && option.codeUnitAt(0) >= 65 && option.codeUnitAt(0) <= 90) {
+      return option.toLowerCase();
+    }
+    return option;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -548,20 +571,20 @@ class _EditorPanelState extends State<EditorPanel> {
               Expanded(
                 child: DropdownButtonFormField<String>(
                   isExpanded: true,
-                  value: ['A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z','1','2','3','4','5','6','7','8','9','0','ENTER','SPACE','TAB','ESC','BACKSPACE','DELETE','UP','DOWN','LEFT','RIGHT','PRINTSCREEN','F1','F2','F3','F4','F5','F6','F7','F8','F9','F10','F11','F12'].contains(action['key']?.toString().toUpperCase()) ? action['key']?.toString().toUpperCase() : 'Custom',
+                  // Display value is always uppercase (matches the option labels); the stored
+                  // action['key'] may be lowercase (a letter, folded per _keyStorageValue) so
+                  // it's upper-cased here purely for matching against the display list.
+                  value: _keyDropdownOptions.contains(action['key']?.toString().toUpperCase())
+                      ? action['key']!.toString().toUpperCase()
+                      : 'Custom',
                   decoration: const InputDecoration(labelText: 'Key', isDense: true),
                   dropdownColor: AppTheme.surfaceHighlight,
-                  items: [
-                    'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
-                    '1','2','3','4','5','6','7','8','9','0',
-                    'ENTER','SPACE','TAB','ESC','BACKSPACE','DELETE',
-                    'UP','DOWN','LEFT','RIGHT','PRINTSCREEN',
-                    'F1','F2','F3','F4','F5','F6','F7','F8','F9','F10','F11','F12',
-                    'Custom'
-                  ].map((k) => DropdownMenuItem(value: k, child: Text(k))).toList(),
+                  items: [..._keyDropdownOptions, 'Custom']
+                      .map((k) => DropdownMenuItem(value: k, child: Text(k)))
+                      .toList(),
                   onChanged: (val) {
                     setState(() {
-                      if (val != 'Custom') action['key'] = val;
+                      if (val != null && val != 'Custom') action['key'] = _keyStorageValue(val);
                     });
                   },
                 ),

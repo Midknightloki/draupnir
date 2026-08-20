@@ -378,7 +378,16 @@ static void executeAction(JsonObject action) {
       if (code > 0) {
         Keyboard.press(code);
       } else {
-        Keyboard.press(keyStr[0]);
+        // Lowercase a single alphabetic key so that case can never inject a modifier.
+        // Arduino's Keyboard maps ASCII through _asciimap, where 'L' means Shift+KEY_L --
+        // so mods:["WIN"] + key:"L" silently became Win+Shift+L and Windows ignored it.
+        // Shift must come from an explicit mods entry and nowhere else.
+        //
+        // ONLY alphabetic characters are folded. Punctuation like "!" or "?" legitimately
+        // needs the shifted asciimap entry, since there is no unshifted keycode for them.
+        char c = keyStr[0];
+        if (strlen(keyStr) == 1 && c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        Keyboard.press(c);
       }
     }
     Keyboard.releaseAll();
