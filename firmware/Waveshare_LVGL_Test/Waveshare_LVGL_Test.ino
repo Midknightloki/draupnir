@@ -201,6 +201,20 @@ static uint32_t brighten(uint32_t c, float f) {
   return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 }
 
+// Picks black or white for whichever gives higher WCAG contrast against background colour `bg`.
+// Relative luminance uses the standard sRGB->linear transform; the 0.179 threshold is where
+// contrast-with-white ((1.05)/(L+0.05)) equals contrast-with-black ((L+0.05)/0.05) -- above it,
+// black wins; below it, white wins. Used for wedge icon recolour, same role contrast_on's label
+// counterpart (the black-outline-then-white fill trick) plays for text.
+static lv_color_t contrast_on(uint32_t bg) {
+  uint8_t r8 = (bg >> 16) & 0xFF, g8 = (bg >> 8) & 0xFF, b8 = bg & 0xFF;
+  float r = (r8 / 255.0f <= 0.03928f) ? (r8 / 255.0f) / 12.92f : powf((r8 / 255.0f + 0.055f) / 1.055f, 2.4f);
+  float g = (g8 / 255.0f <= 0.03928f) ? (g8 / 255.0f) / 12.92f : powf((g8 / 255.0f + 0.055f) / 1.055f, 2.4f);
+  float b = (b8 / 255.0f <= 0.03928f) ? (b8 / 255.0f) / 12.92f : powf((b8 / 255.0f + 0.055f) / 1.055f, 2.4f);
+  float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+  return (lum > 0.179f) ? lv_color_black() : lv_color_white();
+}
+
 #define EMPTY_SLOT_COLOR 0x242430
 
 // The running indicator modulates the wedge's BRIGHTNESS rather than tinting it a fixed colour.
@@ -272,6 +286,30 @@ static void rebuild_ring_layout(void) {
   Serial.printf("[diag] rebuild_ring_layout: active_count=%d\n", active_count);
 }
 
+// The app renders each Feather icon to an 18x18 monochrome bitmap and stores it as `icon_xbm`:
+// 108 hex characters = 54 bytes = 3 bytes per row. Returns false unless the string is exactly
+// that, so a malformed or absent value falls back to the name rather than drawing garbage.
+//
+// THE BIT REVERSAL IS MANDATORY. XBM is LSB-first (bit 0 is the leftmost pixel); LVGL reads
+// pos = 7 - (x & 0x7) (lv_img_decoder.c:599), which is MSB-first. Without reversing, every glyph
+// renders mirrored within each byte -- it compiles and draws SOMETHING, which is exactly how this
+// class of bug survives review.
+static bool wedge_icon_decode(const char *hex, uint8_t *out54) {
+  if (hex == nullptr || strlen(hex) != 108) return false;
+  for (int b = 0; b < 54; b++) {
+    char pair[3] = { hex[b * 2], hex[b * 2 + 1], '\0' };
+    char *end = nullptr;
+    long v = strtol(pair, &end, 16);
+    if (end != pair + 2) return false;      // non-hex character
+    uint8_t x = (uint8_t)v;
+    x = (uint8_t)(((x & 0xF0) >> 4) | ((x & 0x0F) << 4));
+    x = (uint8_t)(((x & 0xCC) >> 2) | ((x & 0x33) << 2));
+    x = (uint8_t)(((x & 0xAA) >> 1) | ((x & 0x55) << 1));
+    out54[b] = x;
+  }
+  return true;
+}
+
 // Draws the donut wedges directly on the screen every repaint (selection change, layout
 // rebuild, etc.) -- LVGL has no built-in clickable "pie slice" widget, so this hand-draws with
 // lv_draw_arc (the same primitive lv_arc uses internally) instead of per-wedge button objects.
@@ -308,35 +346,61 @@ static void ring_draw_event_cb(lv_event_t *e) {
       float rad = center * (float)M_PI / 180.0f;
       lv_coord_t lx = (lv_coord_t)(EXAMPLE_LCD_H_RES / 2.0f + RING_MID_R * cosf(rad));
       lv_coord_t ly = (lv_coord_t)(EXAMPLE_LCD_V_RES / 2.0f + RING_MID_R * sinf(rad));
-      static const int8_t OUTLINE_OFS[8][2] = {
-        {-1,-1}, {0,-1}, {1,-1}, {-1,0}, {1,0}, {-1,1}, {0,1}, {1,1},
-      };
-      // lv_draw_label does NOT clip to `coords` -- coords only sets the wrap width, so an
-      // over-long name wraps to a second line that paints outside the box, nine times over,
-      // across the neighbouring wedge. Truncate to fit instead (see wedge_label_fit()).
-      char nmbuf[24];
-      const char *nm = wedge_label_fit((const char *)(macro["name"] | "?"), nmbuf, sizeof(nmbuf), 84);
-      lv_draw_label_dsc_t wl;
-      lv_draw_label_dsc_init(&wl);
-      wl.font  = &orbitron_12;
-      wl.opa   = LV_OPA_COVER;
-      wl.align = LV_TEXT_ALIGN_CENTER;
+      uint8_t iconbits[54];
+      const char *ixbm = macro.isNull() ? nullptr : (const char *)(macro["icon_xbm"] | (const char *)nullptr);
+      if (wedge_icon_decode(ixbm, iconbits)) {
+        // ALPHA_1BIT supplies alpha only; the colour comes from recolor/recolor_opa
+        // (lv_draw_img.h:38). 18x18 is load-bearing: it is the interchange size shared with the
+        // app and the M5Dial, AND LV_IMG_BUF_SIZE_ALPHA_1BIT ((w/8)+1)*h disagrees with the
+        // decoder's stride (w+7)>>3 at any width that is a multiple of 8. Do not change it.
+        lv_img_dsc_t idata;
+        idata.header.cf         = LV_IMG_CF_ALPHA_1BIT;
+        idata.header.always_zero = 0;
+        idata.header.reserved   = 0;
+        idata.header.w          = 18;
+        idata.header.h          = 18;
+        idata.data_size         = 54;
+        idata.data              = iconbits;
 
-      // Eight black copies first, then white on top. LVGL has no text stroke; this is what an
-      // outline costs. It is what makes the label legible on EVERY wedge colour instead of
-      // only on the dark ones.
-      wl.color = lv_color_black();
-      for (int o = 0; o < 8; o++) {
-        lv_area_t oa = { (lv_coord_t)(lx - 42 + OUTLINE_OFS[o][0]),
-                         (lv_coord_t)(ly -  8 + OUTLINE_OFS[o][1]),
-                         (lv_coord_t)(lx + 42 + OUTLINE_OFS[o][0]),
-                         (lv_coord_t)(ly +  8 + OUTLINE_OFS[o][1]) };
-        lv_draw_label(draw_ctx, &wl, &oa, nm, NULL);
+        lv_draw_img_dsc_t idsc;
+        lv_draw_img_dsc_init(&idsc);
+        idsc.recolor     = contrast_on(color);
+        idsc.recolor_opa = LV_OPA_COVER;
+
+        lv_area_t ia = { (lv_coord_t)(lx - 9), (lv_coord_t)(ly - 9),
+                         (lv_coord_t)(lx + 8), (lv_coord_t)(ly + 8) };
+        lv_draw_img(draw_ctx, &idsc, &ia, &idata);
+      } else {
+        static const int8_t OUTLINE_OFS[8][2] = {
+          {-1,-1}, {0,-1}, {1,-1}, {-1,0}, {1,0}, {-1,1}, {0,1}, {1,1},
+        };
+        // lv_draw_label does NOT clip to `coords` -- coords only sets the wrap width, so an
+        // over-long name wraps to a second line that paints outside the box, nine times over,
+        // across the neighbouring wedge. Truncate to fit instead (see wedge_label_fit()).
+        char nmbuf[24];
+        const char *nm = wedge_label_fit((const char *)(macro["name"] | "?"), nmbuf, sizeof(nmbuf), 84);
+        lv_draw_label_dsc_t wl;
+        lv_draw_label_dsc_init(&wl);
+        wl.font  = &orbitron_12;
+        wl.opa   = LV_OPA_COVER;
+        wl.align = LV_TEXT_ALIGN_CENTER;
+
+        // Eight black copies first, then white on top. LVGL has no text stroke; this is what an
+        // outline costs. It is what makes the label legible on EVERY wedge colour instead of
+        // only on the dark ones.
+        wl.color = lv_color_black();
+        for (int o = 0; o < 8; o++) {
+          lv_area_t oa = { (lv_coord_t)(lx - 42 + OUTLINE_OFS[o][0]),
+                           (lv_coord_t)(ly -  8 + OUTLINE_OFS[o][1]),
+                           (lv_coord_t)(lx + 42 + OUTLINE_OFS[o][0]),
+                           (lv_coord_t)(ly +  8 + OUTLINE_OFS[o][1]) };
+          lv_draw_label(draw_ctx, &wl, &oa, nm, NULL);
+        }
+        wl.color = lv_color_white();
+        lv_area_t wa = { (lv_coord_t)(lx - 42), (lv_coord_t)(ly - 8),
+                         (lv_coord_t)(lx + 42), (lv_coord_t)(ly + 8) };
+        lv_draw_label(draw_ctx, &wl, &wa, nm, NULL);
       }
-      wl.color = lv_color_white();
-      lv_area_t wa = { (lv_coord_t)(lx - 42), (lv_coord_t)(ly - 8),
-                       (lv_coord_t)(lx + 42), (lv_coord_t)(ly + 8) };
-      lv_draw_label(draw_ctx, &wl, &wa, nm, NULL);
     }
 
     if (v == selected_idx) {
