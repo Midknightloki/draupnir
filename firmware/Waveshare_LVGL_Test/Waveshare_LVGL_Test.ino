@@ -1140,7 +1140,13 @@ static void update_settings(void) {
     return;
   }
 
-  if (ui_mode == UI_RING) return;
+  // Only the Settings modes belong to this updater. This deliberately names them rather than
+  // testing "not the ring": when UI_ROTARY was added, a `ui_mode == UI_RING` test silently
+  // started matching it too, so this function ran its idle-timeout logic against a
+  // settings_last_activity that rotary mode never updates -- forcing UI_RING every tick while
+  // update_rotary() flipped it back, and opening a window on each tick where a tap meant for
+  // "TAP TO EXIT" was dispatched to the ring and fired a macro instead.
+  if (ui_mode != UI_SETTINGS_LIST && ui_mode != UI_SETTINGS_EDIT) return;
 
   if (settings_enter_requested) {
     if (!lvgl_lock(200)) return;   // flag stays set; next tick retries

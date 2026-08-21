@@ -105,10 +105,19 @@ void macros_request_stop_all() {
   xQueueSend(fireQueue, &cmd, 0);
 }
 
+// One sentinel per detent, not per wake. encoder_task coalesces every tick queued since it last
+// woke into a single delta, which is right for the ring and the brightness gauge (both treat
+// delta as a magnitude) but would silently drop detents here -- a three-detent flick would fire
+// the bound action once. The M5Dial catches up one step per loop pass, so dropping them would be
+// a parity break.
+//
+// xQueueSend with a 0 timeout drops silently when the queue is full (depth 8, drained every
+// loop tick), which bounds a pathological spin rather than blocking the encoder task.
 void macros_request_rotary_step(int dir) {
-  if (!fireQueue) return;
+  if (!fireQueue || dir == 0) return;
   int cmd = (dir > 0) ? MACRO_CMD_ROTARY_CW : MACRO_CMD_ROTARY_CCW;
-  xQueueSend(fireQueue, &cmd, 0);
+  int steps = (dir > 0) ? dir : -dir;
+  for (int i = 0; i < steps; i++) xQueueSend(fireQueue, &cmd, 0);
 }
 bool        macros_rotary_active(void) { return rotaryActive; }
 const char *macros_rotary_name(void)   { return rotaryMacro.isNull() ? "Rotary"  : (const char *)(rotaryMacro["name"]  | "Rotary"); }
