@@ -201,19 +201,30 @@ static uint32_t brighten(uint32_t c, float f) {
   return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 }
 
-// Picks black or white for whichever gives higher WCAG contrast against background colour `bg`.
-// Relative luminance uses the standard sRGB->linear transform; the 0.179 threshold is where
+// True when `bg` is light enough that black beats white for WCAG contrast against it. Relative
+// luminance uses the standard sRGB->linear transform; the 0.179 threshold is where
 // contrast-with-white ((1.05)/(L+0.05)) equals contrast-with-black ((L+0.05)/0.05) -- above it,
-// black wins; below it, white wins. Used for wedge icon recolour, same role contrast_on's label
-// counterpart (the black-outline-then-white fill trick) plays for text.
-static lv_color_t contrast_on(uint32_t bg) {
+// black wins; below it, white wins. Single source of truth so the main colour and the shadow
+// colour (contrast_on / contrast_shadow_on below) can never disagree about which side of the
+// threshold `bg` fell on.
+static bool bg_is_light(uint32_t bg) {
   uint8_t r8 = (bg >> 16) & 0xFF, g8 = (bg >> 8) & 0xFF, b8 = bg & 0xFF;
   float r = (r8 / 255.0f <= 0.03928f) ? (r8 / 255.0f) / 12.92f : powf((r8 / 255.0f + 0.055f) / 1.055f, 2.4f);
   float g = (g8 / 255.0f <= 0.03928f) ? (g8 / 255.0f) / 12.92f : powf((g8 / 255.0f + 0.055f) / 1.055f, 2.4f);
   float b = (b8 / 255.0f <= 0.03928f) ? (b8 / 255.0f) / 12.92f : powf((b8 / 255.0f + 0.055f) / 1.055f, 2.4f);
   float lum = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-  return (lum > 0.179f) ? lv_color_black() : lv_color_white();
+  return lum > 0.179f;
 }
+
+// Picks black or white for whichever gives higher WCAG contrast against background colour `bg`.
+// Used for wedge icon recolour, same role contrast_on's label counterpart (the
+// black-outline-then-white fill trick) plays for text.
+static lv_color_t contrast_on(uint32_t bg)        { return bg_is_light(bg) ? lv_color_black() : lv_color_white(); }
+// The opposite of contrast_on -- used for the icon's one-pixel drop shadow (see
+// ring_draw_event_cb). Black-or-white alone tops out near 4.6:1 on a mid-tone wedge; the shadow
+// guarantees a hard edge on ANY user-chosen colour, at one extra draw rather than the eight the
+// label outline costs.
+static lv_color_t contrast_shadow_on(uint32_t bg) { return bg_is_light(bg) ? lv_color_white() : lv_color_black(); }
 
 #define EMPTY_SLOT_COLOR 0x242430
 
@@ -364,11 +375,23 @@ static void ring_draw_event_cb(lv_event_t *e) {
 
         lv_draw_img_dsc_t idsc;
         lv_draw_img_dsc_init(&idsc);
-        idsc.recolor     = contrast_on(color);
         idsc.recolor_opa = LV_OPA_COVER;
 
         lv_area_t ia = { (lv_coord_t)(lx - 9), (lv_coord_t)(ly - 9),
                          (lv_coord_t)(lx + 8), (lv_coord_t)(ly + 8) };
+
+        // Two passes: a one-pixel drop shadow in the opposite colour, then the glyph itself on
+        // top. Picking black-or-white by luminance alone tops out near 4.6:1 on a mid-tone
+        // wedge, so the shadow is what guarantees a hard edge on ANY user-chosen colour -- at
+        // one extra draw rather than the eight the label outline costs. `sa` is `ia` shifted by
+        // exactly +1 in both axes (still an 18px span), derived rather than re-typed so the two
+        // areas cannot drift apart.
+        lv_area_t sa = { (lv_coord_t)(ia.x1 + 1), (lv_coord_t)(ia.y1 + 1),
+                         (lv_coord_t)(ia.x2 + 1), (lv_coord_t)(ia.y2 + 1) };
+        idsc.recolor = contrast_shadow_on(color);
+        lv_draw_img(draw_ctx, &idsc, &sa, &idata);
+
+        idsc.recolor = contrast_on(color);
         lv_draw_img(draw_ctx, &idsc, &ia, &idata);
       } else {
         static const int8_t OUTLINE_OFS[8][2] = {
