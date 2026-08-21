@@ -267,6 +267,19 @@ void lcd_lvgl_Init(void)
   indev_drv.type = LV_INDEV_TYPE_POINTER;
   indev_drv.disp = disp;
   indev_drv.read_cb = example_lvgl_touch_cb;
+
+  // LVGL's stock gesture thresholds are wrong for this panel and made swipes feel broken.
+  // indev_gesture() ZEROES the accumulated travel on any poll where the finger moved less
+  // than gesture_min_velocity, so with the default of 3 a slow, deliberate swipe never
+  // reaches gesture_limit no matter how far it goes -- the counter keeps resetting under it.
+  // Measured on hardware: one swipe-up and two swipe-lefts detected across two minutes of
+  // continuous swiping. Everything downstream was working; the gestures never arrived.
+  //
+  // min_velocity 1 means only a genuinely stationary finger resets the accumulator.
+  // gesture_limit stays generous enough that an ordinary tap cannot be mistaken for a swipe.
+  indev_drv.gesture_min_velocity = 1;
+  indev_drv.gesture_limit        = 40;
+
   lv_indev_drv_register(&indev_drv);
 
   const esp_timer_create_args_t lvgl_tick_timer_args = 

@@ -20,6 +20,13 @@ static const char *TAG = "Knob";
 #define TICKS_INTERVAL 3
 #define DEBOUNCE_TICKS 2
 
+// Mirrors DRAUPNIR_TRACE_INPUT from trace.h. Can't just #include trace.h here: this is a plain
+// C translation unit, and trace.h pulls in <Arduino.h>, which is a C++ header (classes,
+// overloads) and will not compile under a C compiler. Keep this in sync by hand -- it only ever
+// toggles between the same two states (0/1) that trace.h defines, and both are checked into the
+// same commit whenever one changes.
+#define KNOB_DEBUG_TRACE_INPUT 0
+
 #define KNOB_CHECK(a, str, ret_val)                               \
     if (!(a))                                                     \
     {                                                             \
@@ -60,6 +67,83 @@ static knob_dev_t *s_head_handle = NULL;
 static esp_timer_handle_t s_knob_timer_handle;
 static bool s_is_timer_running = false;
 
+// --- Diagnostic raw-pin ring buffer -----------------------------------------------------
+//
+// Records the packed (A,B) pin state every time it changes, independent of and without
+// touching the decode/debounce logic above. Single-producer (esp_timer task, via
+// knob_handler()) / single-consumer (loop task, via knob_debug_pop()) ring buffer. Capacity
+// is a power of two so head/tail can be masked instead of compared, which is what makes this
+// safe without a critical section: each side only ever advances its own index.
+//
+// On overflow the newest sample is dropped (not the oldest) and a sticky flag is set --
+// losing the oldest samples would destroy exactly the transition sequence we're trying to
+// read.
+#define KNOB_DEBUG_RING_CAP 128
+#define KNOB_DEBUG_RING_MASK (KNOB_DEBUG_RING_CAP - 1)
+
+typedef struct
+{
+    uint8_t state;
+    uint32_t t_ms;
+} knob_debug_sample_t;
+
+static knob_debug_sample_t s_debug_ring[KNOB_DEBUG_RING_CAP];
+static volatile uint32_t s_debug_head = 0; /*!< next slot to write (producer-owned) */
+static volatile uint32_t s_debug_tail = 0; /*!< next slot to read (consumer-owned) */
+static volatile uint8_t s_debug_overflow = 0;
+static uint8_t s_debug_last_state = 0xFF; /*!< sentinel: no sample recorded yet */
+
+static void knob_debug_record(uint8_t pha_value, uint8_t phb_value)
+{
+    uint8_t state = (uint8_t)(((pha_value & 1) << 1) | (phb_value & 1));
+    if (state == s_debug_last_state)
+    {
+        return;
+    }
+    s_debug_last_state = state;
+
+    uint32_t head = s_debug_head;
+    uint32_t next_head = head + 1;
+    if ((next_head - s_debug_tail) > KNOB_DEBUG_RING_CAP)
+    {
+        /* Buffer full: drop this newest sample, keep the unread history. */
+        s_debug_overflow = 1;
+        return;
+    }
+
+    s_debug_ring[head & KNOB_DEBUG_RING_MASK].state = state;
+    s_debug_ring[head & KNOB_DEBUG_RING_MASK].t_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    s_debug_head = next_head;
+}
+
+int knob_debug_pop(uint8_t *state, uint32_t *t_ms)
+{
+    uint32_t tail = s_debug_tail;
+    if (tail == s_debug_head)
+    {
+        return 0;
+    }
+    knob_debug_sample_t sample = s_debug_ring[tail & KNOB_DEBUG_RING_MASK];
+    s_debug_tail = tail + 1;
+    if (state)
+    {
+        *state = sample.state;
+    }
+    if (t_ms)
+    {
+        *t_ms = sample.t_ms;
+    }
+    return 1;
+}
+
+int knob_debug_overflowed(void)
+{
+    uint8_t was = s_debug_overflow;
+    s_debug_overflow = 0;
+    return was;
+}
+// --- End diagnostic raw-pin ring buffer -------------------------------------------------
+
 // 判定函数
 static void process_knob_channel(uint8_t current_level, uint8_t *prev_level,
                                  uint8_t *debounce_cnt, int *count_value,
@@ -69,7 +153,26 @@ static void process_knob_channel(uint8_t current_level, uint8_t *prev_level,
     {
         if (current_level != *prev_level)
             *debounce_cnt = 0;
-        else
+        else if (*debounce_cnt < DEBOUNCE_TICKS)
+            /* Saturate at DEBOUNCE_TICKS, NOT at the uint8_t type maximum (255).
+             * debounce_cnt ticks once per TICKS_INTERVAL (3 ms) poll while the
+             * contact is held low. The release edge tests it with a PRE-increment
+             * (++(*debounce_cnt) >= DEBOUNCE_TICKS below), so whatever value we
+             * saturate at here arrives at that comparison one higher.
+             *
+             * Saturating at 255 still wraps: 255 + 1 (the release edge's own
+             * pre-increment) overflows uint8_t to 0, and 0 >= 2 is false, so a
+             * long-held click is dropped -- this is what "768 ms held contact
+             * produces no event" was, measured on hardware via the raw-pin
+             * capture (A=1 B=0 at t=29546 -> A=1 B=1 at t=30314). Saturating at
+             * 255 only moves the wrap from the increment into the comparison;
+             * it does not remove it.
+             *
+             * Saturating at DEBOUNCE_TICKS is correct because debounce_cnt is
+             * ONLY ever compared against DEBOUNCE_TICKS (2): once held long
+             * enough to reach the threshold, further held ticks must keep
+             * comparing >= true, never wrap back to false. Do not "tidy" this
+             * back to 255 -- that is the bug, not a stricter version of the fix. */
             (*debounce_cnt)++;
     }
     else
@@ -91,6 +194,13 @@ static void knob_handler(knob_dev_t *knob)
 {
     uint8_t pha_value = knob->hal_knob_level(knob->encoder_a);
     uint8_t phb_value = knob->hal_knob_level(knob->encoder_b);
+
+#if KNOB_DEBUG_TRACE_INPUT
+    // Only the .ino's DRAUPNIR_TRACE_INPUT path ever drains this ring (knob_debug_pop() in
+    // loop()); without this gate a production build fills the ring once and then every 3 ms
+    // poll does a compare-and-drop against s_debug_last_state forever, for no consumer.
+    knob_debug_record(pha_value, phb_value);
+#endif
 
     process_knob_channel(pha_value, &knob->encoder_a_level,
                          &knob->debounce_a_cnt, &knob->count_value,

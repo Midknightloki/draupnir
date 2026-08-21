@@ -1,6 +1,6 @@
 # Draupnir — Session Handoff
 
-*Written 2026-07-25. Pick up here.*
+*Written 2026-08-20. Pick up here.*
 
 This is a continuation brief for whoever works on Draupnir next — another agent, a fresh session,
 or the owner. It assumes **no prior context**.
@@ -12,8 +12,10 @@ or the owner. It assumes **no prior context**.
 | Document | What it gives you |
 |---|---|
 | `CLAUDE.md` / `AGENTS.md` | Persona, locked decisions, threading rules, FQBNs. Identical copies — **edit both together.** |
-| `docs/Draupnir_Spec.md` (v3) | The brief. Concept, hardware, data model, BLE protocol, milestones. |
-| `docs/M6_Hardening_WorkOrder.md` | The current milestone's implementation contract, with per-task verification steps. |
+| `docs/Draupnir_Spec.md` (v3) | The brief. Concept, hardware, data model, BLE protocol, milestones (§10 has the current state). |
+| `docs/superpowers/specs/2026-08-07-m7-m8-persistence-design.md` | The design this milestone was built against. |
+| `docs/superpowers/plans/2026-08-07-m7-m8-persistence.md` | The task-by-task implementation plan. |
+| `.superpowers/sdd/2026-08-07-m7-m8-persistence/progress.md` | The full execution ledger for this milestone — every task, review finding, hardware checkpoint, and owner decision, in order. This document is a summary of it; the ledger is the source of truth. |
 | `docs/Toolchain_arduino-cli.md` | **Read before touching hardware.** Board quirks below will otherwise cost you hours. |
 
 ---
@@ -24,160 +26,161 @@ Draupnir is a **USB-HID macro controller in a knob** — round touch screen plus
 driverless over USB HID, configured from a Flutter phone app over BLE. Macros show as a ring of
 colored wedges; rotate to select, tap center or tap a wedge to fire.
 
-**The immediate goal is finishing M6 — config hardening.** The device presents to the host as a
-*keyboard*, and its BLE config channel currently accepts commands from any central in radio range.
-That is arbitrary keystroke injection into the attached machine. M6 closes that, plus four other
-defects that can silently wedge or brick the device.
+**M6 (config hardening) is done.** The BLE config channel now refuses an unbonded central at the
+GATT layer — verified on hardware 2026-08-07. **M7 (NVS persistence) and M8 (on-device profile
+switching) are also done**, verified on hardware, on branch `feat/m7-m8-persistence`. M8 grew well
+past its original scope into a full ring rework; see §3.
 
-**M6 is not complete.** Code is written and flashed; the test that defines the milestone has not
-been run. See §5.
+**The immediate goal is finishing this branch.** Code is written, reviewed, flashed, and the
+final-review hardware pass is complete (§4) — all six checks passed. The sequence from here is
+M8b/M9 (icons — the ring is now shaped to receive them) and then closing the M5Dial's security
+gap, ahead of M10's comfort items. See §6.
 
 ---
 
 ## 3. Where things stand
 
-Branch `main`, 13 commits ahead of `origin/main` (**nothing has been pushed**).
+Branch `feat/m7-m8-persistence`, 28 commits ahead of `review/waveshare-m6-foundation` (base
+`a254067`, the M6 foundation branch — not `main`, which is further behind). Nothing on this branch
+has been merged yet.
+
+Highlights, oldest to newest (full detail, including every review round and hardware checkpoint,
+is in the ledger at `.superpowers/sdd/2026-08-07-m7-m8-persistence/progress.md`):
 
 ```
-fe67318  docs: Waveshare FQBN + board quirks          <- HEAD
-bfe0d4c  docs: correct two wrong BLE prescriptions
-3607a28  fix(m6): H1 — enforce BLE pairing            <- NOT yet flashed
-7ff11b7  chore: pre-existing companion-app / M5 WIP
-a2733c7  fix(m6): H7                                   <- FLASHED, RUNNING, STABLE
-798fa46  fix(m6): H6
-d2edc07  fix(m6): H5
-0c09ef8  fix(m6): H4
-c868e31  fix(m6): H3
-8051a7d  fix(m6): H2
-6373651  feat: Waveshare firmware baseline            <- bisect floor
-7f6f7cc  docs: M6 work order
-2da815e  docs: spec v3
+c21baac  feat(ui): Orbitron replaces Montserrat on the ring
+0ee54d4  feat(m7): device_state owns NVS; brightness applied at boot
+c16e77f  fix(m7): use Preferences::isKey() instead of a sentinel value
+b1c7f5e  feat(m7): Settings menu -- swipe up opens and kills macros, swipe down closes
+c256725  feat(m7): on-device brightness with a half-moon gauge
+175d3b3  fix(m7): settings panels were swallowing every tap
+085ddc6  fix(m7): swipe-up's release re-fires the macro settings just stopped
+8ef54da  feat: ship a second default profile so switching is testable
+1b335f4  feat(m8): on-device profile switching, and activeProfile finally gets a writer
+3fa8ece  feat(m8): directional profile indicators, tappable
+ba32d42  fix: tune LVGL gesture thresholds so swipes actually register
+01d6829  fix: clear LV_OBJ_FLAG_SCROLLABLE on the ring screen -- horizontal swipes never gestured
+2b3551e..e0ecec5  chevron indicator iterations (superseded by Task 8's glyph, below)
+783fab0  feat(waveshare): ring rework -- rotating ring, centre label stack, tinted bloom
+6b37127  fix: ring rework round 2 -- animated rotation, tap-fires-no-select, wedge names
+9c85c57  feat(ring): lit-wedge selection, outlined labels, crisp bloom ring
+e68b017, afcecb7  tune: ring rotation easing, per owner hardware feedback (0.30 -> 0.45 -> 0.58)
+1a36d53  fix: replace lossy knob event group with a counting queue
+b2a7aa3  fix: quadrature phase decode -- REVERTED in 3ada93d, killed the dial entirely
+f32a255  diag: raw-pin ring buffer for double-detent investigation
+cdfd3b5  fix: saturate knob debounce counter -- itself buggy, see C1 below
+88ed6f2  fix: whole-branch review findings (C1/C2/I1/I2/M3/M4/M6/M7/M9)
+5c6d52c  fix: budget the ellipsis width in wedge_label_fit() before truncation
+9ed000a  fix: stop uppercase key letters from silently injecting Shift    <- HEAD
 ```
 
-### H3 — VERIFIED ON HARDWARE 2026-07-26 ✅
-
-The use-after-free fix is **confirmed**, twice, in the exact scenario that was previously a
-guaranteed crash: a `toggle` macro actively looping when `save_profiles` triggers a reload.
-
-```
-22:17:48  [fire] fire pos=3 START mode=toggle
-22:17:50  loop alive ... any_running=1          <- macro confirmed running
-22:17:52  [ble] cmd: save_profiles
-22:17:52  [ble] save_profiles: committed 903 bytes
-22:17:52  profiles_reload: deserializeJson done, err=Ok     <- the pool realloc
-22:17:53  rebuild_ring_layout: active_count=4
-22:17:53  loop alive ... any_running=0          <- macros_stop_all() dropped the stale ref
-```
-
-Repeated at 22:18:20 with the macro having looped 22 s first. **No crash, no reset, no panic —
-no `rst:0x` line in 90 s of capture.** The `any_running` 1→0 transition immediately after each
-reload is the direct evidence: the running macro was deliberately stopped rather than left
-holding a `JsonObject` into a freed pool.
-
-No leak across cycles: resting heap 61304 → 61136 → 61128, stepping with JSON document size
-(903 → 919 bytes), not per-cycle.
-
-Also confirmed in the same session: **H4's atomic write** (`committed N bytes` — serialize to
-tmp, verify, rename) fired on every save.
-
-### Verified on hardware ✅
-
-`a2733c7` (H2–H7, **no security changes**) was flashed and confirmed working:
-
-- Boots to the ring UI correctly (owner-observed).
-- Serial shows `[diag] loop alive` every ~3 s.
-- **Heap stable at 62,752 bytes across 5 consecutive samples** — no leak, no drift.
-- No resets, no crash output.
-
-**This is a meaningful result.** The known history of unexplained resets into the ROM bootloader
-was the main risk hanging over M6. H2 (buffer bounds), H3 (use-after-free), and H4 (atomic writes)
-are all in this build and it is stable — consistent with the theory that some of that instability
-*was* those defects. Not proof, but the risk is materially lower than it was.
-
-### H1 + H3 (post-`bug_003`) — VERIFIED ON HARDWARE 2026-08-07 ✅
-
-Flashed `0b02a3f`. Captured with a serial channel that no longer resets the board (see §7).
-
-**H1 positive path.** Pairing completes with authentication and bonding:
-
-```
-[ble] show passkey: 885833
-[ble] authentication complete, encrypted=1 authenticated=1 bonded=1
-[ble] cmd: {"cmd":"get_profiles"}   -> streamed 947 bytes
-```
-
-`authenticated=1` is the important field: MITM, **not** Just Works. That empirically confirms the
-`SC_MITM_BOND` reasoning in `ble_engine.cpp` that was previously only a reading of the config —
-so the `NOTIFY_INDICATE_AUTHEN` truncation is not exploitable *in this configuration*. Bonded
-reconnect then takes **105 ms** with no passkey prompt (vs ~29 s to pair fresh).
-
-**H3 with the relocated reload.** Save arriving while a toggle macro is running:
-
-```
-any_running=1  (~24 s)
-[ble] cmd: {"cmd":"save_profiles",...}
-[ble] save_profiles: committed 919 bytes                      <- H4 atomic write
-[ble] save_profiles: written; reload deferred to the display task  <- bug_003: engine only flags
-[diag] profiles changed via BLE, reloading + rebuilding ring UI    <- .ino, under lvgl_lock
-[diag] profiles_reload: deserializeJson done, err=Ok
-[diag] rebuild_ring_layout: active_count=4
-any_running=0                                                  <- stopped across the reload
-```
-
-No crash, no reset; a later trigger ran normally. H3, H4 and the `bug_003` relocation all hold
-under the exact race they exist for.
-
-### H1 NEGATIVE TEST — PASSED ON HARDWARE 2026-08-07 ✅ (M6 done-criterion met)
-
-Run with nRF Connect as an unbonded central (OS bond forgotten first; pairing prompt declined
-on every attempt). Four connections, all `encrypted=0 authenticated=0 bonded=0`:
-
-| nRF Connect operation | Device result |
-|---|---|
-| write `0x626C6168` (`"blah"`) to RX `6E400002` | **no `[ble] cmd:` logged — ever** |
-| CCCD write `0x0100` on TX `6E400003` (×2) | never completed, no response |
-| CCCD **read** on `0x2902` | **succeeded**, returned `0x00-00` |
-
-`[ble] cmd:` count for the whole session: **zero**. An unbonded central wrote to RX and the
-command handler never received the bytes — refused at the GATT layer, not abandoned by the
-central. nRF shows no error code because Android swallows `Insufficient Authentication` and
-retries after bonding; the operation simply hangs until the bond fails and the link drops (~17 s).
-
-Precise statement of what is gated: **CCCD write is gated, CCCD read is not.** The unencrypted
-read leaks only whether notifications are enabled — no data, no control.
-
-### Just Works rejection — VERIFIED ON HARDWARE 2026-08-07 ✅ (closes the AUTHEN question)
-
-Accepting Android's `PAIRING_VARIANT: CONSENT` (Just-Works-style) does **not** yield an
-unauthenticated bond. The device rejects that association model mid-negotiation and escalates to
-passkey entry:
-
-```
-17:47:40  [ble] connected, conn_handle=1
-17:47:47  [ble] show passkey: 739528                 <- consent rejected, escalated
-17:48:19  [ble] authentication complete, encrypted=1 authenticated=1 bonded=1
-```
-
-Across every session tested, only two outcomes ever occurred: `0/0/0` when pairing was declined,
-`1/1/1` when completed. **`authenticated=0 bonded=1` was never reachable** — and that is the one
-state that would make the `NOTIFY_INDICATE_AUTHEN` truncation exploitable. The `SC_MITM_BOND`
-claim in `ble_engine.cpp` is now an observation, not an inference.
-
-> Valid only while `setAuthenticationMode()` keeps a `*_MITM_*` mode. Relax that and the CCCD is
-> genuinely unprotected against Just Works, because the AUTHEN bit still truncates away.
-
-Bonded reconnect authenticates in **121 ms** with no prompt, so the passkey is a one-time cost.
-
-### NOT verified ❌
-- **Heap across a save/reload cycle is not yet proven flat.** One cycle went 61,720 -> 61,392
-  (−328 B), consistent with a larger `profilesDoc` (919 B) rather than a leak — the same "steps
-  with document size, not per cycle" pattern seen before. One cycle cannot separate the two;
-  soak it over many.
-- H2's overflow-recovery test and H4's corruption-recovery test still have not been run.
+Everything through `9ed000a` (HEAD) has now been flashed and hardware-tested — the outstanding
+hardware pass in §4 completed 2026-08-20, all six checks passing. See §4 for exactly what that
+pass did and did not exercise.
 
 ---
 
-## 4. Hardware — read before plugging anything in
+## 4. Verified vs. not verified on hardware
+
+**This is the most important section in this document.** Do not build on anything listed as "not
+verified" as though it were confirmed.
+
+### Verified on hardware during this milestone
+
+- Orbitron rendering on the ring.
+- Brightness: JSON seed → NVS → boot → panel. The screen is visibly dimmer at a low stored value,
+  and `settings.brightness` — present in the schema since the first profile store and never
+  wired to anything — now does something.
+- The Settings menu and the brightness gauge, **including tap-to-enter and tap-to-confirm** (this
+  was a Critical finding: `lv_obj_create()` sets `LV_OBJ_FLAG_CLICKABLE` by default, and the
+  settings panels never cleared it, so a full-screen container was silently stealing every tap).
+- Exactly one NVS write per Settings session, not one per detent (`Preferences::isKey()` guards
+  it) — confirmed by serial log, and a second edit session with no change produced no write.
+- Macros stopping when Settings opens, **and staying stopped.** This took two rounds: the first
+  fix stopped the macro but a queued fire from the finger's release event immediately restarted
+  it; the second drained the pending-fire queue as part of `macros_stop_all()`.
+- Profile switching: persists across a power cycle, survives a switch away from a *running*
+  toggle macro with no crash and no `rst:0x` anywhere in the capture.
+- Swipes registering reliably, both directions. This needed two independent fixes layered on top
+  of each other — tuned gesture thresholds (`ba32d42`) and clearing `LV_OBJ_FLAG_SCROLLABLE` on
+  the ring screen (`01d6829`, the actual root cause: label overflow was making the screen
+  scrollable, and a scrolling object eats gestures before LVGL ever checks thresholds).
+- The complete ring rework (Tasks 8–10): rotating ring under a static 12 o'clock selector, centre
+  label stack, tinted selection bloom, outlined wedge labels, FontAwesome chevron indicators. The
+  owner's own words on seeing it: **"This looks great."**
+- Heap flat throughout — no drift attributable to a leak was observed at any checkpoint.
+- **The final-review fix wave and the phantom-Shift fix, confirmed 2026-08-20** (§4's "outstanding
+  hardware pass" below has the full record): a long knob hold still produces a detent; a no-op
+  swipe-down no longer fires a macro; a refused swipe inside Settings no longer activates a menu
+  item; a long macro name truncates with an ellipsis instead of smearing; brightness survives a
+  power cycle with the NVS write outside `lvgl_lock()`; and an existing `Win+L` macro now works
+  without being re-created, on both firmware and app.
+
+### NOT verified on hardware — do not imply otherwise
+
+- **Task 5's built-in second default profile.** It only regenerates on a wiped device or a
+  missing/corrupt `profiles.json`, and the owner deliberately chose to add a second profile from
+  the companion app instead, to keep their real macros. The regeneration path was validated by two
+  independent code reviews (JSON correctness, consumer codes checked against
+  `getConsumerCode()`), never exercised on the device.
+- **The debounce-counter fix's actual overflow path.** See the "outstanding hardware pass" section
+  below — the long-hold check passed, but it did not exercise the bug the fix targets.
+- **Frame pacing at 12–16 macros.** All hardware testing this milestone ran against a 4-macro
+  profile. The ring's draw callback issues up to 9 `lv_draw_label` calls per wedge per repaint, and
+  the final review turned up a detail that makes this worse than it first looked:
+  `EXAMPLE_LVGL_BUF_HEIGHT` is `V_RES / 10`, so `ring_draw_event_cb` runs once per render *stripe*,
+  not once per frame — roughly **10× the earlier back-of-envelope estimate**. Documented fallback
+  is dropping to 4 label offsets if it stutters. Nobody has loaded a 12+ macro profile onto the
+  device yet.
+
+### Outstanding hardware pass — completed 2026-08-20, all six passed
+
+All six checks below were run against a build of `9ed000a` and passed (owner, 2026-08-20). This
+confirms the final-review fix wave (`88ed6f2`, `5c6d52c` — gesture-release leak, label truncation,
+the NVS-lock change) and the phantom-Shift fix (`9ed000a`) on both the firmware and app sides.
+
+1. A long knob hold (≥ 1 s) still produces a detent (the debounce-counter fix, `88ed6f2`). **PASS
+   — but read the next paragraph before treating the fix itself as exercised.**
+2. A no-op swipe-down (nothing running) does **not** fire a macro. *This previously sent
+   keystrokes to the host* — a real regression, not a theoretical one. **PASS.**
+3. A refused swipe inside Settings does **not** activate a menu item. **PASS.**
+4. A long macro name truncates with an ellipsis rather than smearing across the neighbouring
+   wedge (`5c6d52c`). **PASS.**
+5. Brightness still survives a power cycle — a regression check on the commit that moved the NVS
+   write out from under the LVGL lock. **PASS.**
+6. An existing `Win+L` macro now works **without being re-created** (the phantom-Shift fix,
+   `9ed000a`). **PASS.**
+
+**Do not over-read check 1.** It proves a long hold does not *break* the detent — it does not
+prove the debounce fix's actual bug path was exercised. That bug needs the contact held **low**
+for more than 768 ms (a `uint8_t` counter wrapping at 256 samples of a 3 ms poll), and earlier
+measurement established that closure duration is set by the mechanical wipe of the contact, not by
+how long the owner holds the knob: the longest closure ever captured was 588 ms, even during holds
+the owner believed were much longer. So the debounce fix remains **correct by inspection** (the
+saturating-counter arithmetic was re-verified by the final review) but **unexercised in practice**
+— nothing has yet triggered the >768 ms path on real hardware, and check 1 passing does not change
+that.
+
+### Two findings — settled by measurement, do not re-litigate
+
+- **The encoder is not a quadrature device.** Raw-pin capture (2026-08-13): rest state is
+  `A=1 B=1`; one direction pulses `A` low while `B` never moves, the other direction pulses `B`
+  low while `A` never moves. It is two independent momentary contacts, not a Gray-code encoder. A
+  quadrature-decode rewrite was attempted (`b2a7aa3`) on the theory that "not currently decoded as
+  quadrature" meant "should be" — it emitted zero events across a 90 s capture and was reverted
+  (`3ada93d`). The vendor driver's edge-per-pin design is correct for this hardware. **Do not
+  attempt a quadrature decode on this board again** without new electrical evidence.
+- **~15% of detents emit two contact closures.** Measured: 29 of 189 same-direction inter-event
+  gaps under 250 ms, cleanly separated from the 39 gaps in the 400–700 ms band that are genuine
+  consecutive clicks. This is mechanical (two full closures ~240 ms apart is not healthy detent
+  behaviour), not decodable in firmware — nothing in the signal distinguishes an intentional fast
+  double-click from a bouncing switch. The owner has decided to live with it rather than add a
+  lockout window, which would also cap deliberate fast turning. **If revisited, suspect the
+  physical switch before suspecting firmware.**
+
+---
+
+## 5. Hardware — read before plugging anything in
 
 The board is a **Waveshare ESP32-S3 knob**: ESP32-S3 rev v0.2, 16 MB quad flash, 8 MB PSRAM
 (present but currently disabled), 360×360 AMOLED, CST816 touch, encoder on GPIO 8/7.
@@ -212,7 +215,12 @@ persistence.
 ### Serial capture
 
 Use `scripts/serial_capture.ps1 -Port <COM> -DurationSec <n> -LogPath <file>`.
-**Do not use `arduino-cli monitor`** — it treats non-interactive stdin as an immediate quit.
+**Do not use `arduino-cli monitor`** — it treats non-interactive stdin as an immediate quit, and
+an earlier, now-fixed bug made a plain `.NET SerialPort` capture reset the board on *close*
+(walking three of the four steps of the core's DTR/RTS bootloader-restart state machine, with the
+fourth supplied by `Close()`). Fixed firmware-side by `Serial.enableReboot(false)`
+(`Waveshare_LVGL_Test.ino:1067`) — don't remove it, and don't re-diagnose future silent-capture
+gaps as "port contention" before checking the board's enumeration first.
 
 ### Companion app — build for Android, never Windows
 
@@ -229,74 +237,159 @@ proposed Visual Studio reinstall that would have fixed nothing.
 
 ---
 
-## 5. What to do next, in order
+## 6. What to do next, in order
 
-### Step 1 — Run H2/H3/H4's functional tests against the flashed build
+### Step 1 — Final sign-off and merge
 
-The board is already running `a2733c7`. Before adding H1's variables, confirm the fixes actually
-*work*, not just that they boot. Each test is specified in the work order:
+The outstanding hardware pass (§4) is complete — all six checks passed 2026-08-20 against
+`9ed000a`.
 
-- **H3** is the cheapest and most decisive: fire the "Caps Lock" toggle macro so it loops, then
-  save profiles from the app. Pre-H3 this was a guaranteed use-after-free.
-- **H2**: save a 16-macro-with-icons profile (must succeed); then force an overflow and confirm the
-  device still answers the *next* `get_profiles` — that is the real regression test.
-- **H4**: corrupt `/profiles.json`, reboot, confirm fallback to defaults and a working ring.
+**The debounce fix's unexercised >768 ms path (§4) was ruled non-blocking**, so that decision does
+not need re-making. The fix saturates the counter at `DEBOUNCE_TICKS`, so the release edge's
+pre-increment yields 3 and passes for every hold length; the counter can never exceed 3, which
+means no wrap is reachable. That arithmetic was independently verified across three hold lengths
+including 1000 polls during the final review. What it prevents is a dropped click — an annoyance,
+not a hazard — and reproducing it requires parking the knob mid-detent to hold the contact low,
+which costs a flash cycle for near-zero information. It is recorded as correct-by-inspection and
+unexercised, and that is where it should stay unless the symptom is ever seen in the wild.
 
-### Step 2 — Flash H1 (`3607a28`) and watch for resets
+What remains is to triage the deferred-minor list in the ledger's final section — mostly cosmetic
+(the `state_set_active_profile` sentinel, `update_profile_switch`'s pre-lock read, a stale
+comment), none blocking — and hand off to `superpowers:finishing-a-development-branch`.
 
-```
-git checkout 3607a28
-arduino-cli compile --fqbn "<FQBN>" firmware/Waveshare_LVGL_Test
-arduino-cli upload -p <PORT> --fqbn "<FQBN>" firmware/Waveshare_LVGL_Test
-# then PHYSICALLY REPLUG, then capture serial
-git checkout main
-```
+### Step 2 — M8b, then M9
 
-If resets return, **walk the rollback ladder written into the `ble_init()` comment** — one step per
-flash — and report the boot reason. Do not stop at "reverted to unauthenticated and it works".
+M8b (uncap `pos`, key running-macro state by identity, bump `version: 3`) and M9 (icons on the
+ring). The ring geometry M9 will draw icons into is now settled by the Task 8–10 rework, which is
+exactly why M9 was sequenced after it rather than before. M9 should also settle the frame-pacing
+question flagged in §4 — the first natural point at which a 12+ macro profile will actually get
+loaded onto the device.
 
-### Step 3 — The negative test *(this is what "M6 done" means)*
+**M9 also picks up dial orientation**, newly scoped in by the owner. The Companion App's "Dial
+Orientation" dropdown (`companion_app/lib/screens/dashboard_screen.dart:388-402`) already writes an
+int `0..3` to `profiles.json`'s `settings.orientation`
+(`companion_app/lib/state/draupnir_state.dart:481-492`), but the **Waveshare** firmware has zero
+references to `orientation` — the dropdown is wired to nothing on the primary target. (It *is*
+wired on the **M5Dial**: `firmware/M5_M6_config/M5_M6_config.ino` already calls
+`M5Dial.Display.setRotation(orientation)` on every `save_profiles` (three call sites, e.g.
+`:869-870`), and M5GFX rotates the touch matrix along with the display in that one call. That's a
+real, working reference implementation — don't rediscover it as new work — but it doesn't transfer
+to Waveshare's raw `esp_lcd_sh8601` + CST816 stack, which has no equivalent single-call API.)
 
-From an **unbonded** device using nRF Connect or equivalent: attempt to **write the RX
-characteristic** and to **subscribe to TX notifications**. **Both must be rejected** with
-insufficient authentication/encryption.
+Start from the MADCTL answer, not from `esp_lcd`'s rotation API — that's a dead end, already ruled
+out:
 
-If either succeeds, H1 is not done regardless of how well the paired app behaves. Until this test
-passes, **do not describe the device as safe to leave plugged in.**
+- Rotation happens in the SH8601 panel via MADCTL (register `0x36`), not in software.
+  `firmware/Waveshare_LVGL_Test/lcd_bsp.c` already ships a compile-time 90° path in the panel-init
+  command list, plus a matching touch-coordinate transform in `example_lvgl_touch_cb()`:
 
-### Step 4 — Then, and only then, M7+
+  ```c
+  #ifdef EXAMPLE_Rotate_90
+    {0x36, (uint8_t[]){0x60}, 1, 0},   // MADCTL MX|MV = 90 degrees
+  #else
+    {0x36, (uint8_t[]){0x00}, 1, 0},   // MADCTL 0 degrees
+  #endif
+  ```
+  ```c
+  #ifdef EXAMPLE_Rotate_90
+    data->point.x = tp_y;
+    data->point.y = (EXAMPLE_LCD_V_RES - tp_x);
+  #else
+    data->point.x = tp_x;
+    data->point.y = tp_y;
+  #endif
+  ```
+  The work is making both runtime-selectable from `settings.orientation` and extending them to all
+  four cases.
+- **Do not use `esp_lcd`'s rotation API or LVGL's software rotation** — both are dead ends here.
+  `panel_sh8601_swap_xy()` returns `ESP_ERR_NOT_SUPPORTED` unconditionally
+  (`esp_lcd_sh8601.c:319-323`) and `mirror_y` is unsupported too (`:310`); only `mirror_x` works.
+  LVGL's `sw_rotate` would re-rotate every flush in software on a display that already renders
+  **ten stripes per frame** (`EXAMPLE_LVGL_BUF_HEIGHT = V_RES / 10`) — MADCTL is free by
+  comparison. The panel is square (360x360), so rotation needs no dimension swapping anywhere.
+- MADCTL values are the standard set: `0x00` (0°), `0x60` (90°), `0xC0` (180°), `0xA0` (270°). Only
+  `0x00` and `0x60` are proven on this hardware — confirm `0xC0`/`0xA0` on the device, don't assume
+  them. Likewise only the 90° touch transform above is known-good; the 180°/270° transforms have to
+  be derived and verified by eye, not taken on faith.
 
-NVS persistence (M7), on-device profile switching (M8), icons on the ring + encoder detent
-alignment (M9). Spec §10.
+Decisions the owner already made — do not re-litigate:
+
+1. **Applies live, on profile save.** MADCTL and the touch transform are both cheap at runtime;
+   hook the change into the existing profile-reload path, under `lvgl_lock()`.
+2. **`profiles.json` is the single source of truth — no NVS**, unlike brightness. Brightness has
+   one writer (the device) and the app round-trips a stale value on every macro edit, so NVS is
+   authoritative there with JSON as seed-only; adopting from JSON on save would stomp the knob's
+   value. Orientation will have **two** writers (app, and eventually an on-device Settings item),
+   which breaks the brightness pattern either way — skip adopting from JSON and the app's dropdown
+   does nothing; adopt it and the next app save stomps the on-device change. The only escape is the
+   device writing back to `profiles.json` through the H4 atomic-write path, at which point NVS
+   would be a redundant second copy. It also avoids leaving the app's dropdown showing a stale
+   value after an on-device change, since the app renders from `profiles.json`. Orientation changes
+   are rare and deliberate, so a ~1-2 KB atomic JSON write per change is fine — unlike brightness,
+   which moves per encoder detent.
+3. **Encoder direction does not change with orientation.** The user turns the knob from the same
+   physical position however the puck is mounted, so clockwise stays clockwise; only the display
+   and touch transform rotate.
+
+Open, not solved: whether changing MADCTL at runtime while LVGL is doing partial-refresh flushes
+(`esp_lcd_panel_draw_bitmap` over stripe regions) keeps the flush regions correct. Needs hardware
+verification; if it misbehaves, fall back to applying orientation only at boot.
+
+### Step 3 — M5Dial security gate
+
+The M5Dial firmware still has no cryptographic gate at all (§7). This has been the top follow-up
+since M6 closed the equivalent hole on the Waveshare board, and per the locked work order
+(`CLAUDE.md`), Waveshare polish work should not keep displacing it indefinitely — it goes ahead of
+M10's comfort items.
 
 ---
 
-## 6. Hard constraints — do not violate
+## 7. Hard constraints — do not violate
 
 1. **No Wi-Fi, no HTTP server, no captive portal, no web UI.** Permanently cut. If a fix seems to
    need one, it is the wrong fix.
-2. **No application-layer auth token.** H1 *removed* the `token`/`pair`/`pairingToken` scheme.
-   Security is BLE pairing + bonding + GATT permission flags. Do not reintroduce it as a fallback.
-3. **Threading rules** (spec §5): macro engine is loop()-task only; UI callbacks use
+2. **No application-layer auth token.** M6 *removed* the `token`/`pair`/`pairingToken` scheme.
+   Security is BLE pairing + bonding + GATT permission flags. Do not reintroduce it as a fallback
+   — see the pairingToken rebuttal in §8, it has already been re-litigated once by an external
+   audit and the removal held up under scrutiny.
+3. **Threading rules** (spec §5, `CLAUDE.md`): macro engine is loop()-task only; UI callbacks use
    `macros_request_fire()`; LVGL only under `lvgl_lock()`; BLE callbacks hand off via queues; stop
-   running macros before a profile reload.
-4. **Verify BLE APIs against the installed core's headers.** This build uses Bluedroid-styled class
-   names but is **NimBLE-backed**, and the wrapper keeps the Bluedroid API surface while silently
-   neutering it — `setAccessPermissions()` compiles and does nothing, `PROPERTY_*_ENC` is `0` on the
-   Bluedroid branch, `addDescriptor(BLE2902)` is discarded. All fail *silently and insecurely*.
-   This already caused two wrong prescriptions in the work order.
+   running macros (and drain the pending-fire queue — see §4) before a profile reload.
+4. **Verify BLE and LVGL APIs against the installed core's headers, don't assume.** This build uses
+   Bluedroid-styled class names but is **NimBLE-backed**, and the wrapper keeps the Bluedroid API
+   surface while silently neutering it — `setAccessPermissions()` compiles and does nothing,
+   `PROPERTY_*_ENC` is `0` on the Bluedroid branch, `addDescriptor(BLE2902)` is discarded. All fail
+   *silently and insecurely*. This already caused two wrong prescriptions during M6, and this
+   milestone's `LV_OBJ_FLAG_CLICKABLE` Critical (§4) is the same lesson applied to LVGL: a default
+   assumed rather than read from source cost a working tap-to-enter.
 5. **Do not claim hardware verification you did not perform.** State plainly what was observed and
-   what was not.
+   what was not. §4 exists because of this rule.
 
 ---
 
-## 7. Open items and known gaps
+## 8. Open items and known gaps
 
+*The detailed H1/H3 hardware verification logs and the Just Works rejection narrative that used
+to live in this section are not lost — they're in this file's git history, in the version dated
+2026-07-25. This rewrite compresses them because M6 is done; go there for the raw serial evidence.*
+
+- **`TX CCCD` notify permission is still gated on encryption, not authentication — resolved, but
+  conditionally.** `BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN` (`0x10000`) truncates away because
+  `BLECharacteristic` stores properties in a `uint16_t`; that code has not changed. What the H1
+  negative test and the Just Works rejection finding established is that this is *currently*
+  unexploitable: across every pairing session captured, only `0/0/0` (declined) or `1/1/1`
+  (completed) ever occurred — `authenticated=0 bonded=1`, the one state that would make the
+  truncation matter, was never reachable, because `setAuthenticationMode()` uses an `SC_MITM_BOND`
+  mode and the device rejects Just Works, escalating to a passkey prompt instead. **This finding is
+  void the moment authentication mode stops requiring MITM.** If a future change drops or weakens
+  the passkey prompt to make pairing friendlier, the CCCD becomes genuinely unprotected against
+  Just Works with nothing flagging it, because the truncated bit was never actually enforcing
+  anything — the MITM requirement upstream was.
 - **M5Dial firmware has no cryptographic gate.** That sketch has no `BLESecurity` setup and no
   GATT permission flags at all — config access is gated solely on `CONFIG_MODE`. The second
-  supported board still carries the vulnerability M6 exists to close. **Top follow-up.**
-  (Work order §3a.) Deferred by the board sequencing (spec §3), not by tooling — the hardware is
-  on hand.
+  supported board still carries the vulnerability M6 exists to close. **Top follow-up**, now
+  explicitly sequenced ahead of M10 (see §6 Step 5). Deferred by the board sequencing (spec §3),
+  not by tooling — the hardware is on hand.
   > **Do not close this by restoring the `pairingToken`.** An external audit (2026-08) called the
   > removal a blocking regression; it was not. The token was checked *only outside* `CONFIG_MODE`,
   > and `CONFIG_MODE` is the only mode serving config commands — so in the mode that mattered
@@ -305,57 +398,37 @@ alignment (M9). Spec §10.
   > handed the token to any central in `CONFIG_MODE` and persisted it to NVS, converting one
   > moment of physical access into permanent remote `RUN_MODE` access. Full reasoning is in the
   > header comment of `firmware/M5_M6_config/M5_M6_config.ino`.
-  > Verified against the real baseline: `origin/main:584` carries exactly that gate. (An earlier
-  > note here blamed the misread on an empty baseline — that was wrong. The PR targets `main`,
-  > which has full history, so the audit saw a genuine diff and still misjudged the direction.)
-- **TX CCCD is gated on encryption, not authentication.** `BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN`
-  (0x10000) truncates away — `BLECharacteristic` stores properties in a `uint16_t`. The argument
-  that this is harmless (`SC_MITM_BOND` won't complete Just Works, so any encrypted link is
-  authenticated) is **a reading of the config, not an observation** — the H1 negative test has
-  never been run. Don't lean on it until §5 step 3 is done. Re-flagged by the 2026-08 audit.
-- **~~Unexplained resets into the ROM bootloader~~ — SOLVED 2026-08-07, verified on hardware.**
-  It was `scripts/serial_capture.ps1`, via the core's four-state DTR/RTS bootloader-restart
-  machine: a .NET `SerialPort` open walks three steps and `Close()` supplies the fourth, so the
-  board reset **on close** — the guilty capture looked clean and the *next* one died with
-  `The port is closed`. Fixed by `Serial.enableReboot(false)`. See
-  `docs/Toolchain_arduino-cli.md`. Two prior diagnoses ("port contention, a harness quirk", and
-  a state-machine reading that cleared the script) were both wrong in the same direction —
-  treating it as noise. What settled it was checking the *board's enumeration* after a failure
-  instead of reasoning about the code. **Do that first next time.**
-  > This is the leading explanation for H1's GATT flags having been rolled back once as
-  > suspected of causing resets. Re-examine that assumption rather than inheriting it.
-- **PSRAM is disabled although 8 MB is present.** Deliberate — kept out of the M6 stability
-  diagnosis. Now that H2–H7 is confirmed stable, enabling `PSRAM=opi` is a reasonable isolated next
-  experiment; free heap is 62 KB, which is workable but not generous.
-- **500 MB microSD installed, unused.** Recommendation: keep `profiles.json` in LittleFS (internal,
-  always present, no eject/corruption risk, and H4 just hardened that path). The SD is a good home
-  for **icon assets** at M9, which is the one thing likely to outgrow internal flash.
-- **The app finds the device by scanning ONLY** (`draupnir_state.dart:248-287`) and never consults
-  `FlutterBluePlus.systemDevices`. A peripheral does not advertise while a link is open, so if
-  Android holds a stale ACL connection the scan returns nothing and the app reports "No Draupnir
-  found" — presenting as *"it paired but the app won't connect."* **Observed 2026-08-07:** the
-  app connected on the first attempt immediately after a lingering link dropped (`[ble]
-  disconnected` at 00:46:53). Fix: check `systemDevices` first, fall back to scanning. Same root
-  cause as the earlier "no way to reconnect without restarting the app" complaint.
-- **`_looksLikeAuthFailure`** in the companion app is an untested string heuristic against platform
-  GATT error text.
-- **`http` / `shared_preferences`** are now unused in `companion_app/pubspec.yaml`.
-- **H6 shipped the interim fix** (10 ms time-scoped duplicate guard) rather than inbound sequence
-  numbers, because the same app also talks to the M5Dial firmware. Documented in code. The 2026-08
-  audit re-flagged the silent-drop risk and urged prioritising seq numbers — but **check first
-  whether the guard is needed at all.** NimBLE calls `onWrite()` once per write, with none of the
-  Bluedroid prepare/execute double-dispatch the guard was written for. If that holds on hardware,
-  deleting the guard kills the silent-drop risk for free and saves a two-firmware app change.
+  > Verified against the real baseline: `origin/main:584` carries exactly that gate.
 - **Haptics remain disabled** (breaks the CST816). A three-step single-variable re-enable plan is
   written at the call site in `Waveshare_LVGL_Test.ino`. Test by tapping *and* swiping — the
   encoder kept working right through the original failure, so it proves nothing.
+- **PSRAM is disabled although 8 MB is present.** Kept out of the M6 stability diagnosis
+  originally; that diagnosis is now settled (M6 is done), so enabling `PSRAM=opi` is a reasonable
+  isolated experiment. Free heap has stayed flat all through M7/M8 (§4), which is workable but not
+  generous, especially with M9's icon assets still to come.
+- **500 MB microSD installed, unused.** Recommendation unchanged: keep `profiles.json` in LittleFS
+  (internal, always present, no eject/corruption risk). The SD is a good home for **icon assets**
+  at M9, which is the one thing likely to outgrow internal flash.
+- **The app finds the device by scanning ONLY** (`draupnir_state.dart:248-287`) and never consults
+  `FlutterBluePlus.systemDevices`. A peripheral does not advertise while a link is open, so if
+  Android holds a stale ACL connection the scan returns nothing and the app reports "No Draupnir
+  found" — presenting as *"it paired but the app won't connect."* Fix: check `systemDevices` first,
+  fall back to scanning.
+- **`_looksLikeAuthFailure`** in the companion app is an untested string heuristic against platform
+  GATT error text.
+- **`http` / `shared_preferences`** are unused in `companion_app/pubspec.yaml`.
+- **H6's duplicate-write guard** (a 10 ms time-scoped guard, shipped as the interim fix instead of
+  inbound sequence numbers because the same app also talks to the M5Dial firmware) may be
+  unnecessary under NimBLE: it was written for Bluedroid's prepare/execute double-dispatch, and
+  NimBLE calls `onWrite()` once per write. Check that on hardware before spending effort on real
+  sequence numbers — if the guard is provably dead weight, deleting it is free.
 - **Display controller discrepancy:** third-party sources describe the panel as ST77916; the
   firmware drives it with SH8601 and works. Unresolved, low priority.
 - **`firmware/Waveshare_Knob_Config/`** is a superseded Adafruit_GFX port, still untracked, with
   leftover `refactor*.py` scripts. Safe to delete once nothing is owed to it.
-- **Two long-lived branches exist and they are unrelated histories.** `main` is the real trunk and
-  is what PR #1 targets. `origin/master` is a bare "Initial commit" that holds almost none of the
-  tree, yet it is the repo's *default* branch (`origin/HEAD -> origin/master`), so tooling and
-  fresh clones land on the empty one. Diffing against `master` gives a meaningless 1,431-line
-  "all new" result — that mistake was made during this review. **Use `main`.** Worth deleting or
-  repointing `master` before it misleads anyone else.
+- **Two long-lived branches exist and they are unrelated histories.** `main` is the real trunk.
+  `origin/master` is a bare "Initial commit" that holds almost none of the tree, yet it is the
+  repo's *default* branch (`origin/HEAD -> origin/master`), so tooling and fresh clones land on the
+  empty one. Diffing against `master` gives a meaningless "all new" result. **Use `main`** (or, for
+  this milestone's own history, `review/waveshare-m6-foundation`). Worth deleting or repointing
+  `master` before it misleads anyone else.

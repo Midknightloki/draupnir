@@ -16,7 +16,7 @@ void hid_init();
 void profiles_init();
 
 // Re-reads /profiles.json (already written by a BLE save_profiles command) into profilesDoc,
-// without touching LittleFS.begin()/prefs.begin() again -- those are one-time setup calls, done
+// without touching LittleFS.begin()/state_init() again -- those are one-time setup calls, done
 // only by profiles_init(). Mirrors M5_M6_config.ino's loadProfiles(), which profiles_init()
 // itself is built on top of.
 void profiles_reload();
@@ -25,6 +25,27 @@ void profiles_reload();
 // null JsonObject (check with .isNull()) if there's no macro at that position.
 const char *profiles_active_name();
 JsonObject profiles_find_macro(int pos);
+
+// The active document's settings.brightness -- the SEED for NVS brightness, never a source of
+// truth once NVS has been written (see device_state.h). 160 if absent or out of range.
+uint8_t profiles_default_brightness();
+
+// Active profile's "color" (e.g. "#3080E0"), "#FFFFFF" if absent. Used for the ring's
+// directional profile indicators.
+const char *profiles_active_color();
+
+int profiles_count();
+int profiles_active_index();
+
+// Switches the active profile. Returns false (and does nothing) if `idx` is out of range or
+// already active. Stops every running macro first and persists the new index to NVS.
+//
+// loop()-task ONLY, same constraint as macros_fire(): it calls macros_stop_all(), which mutates
+// runningMacros[] with no locking. Every ActiveMacro also holds a JsonObject into the profile
+// being switched away from, so skipping the stop is the H3 use-after-free on a new trigger.
+//
+// The CALLER is responsible for rebuilding the ring UI afterwards, under lvgl_lock().
+bool profiles_set_active(int idx);
 
 // Serializes the whole loaded profiles.json document straight to `out` (e.g. a BLE chunk sink),
 // so callers never need direct access to the underlying JsonDocument.
@@ -56,6 +77,12 @@ bool macros_is_running(int pos);
 // This exists because every ActiveMacro holds a JsonObject referencing profilesDoc's memory
 // pool, which deserializeJson() frees and reallocates on reload; a macro still running across
 // that boundary reads freed memory on its next macros_update() tick.
+//
+// Also drains fireQueue (see macro_engine.cpp): a fire can be queued after this stop was decided
+// but before it runs, and would otherwise survive to restart the macro this call just stopped.
+// That means a fire queued behind a MACRO_CMD_STOP_ALL sentinel is discarded too, not just
+// fires queued before it -- "stop all" that lets a still-queued tap start something a moment
+// later is not stopping all.
 void macros_stop_all();
 
 // Cross-task-safe form of macros_stop_all(), for the swipe-down "kill all" gesture, whose event

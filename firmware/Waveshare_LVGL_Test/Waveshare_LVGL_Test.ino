@@ -6,6 +6,7 @@
 #include "lcd_config.h"
 #include "bidi_switch_knob.h"
 #include "macro_engine.h"
+#include "device_state.h"
 #include "ble_engine.h"
 #include "haptics.h"
 #include "trace.h"
@@ -21,26 +22,161 @@
 #define RING_MID_R ((RING_OUTER_R + RING_INNER_R) / 2)
 #define WEDGE_GAP_DEG 2.0f
 
+// Profile indicators live INSIDE the inner hole: the ring band is full of wedges, and outside
+// RING_OUTER_R there are only 8 px on a 360 px panel. That puts them in the tap-to-fire zone,
+// so their hot zones switch profiles rather than firing -- something that looks tappable inside
+// the fire zone must not fire a macro. Drawn as the real LV_SYMBOL_LEFT/RIGHT glyphs (Montserrat
+// 28, see ring_draw_event_cb) rather than hand-drawn strokes -- see the note there.
+#define INDICATOR_CX      72
+// The hot zone is intentionally larger than the visual glyph -- a small hint with a generous
+// tap target, not an oversight. Do not shrink these to match the glyph's own metrics.
+#define HOTZONE_MIN_DX    60
+#define HOTZONE_MAX_DY    40
+
 // active_positions[v] = the profiles.json "pos" (0-15) shown at wedge v. selected_idx and all
 // wedge/label indices below are in terms of v (0..active_count-1), not raw pos -- macros_fire()
 // and profiles_find_macro() still take a real pos, so callers go through active_positions[].
 static int active_positions[NUM_MACRO_SLOTS];
 static int active_count = 0;
 
-static lv_obj_t *macro_labels[NUM_MACRO_SLOTS];
-// Declared up here rather than beside the rest of the pairing UI below, because
-// rebuild_ring_layout() has to re-assert its z-order after re-creating the wedge labels (see the
-// comment there) and that function is defined earlier in this file.
-static lv_obj_t *pairing_overlay = nullptr;
+// ---- Settings menu ----------------------------------------------------------------------
+// ui_mode is owned by loop(). LVGL-task callbacks (touch, gesture) and encoder_task only ever
+// RAISE a request flag; loop() performs the transition under lvgl_lock(). Same pattern as
+// update_pairing_overlay()/update_profiles_reload(). See spec section 9.
+typedef enum { UI_RING, UI_SETTINGS_LIST, UI_SETTINGS_EDIT } ui_mode_t;
+static ui_mode_t ui_mode = UI_RING;
+
+static volatile bool settings_open_requested  = false;
+static volatile bool settings_close_requested = false;
+static volatile bool settings_enter_requested = false;
+
+static lv_obj_t *settings_overlay = nullptr;
+static lv_obj_t *settings_list_panel = nullptr;
+static lv_obj_t *settings_edit_panel = nullptr;
+static lv_obj_t *gauge_arc   = nullptr;
+static lv_obj_t *gauge_value = nullptr;
+static lv_obj_t *gauge_label = nullptr;
+static lv_obj_t *settings_rows[4];          // sized for growth; SETTINGS_ITEM_COUNT is the truth
+static int settings_sel = 0;
+static unsigned long settings_last_activity = 0;
+
+#define SETTINGS_IDLE_TIMEOUT_MS 8000
+// Vertical distance between rows. The active row sits at the exact screen centre and the others
+// are offset from it, so scrolling moves the whole column past a fixed centre -- the slot
+// machine -- rather than moving a highlight down a static list.
+#define SETTINGS_ROW_PITCH 54
+
+// Backlight duty range. The floor is deliberately NOT 0: a knob that can be turned to a black
+// screen looks bricked and leaves no way to find the setting again. Step 16 gives ~15 detents
+// across the range. Duty is linear, so the low end feels perceptually coarse; gamma is a polish
+// item, not this milestone.
+#define BRIGHTNESS_MIN  20
+#define BRIGHTNESS_MAX  255
+#define BRIGHTNESS_STEP 16
+
+static uint8_t current_duty = BRIGHTNESS_MAX;  // real value assigned in setup()
+static bool    brightness_dirty = false;
+
+static int  brightness_get(void) { return current_duty; }
+
+// Live preview ONLY. NVS is written once, when Settings closes -- never per detent, and never
+// from the LVGL task, where a flash write would stall the renderer.
+static void brightness_apply(int duty) {
+  if (duty < BRIGHTNESS_MIN) duty = BRIGHTNESS_MIN;
+  if (duty > BRIGHTNESS_MAX) duty = BRIGHTNESS_MAX;
+  current_duty = (uint8_t)duty;
+  brightness_dirty = true;
+  setUpdutySubdivide(current_duty);
+}
+
+// Settings are declared as data, not as bespoke screens, so an M10 item is one table entry.
+// Every item is currently a knob-adjusted numeric value, so no kind discriminator is needed;
+// a non-numeric setting (a buzzer on/off, say) will need a labels array added here.
+typedef struct {
+  const char *name;
+  int         min, max, step;
+  int  (*get)(void);
+  void (*apply)(int);   // live preview while the knob turns
+} setting_item_t;
+
+static const setting_item_t SETTINGS_ITEMS[] = {
+  { "Brightness", BRIGHTNESS_MIN, BRIGHTNESS_MAX, BRIGHTNESS_STEP, brightness_get, brightness_apply },
+};
+#define SETTINGS_ITEM_COUNT ((int)(sizeof(SETTINGS_ITEMS) / sizeof(SETTINGS_ITEMS[0])))
+
+// Assigned (never accumulated) by the gesture callback and zeroed by loop(), so there is no
+// cross-core read-modify-write. A very fast double-swipe may register as one switch; acceptable.
+static volatile int8_t profile_switch_delta = 0;
+
 static int selected_idx = 0;
 static knob_handle_t s_knob = NULL;
-static EventGroupHandle_t knob_events = NULL;
-static lv_obj_t *center_label;
+static QueueHandle_t knob_queue = nullptr;   // int8_t deltas, one per knob event
+static lv_obj_t *centre_macro   = nullptr;    // selected macro name
+static lv_obj_t *centre_profile = nullptr;    // active profile name -- always visible now, so no
+                                               // separate toast is needed to say what changed.
 
 static uint32_t parse_hex_color(const char *hex, uint32_t fallback) {
   if (hex == nullptr || strlen(hex) < 6) return fallback;
   int offset = (hex[0] == '#') ? 1 : 0;
   return (uint32_t)strtol(hex + offset, nullptr, 16) & 0xFFFFFF;
+}
+
+// lv_draw_label does NOT clip to the lv_area_t passed to it -- that area only sets the wrap
+// width (lv_draw_label.c:109) and the alignment offset (:174); a name wider than max_w wraps to
+// a second line that paints ~14px below the box, over the ring band and the neighbouring wedge,
+// in all nine outline/fill copies. Truncate with an ellipsis instead of relying on clipping that
+// doesn't exist.
+//
+// Writes the (possibly truncated) name into out_buf and returns out_buf, so callers can pass the
+// result straight to lv_draw_label without a second copy.
+static const char *wedge_label_fit(const char *name, char *out_buf, size_t out_buf_sz, lv_coord_t max_w) {
+  if (name == nullptr) name = "?";
+  size_t len = strlen(name);
+  if (len >= out_buf_sz) len = out_buf_sz - 1;
+  memcpy(out_buf, name, len);
+  out_buf[len] = '\0';
+
+  if (lv_txt_get_width(out_buf, (uint32_t)strlen(out_buf), &orbitron_12, 0, LV_TEXT_FLAG_NONE) <= max_w) {
+    return out_buf;
+  }
+
+  // Too wide: drop characters from the end until "<what's left>..." fits, or there is nothing
+  // left to drop. Reserve room for the ellipsis up front so the loop below never has to re-check
+  // buffer space, only pixel width.
+  size_t ellipsis_room = (out_buf_sz >= 4) ? 3 : 0;
+  size_t max_keep = (out_buf_sz > ellipsis_room) ? (out_buf_sz - 1 - ellipsis_room) : 0;
+  if (len > max_keep) {
+    len = max_keep;
+    out_buf[len] = '\0';
+  }
+
+  // Budget for the ellipsis BEFORE choosing the prefix. Measuring only the kept prefix and
+  // appending "..." afterwards overshoots by the ellipsis width -- 9 px in orbitron_12 -- which
+  // is enough to wrap, and lv_draw_label paints the wrapped line outside the box.
+  lv_coord_t ell_w = lv_txt_get_width("...", 3, &orbitron_12, 0, LV_TEXT_FLAG_NONE);
+  lv_coord_t fit_w = (max_w > ell_w) ? (lv_coord_t)(max_w - ell_w) : (lv_coord_t)0;
+
+  while (len > 1 &&
+         lv_txt_get_width(out_buf, (uint32_t)len, &orbitron_12, 0, LV_TEXT_FLAG_NONE) > fit_w) {
+    len--;
+    out_buf[len] = '\0';
+  }
+  if (ellipsis_room > 0) {
+    memcpy(out_buf + len, "...", 3);
+    out_buf[len + 3] = '\0';
+  }
+  return out_buf;
+}
+
+// Mix a colour toward white by `f` (0..1). Used to light the selected wedge in its own hue
+// rather than washing it out with a neutral highlight -- macro colours are user-chosen, so any
+// fixed highlight colour is invisible on someone's palette.
+static uint32_t brighten(uint32_t c, float f) {
+  uint8_t r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+  r = (uint8_t)(r + (255.0f - r) * f);
+  g = (uint8_t)(g + (255.0f - g) * f);
+  b = (uint8_t)(b + (255.0f - b) * f);
+  return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 }
 
 #define EMPTY_SLOT_COLOR 0x242430
@@ -78,6 +214,12 @@ static void scan_active_positions(void) {
   }
 }
 
+// Ring rotation in degrees, animated. wedge_center_angle() reads ring_rot; the selection sets
+// ring_rot_target and loop() eases toward it. A whole-wedge snap (90 deg at 4 macros) is
+// impossible to follow -- the owner read it as random rather than fast.
+static float ring_rot = 0.0f;         // current, what is drawn
+static float ring_rot_target = 0.0f;  // continuous: NOT wrapped, so easing takes the short way
+
 // Center angle (in lv_draw_arc's own angle units) of wedge v, given `count` total wedges.
 // Verified directly against lv_arc.c's own knob-placement code (the one part of LVGL
 // guaranteed to use its angle units correctly): knob_x = R*sin(angle+90) = R*cos(angle),
@@ -85,63 +227,26 @@ static void scan_active_positions(void) {
 // 3 o'clock and makes increasing angle go CLOCKWISE on screen. The +270 offset rotates that
 // so v=0 lands at 12 o'clock; since both v and the angle unit increase clockwise, no direction
 // flip is needed between them.
+// v*wedge_deg - ring_rot puts the wedge at ring_rot's own origin at the +270 point -- 12
+// o'clock -- and rotates every other wedge around it. The ring moves under a fixed selection
+// point rather than a highlight travelling around a fixed ring. When ring_rot equals
+// selected_idx*wedge_deg (the settled state), wedge selected_idx sits at 12 o'clock, matching
+// the pre-animation behaviour; mid-animation, ring_rot is whatever loop() has eased it to.
 static float wedge_center_angle(int v, int count) {
   float wedge_deg = 360.0f / count;
-  float a = fmodf(v * wedge_deg + 270.0f, 360.0f);
+  float a = fmodf(v * wedge_deg - ring_rot + 270.0f, 360.0f);
   if (a < 0.0f) a += 360.0f;
   return a;
 }
 
-// Rebuilds the label objects for the currently active macros. Safe to call again later (once
-// profile edits arrive over BLE) -- deletes any previously-created labels first.
+// Rescans the active macro set and refreshes the centre stack. No wedge objects exist any more
+// (task 8 deleted the per-wedge labels -- wedges are plain colour arcs drawn in
+// ring_draw_event_cb), so there is nothing left here to re-create or re-parent. Kept as its own
+// function, under its original name, because several callers (profile switch, BLE profile
+// reload, initial build) depend on calling it as one step.
 static void rebuild_ring_layout(void) {
-  for (int i = 0; i < NUM_MACRO_SLOTS; i++) {
-    if (macro_labels[i]) {
-      lv_obj_del(macro_labels[i]);
-      macro_labels[i] = NULL;
-    }
-  }
-
   scan_active_positions();
-  if (active_count == 0) {
-    lv_label_set_text(center_label, "(no macros)");
-    return;
-  }
-
-  float wedge_deg = 360.0f / active_count;
-  float half_span = wedge_deg / 2.0f - WEDGE_GAP_DEG / 2.0f;
-  // Chord width available at the wedge's mid-radius, so text wraps to what's actually there
-  // instead of a fixed guess -- this is what was overflowing before at 16 fixed slots.
-  float chord = 2.0f * RING_MID_R * sinf(half_span * (float)M_PI / 180.0f) - 6.0f;
-  if (chord < 20.0f) chord = 20.0f;
-
-  lv_obj_t *scr = lv_scr_act();
-  for (int v = 0; v < active_count; v++) {
-    JsonObject macro = profiles_find_macro(active_positions[v]);
-    float angle = wedge_center_angle(v, active_count);
-    float rad = angle * (float)M_PI / 180.0f;
-    float x = EXAMPLE_LCD_H_RES / 2.0f + RING_MID_R * cosf(rad);
-    float y = EXAMPLE_LCD_V_RES / 2.0f + RING_MID_R * sinf(rad);
-
-    lv_obj_t *label = lv_label_create(scr);
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(label, lv_color_white(), 0);
-    lv_obj_set_width(label, (lv_coord_t)chord);
-    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT); // single line, truncates with "..." -- never overflows vertically
-    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_text(label, macro.isNull() ? "" : (const char *)(macro["name"] | "?"));
-    lv_obj_set_pos(label, (lv_coord_t)(x - chord / 2.0f), (lv_coord_t)(y - 9));
-
-    macro_labels[v] = label;
-  }
-  // LVGL 8 draws a screen's children in insertion order, so the labels just re-created above now
-  // sit AFTER pairing_overlay in scr's child list and would paint on top of it. Since this runs
-  // on every profile save, one edit is enough to leave a later re-pair rendering the passkey
-  // overlay with macro names bleeding through it. Re-assert the overlay's z-order.
-  //
-  // Guarded because the first call comes from build_ring_ui() before build_pairing_overlay().
-  if (pairing_overlay) lv_obj_move_foreground(pairing_overlay);
-
+  update_centre_stack();
   Serial.printf("[diag] rebuild_ring_layout: active_count=%d\n", active_count);
 }
 
@@ -174,18 +279,76 @@ static void ring_draw_event_cb(lv_event_t *e) {
     dsc.width = RING_OUTER_R - RING_INNER_R;
     lv_draw_arc(draw_ctx, &dsc, &center_pt, RING_OUTER_R, (uint16_t)lroundf(start), (uint16_t)lroundf(end));
 
-    if (v == selected_idx) {
-      lv_draw_arc_dsc_t hl;
-      lv_draw_arc_dsc_init(&hl);
-      hl.color = lv_color_white();
-      hl.width = 4;
-      lv_draw_arc(draw_ctx, &hl, &center_pt, RING_OUTER_R, (uint16_t)lroundf(start), (uint16_t)lroundf(end));
-      lv_draw_arc(draw_ctx, &hl, &center_pt, RING_INNER_R + 4, (uint16_t)lroundf(start), (uint16_t)lroundf(end));
+    // Macro name on the wedge, white with a black outline so it is legible on every wedge colour
+    // without the text colour changing between wedges. This is a SECONDARY cue -- the centre
+    // stack carries the authoritative name at 21:1 on black.
+    if (!macro.isNull()) {
+      float rad = center * (float)M_PI / 180.0f;
+      lv_coord_t lx = (lv_coord_t)(EXAMPLE_LCD_H_RES / 2.0f + RING_MID_R * cosf(rad));
+      lv_coord_t ly = (lv_coord_t)(EXAMPLE_LCD_V_RES / 2.0f + RING_MID_R * sinf(rad));
+      static const int8_t OUTLINE_OFS[8][2] = {
+        {-1,-1}, {0,-1}, {1,-1}, {-1,0}, {1,0}, {-1,1}, {0,1}, {1,1},
+      };
+      // lv_draw_label does NOT clip to `coords` -- coords only sets the wrap width, so an
+      // over-long name wraps to a second line that paints outside the box, nine times over,
+      // across the neighbouring wedge. Truncate to fit instead (see wedge_label_fit()).
+      char nmbuf[24];
+      const char *nm = wedge_label_fit((const char *)(macro["name"] | "?"), nmbuf, sizeof(nmbuf), 84);
+      lv_draw_label_dsc_t wl;
+      lv_draw_label_dsc_init(&wl);
+      wl.font  = &orbitron_12;
+      wl.opa   = LV_OPA_COVER;
+      wl.align = LV_TEXT_ALIGN_CENTER;
+
+      // Eight black copies first, then white on top. LVGL has no text stroke; this is what an
+      // outline costs. It is what makes the label legible on EVERY wedge colour instead of
+      // only on the dark ones.
+      wl.color = lv_color_black();
+      for (int o = 0; o < 8; o++) {
+        lv_area_t oa = { (lv_coord_t)(lx - 42 + OUTLINE_OFS[o][0]),
+                         (lv_coord_t)(ly -  8 + OUTLINE_OFS[o][1]),
+                         (lv_coord_t)(lx + 42 + OUTLINE_OFS[o][0]),
+                         (lv_coord_t)(ly +  8 + OUTLINE_OFS[o][1]) };
+        lv_draw_label(draw_ctx, &wl, &oa, nm, NULL);
+      }
+      wl.color = lv_color_white();
+      lv_area_t wa = { (lv_coord_t)(lx - 42), (lv_coord_t)(ly - 8),
+                       (lv_coord_t)(lx + 42), (lv_coord_t)(ly + 8) };
+      lv_draw_label(draw_ctx, &wl, &wa, nm, NULL);
     }
 
-    // Drawn last so it wins over the white selection highlight when a wedge is both selected and
-    // running -- "running" is the more urgent state, and a macro looping unnoticed is exactly the
-    // failure this indicator exists to prevent.
+    if (v == selected_idx) {
+      // Selection = the slice lighting up (owner mockup), not a border around it. LVGL 8 has no
+      // blur, so the glow is stacked arcs at falling opacity. lv_draw_arc's `radius` is the
+      // OUTER edge and `width` extends INWARD, so wider passes bleed toward the centre and can
+      // never overflow the panel.
+      uint32_t lit = brighten(color, 0.55f);
+      static const struct { int16_t extra; lv_opa_t opa; } SEL_GLOW[] = {
+        { 22, 28 }, { 12, 48 },
+      };
+      for (unsigned g = 0; g < sizeof(SEL_GLOW) / sizeof(SEL_GLOW[0]); g++) {
+        lv_draw_arc_dsc_t gl;
+        lv_draw_arc_dsc_init(&gl);
+        gl.color = lv_color_hex(lit);
+        gl.opa   = SEL_GLOW[g].opa;
+        gl.width = (RING_OUTER_R - RING_INNER_R) + SEL_GLOW[g].extra;
+        lv_draw_arc(draw_ctx, &gl, &center_pt, RING_OUTER_R,
+                    (uint16_t)lroundf(start), (uint16_t)lroundf(end));
+      }
+      // The wash itself -- mockup uses 24% opacity, which is 61/255.
+      lv_draw_arc_dsc_t wash;
+      lv_draw_arc_dsc_init(&wash);
+      wash.color = lv_color_hex(lit);
+      wash.opa   = 61;
+      wash.width = RING_OUTER_R - RING_INNER_R;
+      lv_draw_arc(draw_ctx, &wash, &center_pt, RING_OUTER_R,
+                  (uint16_t)lroundf(start), (uint16_t)lroundf(end));
+    }
+
+    // Drawn last so it wins over the selection wash (a brightened tint in the wedge's own hue,
+    // not white -- selection stopped being a flat white highlight in the mockup rework) when a
+    // wedge is both selected and running -- "running" is the more urgent state, and a macro
+    // looping unnoticed is exactly the failure this indicator exists to prevent.
     if (macros_is_running(active_positions[v])) {
       bool lighten = true;
       lv_opa_t opa = pulse_overlay(&lighten);
@@ -197,23 +360,94 @@ static void ring_draw_event_cb(lv_event_t *e) {
       lv_draw_arc(draw_ctx, &run, &center_pt, RING_OUTER_R, (uint16_t)lroundf(start), (uint16_t)lroundf(end));
     }
   }
+
+  // Tinted bloom -- fakes a glow with stacked arcs, since LVGL 8 has no blur. Colour follows the
+  // SELECTED macro so the centre text and the top wedge read as one object.
+  if (active_count > 0) {
+    JsonObject selm = profiles_find_macro(active_positions[selected_idx]);
+    uint32_t glow = selm.isNull() ? 0xFFFFFF
+                                  : parse_hex_color(selm["color"] | "#FFFFFF", 0xFFFFFF);
+    // A crisp 2px ring at the wedge band's inner edge, with a soft halo bleeding both ways.
+    // Mockup construction. `radius` is the arc's OUTER edge and `width` extends inward, so each
+    // entry's span is (radius - width) .. radius.
+    static const struct { int16_t radius_ofs; int16_t w; lv_opa_t opa; } HALO[] = {
+      { 10, 24, 22 },   // spans 78..102 -- wide, faint, straddles the ring
+      {  6, 14, 45 },   // spans 84..98  -- tighter, brighter
+      {  1,  2, 255 },  // spans 91..93  -- the crisp ring itself
+    };
+    for (unsigned i = 0; i < sizeof(HALO) / sizeof(HALO[0]); i++) {
+      lv_draw_arc_dsc_t b;
+      lv_draw_arc_dsc_init(&b);
+      b.color = lv_color_hex(glow);
+      b.opa   = HALO[i].opa;
+      b.width = HALO[i].w;
+      lv_draw_arc(draw_ctx, &b, &center_pt, RING_INNER_R + HALO[i].radius_ofs, 0, 360);
+    }
+  }
+
+  // Drawn in the active profile's own colour, and only when a profile exists in that direction.
+  // screen_click_cb() gates its hot zones on the same condition, so at either end of the list a
+  // tap there falls through and fires instead of switching.
+  int pcount = profiles_count();
+  int pidx   = profiles_active_index();
+  if (pcount > 1) {
+    // A real FontAwesome chevron glyph, not hand-drawn strokes -- three iterations of tuning
+    // lv_draw_line stroke width/length/caps failed to read as a ❯; a typeface glyph has shaping
+    // two straight lines do not. LV_SYMBOL_LEFT/RIGHT are already compiled into
+    // lv_font_montserrat_28 (LV_FONT_MONTSERRAT_28 enabled in lv_conf.h for task 8).
+    const lv_coord_t cx = EXAMPLE_LCD_H_RES / 2;
+    const lv_coord_t cy = EXAMPLE_LCD_V_RES / 2;
+
+    lv_draw_label_dsc_t sym;
+    lv_draw_label_dsc_init(&sym);
+    sym.font  = &lv_font_montserrat_28;
+    sym.color = lv_color_hex(parse_hex_color(profiles_active_color(), 0xFFFFFF));
+    sym.opa   = LV_OPA_COVER;
+    sym.align = LV_TEXT_ALIGN_CENTER;
+
+    if (pidx > 0) {
+      lv_area_t a = { (lv_coord_t)(cx - INDICATOR_CX - 20), (lv_coord_t)(cy - 20),
+                      (lv_coord_t)(cx - INDICATOR_CX + 20), (lv_coord_t)(cy + 20) };
+      lv_draw_label(draw_ctx, &sym, &a, LV_SYMBOL_LEFT, NULL);
+    }
+    if (pidx < pcount - 1) {
+      lv_area_t a = { (lv_coord_t)(cx + INDICATOR_CX - 20), (lv_coord_t)(cy - 20),
+                      (lv_coord_t)(cx + INDICATOR_CX + 20), (lv_coord_t)(cy + 20) };
+      lv_draw_label(draw_ctx, &sym, &a, LV_SYMBOL_RIGHT, NULL);
+    }
+  }
 }
 
-static void update_center_label(int idx) {
-  if (active_count == 0) return;
-  JsonObject macro = profiles_find_macro(active_positions[idx]);
-  lv_label_set_text(center_label, macro.isNull() ? "?" : (const char *)(macro["name"] | "?"));
+// Call under lvgl_lock(). Both lines change together -- the macro name follows the selection,
+// the profile name follows a profile switch, and a switch changes both.
+static void update_centre_stack(void) {
+  if (active_count == 0) {
+    lv_label_set_text(centre_macro, "(no macros)");
+  } else {
+    JsonObject m = profiles_find_macro(active_positions[selected_idx]);
+    lv_label_set_text(centre_macro, m.isNull() ? "?" : (const char *)(m["name"] | "?"));
+  }
+  lv_label_set_text(centre_profile, profiles_active_name());
 }
 
 static void select_idx(int idx) {
   selected_idx = idx;
-  update_center_label(selected_idx);
+  // Shortest angular path. ring_rot_target is deliberately NOT wrapped to 0..360: wrapping it
+  // would make a 3->0 selection step animate 270 degrees the long way round.
+  float wedge_deg = 360.0f / (active_count > 0 ? active_count : 1);
+  float desired = selected_idx * wedge_deg;
+  float d = fmodf(desired - fmodf(ring_rot_target, 360.0f) + 540.0f, 360.0f) - 180.0f;
+  ring_rot_target += d;
+  update_centre_stack();
   lv_obj_invalidate(lv_scr_act());
 }
 
 // Inverse of wedge_center_angle() -- maps a tap point to a wedge index using the same angle
 // convention (atan2f already returns angle in exactly lv_draw_arc's units, since that
 // convention IS the standard x=R*cos/y=R*sin parametrization; see wedge_center_angle's comment).
+// MUST stay in lockstep with wedge_center_angle()'s use of ring_rot -- both read the same
+// animated offset, so a tap hits the wedge that is visually under the finger even mid-animation,
+// not wherever it will end up once the ease settles.
 static int wedge_index_from_point(lv_coord_t px, lv_coord_t py) {
   if (active_count == 0) return 0;
   float dx = (float)px - EXAMPLE_LCD_H_RES / 2.0f;
@@ -221,14 +455,23 @@ static int wedge_index_from_point(lv_coord_t px, lv_coord_t py) {
   float angle = atan2f(dy, dx) * 180.0f / (float)M_PI;
   if (angle < 0.0f) angle += 360.0f;
   float wedge_deg = 360.0f / active_count;
-  int idx = (int)lroundf((angle - 270.0f) / wedge_deg);
-  return ((idx % active_count) + active_count) % active_count;
+  int rel = (int)lroundf((angle - 270.0f + ring_rot) / wedge_deg);
+  return ((rel % active_count) + active_count) % active_count;
 }
 
 // A tap inside the inner radius (the center label area) fires whatever the encoder currently
-// has selected, without changing the selection. A tap on the ring itself selects and fires
-// that wedge. Taps outside the outer radius (round-glass bezel) are ignored.
+// has selected, without changing the selection. A tap on the ring itself fires that wedge
+// without changing the selection either -- the knob is the only thing that moves the ring.
+// Taps outside the outer radius (round-glass bezel) are ignored.
 static void screen_click_cb(lv_event_t *e) {
+  // A tap while Settings is open activates the centred item. It must NEVER fall through to
+  // macros_request_fire() -- firing a macro from a menu tap is the wrong surprise on a device
+  // whose whole job is sending keystrokes.
+  if (ui_mode != UI_RING) {
+    settings_enter_requested = true;
+    return;
+  }
+
   if (active_count == 0) return;
   lv_indev_t *indev = lv_indev_get_act();
   if (!indev) return;
@@ -245,12 +488,31 @@ static void screen_click_cb(lv_event_t *e) {
                 (int)p.x, (int)p.y, dist, RING_INNER_R, RING_OUTER_R, active_count);
 
   if (dist < RING_INNER_R) {
+    // The indicator hot zones. Live ONLY while their indicator is showing, so at either end of
+    // the profile list the tap falls straight through and fires as it always has. The middle
+    // ~120 px stays a comfortable fire target.
+    int pcount = profiles_count();
+    int pidx   = profiles_active_index();
+    if (fabsf(dy) < HOTZONE_MAX_DY && fabsf(dx) > HOTZONE_MIN_DX) {
+      if (dx < 0 && pidx > 0) {
+        TRACE("[tap] -> indicator prev\n");
+        profile_switch_delta = -1;
+        return;
+      }
+      if (dx > 0 && pidx < pcount - 1) {
+        TRACE("[tap] -> indicator next\n");
+        profile_switch_delta = 1;
+        return;
+      }
+    }
     TRACE("[tap] -> center, fire pos=%d\n", active_positions[selected_idx]);
     macros_request_fire(active_positions[selected_idx]);
   } else if (dist <= RING_OUTER_R + 10) {
     int idx = wedge_index_from_point(p.x, p.y);
-    TRACE("[tap] -> wedge v=%d fire pos=%d\n", idx, active_positions[idx]);
-    select_idx(idx);
+    // Fire WITHOUT selecting. Since Task 8 the ring rotates, so select_idx() would spin the
+    // tapped wedge up to 12 o'clock -- the owner reported that as unexpected. The knob owns
+    // selection; a tap is a shortcut to fire, nothing more.
+    TRACE("[tap] -> wedge v=%d fire pos=%d (no reselect)\n", idx, active_positions[idx]);
     macros_request_fire(active_positions[idx]);
   } else {
     TRACE("[tap] -> outside ring, ignored\n");
@@ -268,21 +530,56 @@ static void screen_gesture_cb(lv_event_t *e) {
   lv_indev_t *indev = lv_indev_get_act();
   if (!indev) return;
   lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+
+  // This touch is a gesture, so it is never also a tap -- whatever we decide below, including
+  // deciding to ignore it. LVGL delivers LV_EVENT_CLICKED on release regardless of the gesture
+  // (indev_proc_release, core/lv_indev.c), and wait_until_release is the only suppressor.
+  //
+  // Doing this per-branch has now failed three times: a swipe-up re-firing the macro Settings
+  // had just stopped, a no-op swipe-down FIRING a macro when nothing was running, and a swipe
+  // the handler explicitly refused activating a Settings item. There is no path where a swipe
+  // should also count as a tap, so this belongs here rather than at each accepting branch.
+  lv_indev_wait_release(indev);
+
   // LVGL delivers GESTURE or CLICKED for a touch, never both, so a gesture misfiring on
   // ordinary taps would silently swallow every macro fire. Gated by DRAUPNIR_TRACE_INPUT.
   TRACE("[tap] GESTURE dir=%d (bottom=%d) any_running=%d\n",
                 (int)dir, (int)LV_DIR_BOTTOM, (int)macros_any_running());
-  if (dir != LV_DIR_BOTTOM) return;
-  if (!macros_any_running()) return;
 
+  // Swipe UP: open Settings. Refused while the pairing overlay owns the screen -- a passkey
+  // being replaced by a menu mid-pairing is unrecoverable without restarting the pairing.
+  if (dir == LV_DIR_TOP) {
+    if (ui_mode == UI_RING && !ble_pairing_active()) {
+      settings_open_requested = true;
+    }
+    return;
+  }
+
+  // Horizontal swipes switch profiles, matching M5_M6_config.ino:1375-1380 so the same gesture
+  // means the same thing on both boards: swipe left = next, swipe right = previous.
+  // Ignored while Settings or the pairing overlay owns the screen.
+  if (dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) {
+    if (ui_mode == UI_RING && !ble_pairing_active()) {
+      profile_switch_delta = (dir == LV_DIR_LEFT) ? 1 : -1;
+    }
+    return;
+  }
+
+  if (dir != LV_DIR_BOTTOM) return;
+
+  // Swipe DOWN inside Settings closes it. Safe to overload the panic gesture here ONLY because
+  // opening Settings stopped every running macro, so nothing can be running behind the menu
+  // (spec section 5). Do not reuse it as "back" anywhere a macro could still be live.
+  if (ui_mode != UI_RING) {
+    settings_close_requested = true;
+    return;
+  }
+
+  // Swipe DOWN on the ring: unchanged kill-all.
+  if (!macros_any_running()) return;
   Serial.println("[diag] swipe down -> kill all macros");
   macros_request_stop_all();
-  haptics_pulse(); // replaces the M5Dial's buzzer blip: eyes-free confirmation the gesture took
-
-  // Suppress the rest of this touch so the release does not also land as a CLICKED event on
-  // whatever wedge the finger happens to end over -- otherwise killing everything could
-  // immediately re-fire a macro.
-  lv_indev_wait_release(indev);
+  haptics_pulse();
 }
 
 // The running pulse is time-driven, so something has to repaint while a macro runs. Done here
@@ -321,10 +618,27 @@ static void update_running_pulse(void) {
   }
 }
 
+// Eases ring_rot toward ring_rot_target. Runs on the loop task under lvgl_lock(), matching
+// update_running_pulse() -- an lv_timer would run on the LVGL task and race the writes made
+// from encoder_task.
+static unsigned long last_ring_anim = 0;
+static void update_ring_rotation(void) {
+  if (ring_rot == ring_rot_target) return;
+  unsigned long now = millis();
+  if (now - last_ring_anim < 16) return;   // ~60 fps
+  last_ring_anim = now;
+  if (!lvgl_lock(50)) return;              // leave the delta pending; next tick retries
+  float diff = ring_rot_target - ring_rot;
+  if (fabsf(diff) < 0.5f) ring_rot = ring_rot_target;
+  else                    ring_rot += diff * 0.58f;   // ease factor tuned via hardware feedback (3 rounds). Math: with 0.5° snap threshold, 90° step needs (1-f)^n*90 <= 0.5; n=6 frames gives f=0.58. At 16ms/frame: ~96ms settle time (vs ~140ms at 0.45f, ~230ms at 0.30f).
+  lv_obj_invalidate(lv_scr_act());
+  lvgl_unlock();
+}
+
 // Full-screen overlay shown while ble_pairing_active() is true, on top of the ring (created
 // after it, so it draws later/on top in LVGL's default per-screen z-order). Hidden the rest of
 // the time.
-// pairing_overlay itself is declared at the top of this file (see the note there).
+static lv_obj_t *pairing_overlay = nullptr;
 static lv_obj_t *pairing_label = nullptr;
 
 static void build_pairing_overlay(void) {
@@ -391,6 +705,245 @@ static void update_profiles_reload(void) {
   ble_clear_profiles_dirty();
 }
 
+static void settings_layout(void) {
+  for (int i = 0; i < SETTINGS_ITEM_COUNT; i++) {
+    bool active = (i == settings_sel);
+    lv_obj_set_style_text_font(settings_rows[i], active ? &orbitron_24 : &orbitron_14, 0);
+    // LVGL's stock Montserrat has no bold face and no synthetic bold; Orbitron gives size a real
+    // partner in opacity. Size + contrast carry the hierarchy (spec section 5).
+    lv_obj_set_style_text_opa(settings_rows[i], active ? LV_OPA_COVER : LV_OPA_40, 0);
+    lv_obj_align(settings_rows[i], LV_ALIGN_CENTER, 0, (i - settings_sel) * SETTINGS_ROW_PITCH);
+  }
+}
+
+static void build_settings_overlay(void) {
+  lv_obj_t *scr = lv_scr_act();
+  settings_overlay = lv_obj_create(scr);
+  lv_obj_set_size(settings_overlay, EXAMPLE_LCD_H_RES, EXAMPLE_LCD_V_RES);
+  lv_obj_set_pos(settings_overlay, 0, 0);
+  lv_obj_set_style_bg_color(settings_overlay, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(settings_overlay, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(settings_overlay, 0, 0);
+  lv_obj_set_style_border_width(settings_overlay, 0, 0);
+  lv_obj_clear_flag(settings_overlay, LV_OBJ_FLAG_SCROLLABLE);
+  // lv_obj_create() defaults every new object to LV_OBJ_FLAG_CLICKABLE (core/lv_obj.c:436), and
+  // lv_obj_hit_test() requires that flag to report a hit (core/lv_obj_pos.c:950). A full-screen
+  // container left clickable wins lv_indev_search_obj()'s hit test before it ever reaches `scr`,
+  // silently swallowing every tap meant for screen_click_cb -- the only LV_EVENT_CLICKED handler
+  // in this file. Clear it so taps fall through to the screen.
+  lv_obj_clear_flag(settings_overlay, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(settings_overlay, LV_OBJ_FLAG_HIDDEN);
+
+  settings_list_panel = lv_obj_create(settings_overlay);
+  lv_obj_set_size(settings_list_panel, EXAMPLE_LCD_H_RES, EXAMPLE_LCD_V_RES);
+  lv_obj_center(settings_list_panel);
+  lv_obj_set_style_bg_opa(settings_list_panel, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(settings_list_panel, 0, 0);
+  lv_obj_clear_flag(settings_list_panel, LV_OBJ_FLAG_SCROLLABLE);
+  // Same lv_obj_create() default as settings_overlay above: clickable-by-default means this
+  // full-screen panel steals the hit test from `scr` before screen_click_cb ever runs. Clear it.
+  lv_obj_clear_flag(settings_list_panel, LV_OBJ_FLAG_CLICKABLE);
+
+  // The two rails framing the centre slot -- the slot-machine affordance. Drawn first so the
+  // rows, created after, paint on top in LVGL's insertion-order z-stacking.
+  for (int i = 0; i < 2; i++) {
+    lv_obj_t *rail = lv_obj_create(settings_list_panel);
+    lv_obj_set_size(rail, 170, 2);
+    lv_obj_set_style_bg_color(rail, lv_color_hex(0x404050), 0);
+    lv_obj_set_style_bg_opa(rail, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(rail, 0, 0);
+    lv_obj_set_style_radius(rail, 0, 0);
+    lv_obj_clear_flag(rail, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(rail, LV_ALIGN_CENTER, 0, (i == 0 ? -1 : 1) * (SETTINGS_ROW_PITCH / 2 + 8));
+  }
+
+  for (int i = 0; i < SETTINGS_ITEM_COUNT; i++) {
+    lv_obj_t *row = lv_label_create(settings_list_panel);
+    lv_label_set_text(row, SETTINGS_ITEMS[i].name);
+    lv_obj_set_style_text_color(row, lv_color_white(), 0);
+    lv_obj_set_style_text_align(row, LV_TEXT_ALIGN_CENTER, 0);
+    settings_rows[i] = row;
+  }
+  settings_layout();
+
+  settings_edit_panel = lv_obj_create(settings_overlay);
+  lv_obj_set_size(settings_edit_panel, EXAMPLE_LCD_H_RES, EXAMPLE_LCD_V_RES);
+  lv_obj_center(settings_edit_panel);
+  lv_obj_set_style_bg_opa(settings_edit_panel, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(settings_edit_panel, 0, 0);
+  lv_obj_clear_flag(settings_edit_panel, LV_OBJ_FLAG_SCROLLABLE);
+  // Same lv_obj_create() default as settings_overlay/settings_list_panel above: clickable-by-
+  // default means this full-screen panel steals the hit test from `scr` before screen_click_cb
+  // ever runs -- clearing LV_OBJ_FLAG_CLICKABLE on gauge_arc alone isn't enough, since this panel
+  // sits underneath it and wins the hit test first. Clear it here too.
+  lv_obj_clear_flag(settings_edit_panel, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(settings_edit_panel, LV_OBJ_FLAG_HIDDEN);
+
+  // Half-moon gauge across the TOP. LVGL arc angles put 0 deg at 3 o'clock and increase
+  // clockwise -- the same convention wedge_center_angle() uses -- so 180..360 is 9 o'clock
+  // through 12 to 3 o'clock, and the indicator fills left to right as the value rises. That
+  // matches a clockwise knob turn, and reuses the ring's own geometry so the gauge reads as the
+  // same object the rest of the UI is built from.
+  gauge_arc = lv_arc_create(settings_edit_panel);
+  lv_obj_set_size(gauge_arc, 300, 300);
+  lv_obj_align(gauge_arc, LV_ALIGN_CENTER, 0, 0);
+  lv_arc_set_rotation(gauge_arc, 0);
+  lv_arc_set_bg_angles(gauge_arc, 180, 360);
+  lv_arc_set_range(gauge_arc, 0, 100);
+  lv_arc_set_value(gauge_arc, 0);
+  lv_obj_remove_style(gauge_arc, NULL, LV_PART_KNOB);      // encoder drives it, not a drag handle
+  lv_obj_clear_flag(gauge_arc, LV_OBJ_FLAG_CLICKABLE);     // taps must reach the screen click cb
+  lv_obj_set_style_arc_width(gauge_arc, 18, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(gauge_arc, 18, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(gauge_arc, lv_color_hex(0x303040), LV_PART_MAIN);
+  lv_obj_set_style_arc_color(gauge_arc, lv_color_white(), LV_PART_INDICATOR);
+
+  gauge_value = lv_label_create(settings_edit_panel);
+  lv_obj_set_style_text_font(gauge_value, &orbitron_24, 0);
+  lv_obj_set_style_text_color(gauge_value, lv_color_white(), 0);
+  lv_label_set_text(gauge_value, "0%");
+  lv_obj_align(gauge_value, LV_ALIGN_CENTER, 0, 0);
+
+  gauge_label = lv_label_create(settings_edit_panel);
+  lv_obj_set_style_text_font(gauge_label, &orbitron_14, 0);
+  lv_obj_set_style_text_color(gauge_label, lv_color_white(), 0);
+  lv_obj_set_style_text_opa(gauge_label, LV_OPA_60, 0);
+  lv_label_set_text(gauge_label, "Brightness");
+  lv_obj_align(gauge_label, LV_ALIGN_CENTER, 0, 52);
+}
+
+// 0..100 across the usable duty range, so the floor reads as 0% rather than 8%. Clamped for
+// display only -- current_duty itself is never clamped here, so the boot value stays honest to
+// whatever was actually stored (e.g. a pre-M7 profiles.json brightness below BRIGHTNESS_MIN,
+// which would otherwise print as a negative percentage until the encoder is first turned).
+static int duty_to_pct(int duty) {
+  if (duty < BRIGHTNESS_MIN) return 0;
+  if (duty > BRIGHTNESS_MAX) return 100;
+  return ((duty - BRIGHTNESS_MIN) * 100) / (BRIGHTNESS_MAX - BRIGHTNESS_MIN);
+}
+
+static void gauge_refresh(void) {
+  const setting_item_t *it = &SETTINGS_ITEMS[settings_sel];
+  int pct = duty_to_pct(it->get());
+  lv_arc_set_value(gauge_arc, pct);
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d%%", pct);
+  lv_label_set_text(gauge_value, buf);
+  lv_label_set_text(gauge_label, it->name);
+}
+
+// One NVS write per Settings session, from the loop task. state_set_brightness() skips an
+// identical write, so a session that changed nothing costs a read and no wear.
+//
+// Split from the write itself: this only captures whether a write is needed and the value to
+// write, so callers can do it while still holding lvgl_lock() and perform the actual flash
+// write only after releasing it (see the call sites -- M4).
+static bool settings_commit_prepare(uint8_t *out_duty) {
+  if (!brightness_dirty) return false;
+  *out_duty = current_duty;
+  brightness_dirty = false;
+  return true;
+}
+
+// Owns every Settings mode transition. Callbacks only raise flags (spec section 9).
+static void update_settings(void) {
+  if (settings_open_requested) {
+    // Lock FIRST, clear the flag after -- the H5 lesson. Clearing first meant one lock timeout
+    // consumed the transition permanently and the overlay never appeared again.
+    if (!lvgl_lock(200)) return;
+    settings_open_requested = false;
+    // A CLICKED landing between loop()'s read of settings_enter_requested and this open branch
+    // can leave that flag (or a stale close request) set from the session that just ended --
+    // consumed on the NEXT open, jumping straight into the brightness editor instead of the
+    // list. Clear both here so nothing leaks across a close/reopen.
+    settings_enter_requested = false;
+    settings_close_requested = false;
+
+    // Killing here rather than via macros_request_stop_all() from the gesture callback keeps
+    // "Settings is open" and "nothing is running" a single transition under one lock
+    // acquisition, instead of two that can land in either order -- and avoids killing macros in
+    // the case where the lock timed out and the overlay never opened. This runs on the loop
+    // task, so calling macros_stop_all() directly is allowed here and ONLY here.
+    macros_stop_all();
+
+    ui_mode = UI_SETTINGS_LIST;
+    settings_sel = 0;
+    settings_last_activity = millis();
+    settings_layout();
+    lv_obj_add_flag(settings_edit_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(settings_list_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(settings_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(settings_overlay);
+    if (pairing_overlay) lv_obj_move_foreground(pairing_overlay);
+    lvgl_unlock();
+    Serial.println("[diag] settings opened, macros stopped");
+    return;
+  }
+
+  if (ui_mode == UI_RING) return;
+
+  if (settings_enter_requested) {
+    if (!lvgl_lock(200)) return;   // flag stays set; next tick retries
+    settings_enter_requested = false;
+    bool commit_pending = false;
+    uint8_t commit_duty = 0;
+    if (ui_mode == UI_SETTINGS_LIST) {
+      ui_mode = UI_SETTINGS_EDIT;
+      gauge_refresh();
+      lv_obj_add_flag(settings_list_panel, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_clear_flag(settings_edit_panel, LV_OBJ_FLAG_HIDDEN);
+      Serial.printf("[diag] settings: editing %s\n", SETTINGS_ITEMS[settings_sel].name);
+    } else {
+      ui_mode = UI_SETTINGS_LIST;
+      lv_obj_add_flag(settings_edit_panel, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_clear_flag(settings_list_panel, LV_OBJ_FLAG_HIDDEN);
+      commit_pending = settings_commit_prepare(&commit_duty);
+      Serial.println("[diag] settings: back to list");
+    }
+    settings_last_activity = millis();
+    lvgl_unlock();
+    // NVS write happens here, AFTER releasing lvgl_lock() -- the whole point of deferring it to
+    // the loop task was that a flash write stalls; doing it while still holding the LVGL mutex
+    // stalls the renderer exactly the same, just from inside the lock instead of outside it.
+    if (commit_pending) state_set_brightness(commit_duty);
+    return;
+  }
+
+  bool timed_out = (millis() - settings_last_activity > SETTINGS_IDLE_TIMEOUT_MS);
+  if (settings_close_requested || timed_out) {
+    if (!lvgl_lock(200)) return;
+    settings_close_requested = false;
+    uint8_t commit_duty = 0;
+    bool commit_pending = settings_commit_prepare(&commit_duty);
+    ui_mode = UI_RING;
+    lv_obj_add_flag(settings_edit_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(settings_list_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(settings_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_invalidate(lv_scr_act());
+    lvgl_unlock();
+    // Same reason as above: write after unlock, not while holding the LVGL mutex.
+    if (commit_pending) state_set_brightness(commit_duty);
+    Serial.printf("[diag] settings closed (%s)\n", timed_out ? "idle timeout" : "swipe down");
+  }
+}
+
+// Runs the switch on the loop task: profiles_set_active() calls macros_stop_all() (loop-only)
+// and rebuild_ring_layout() needs lvgl_lock(). Same hand-off update_profiles_reload() uses.
+static void update_profile_switch(void) {
+  int delta = profile_switch_delta;
+  if (delta == 0) return;
+  // Lock FIRST; only consume the request once the lock is held (the H5 lesson).
+  if (!lvgl_lock(200)) return;
+  profile_switch_delta = 0;
+
+  if (profiles_set_active(profiles_active_index() + delta)) {
+    rebuild_ring_layout();
+    selected_idx = 0;
+    if (active_count > 0) select_idx(selected_idx);
+  }
+  lvgl_unlock();
+}
+
 static void build_ring_ui(void) {
   lv_obj_t *scr = lv_scr_act();
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
@@ -398,39 +951,97 @@ static void build_ring_ui(void) {
   lv_obj_add_event_cb(scr, screen_click_cb, LV_EVENT_CLICKED, NULL);
   lv_obj_add_event_cb(scr, screen_gesture_cb, LV_EVENT_GESTURE, NULL);
 
-  center_label = lv_label_create(scr);
-  lv_obj_set_style_text_color(center_label, lv_color_white(), 0);
-  lv_obj_center(center_label);
+  // LVGL suppresses gestures entirely while a touch is scrolling something --
+  // indev_gesture() returns immediately if proc->types.pointer.scroll_obj is set, before the
+  // gesture thresholds are even consulted. lv_obj_create() makes every object scrollable by
+  // default, including the screen, and the ring USED TO carry one absolutely-positioned wedge
+  // label per macro, wide enough to overflow it horizontally (chord could reach ~177 px at 4
+  // macros, putting the 3 o'clock label's right edge near x=400 on a 360 px panel). The screen
+  // was therefore horizontally scrollable, and every horizontal swipe scrolled instead of
+  // gesturing -- which is why profile switching could not be triggered at all while swipe-up,
+  // with far less vertical overflow, worked only intermittently.
+  //
+  // Task 8 deleted the wedge labels (the ring is now plain colour arcs, see ring_draw_event_cb),
+  // but the guard stays: the centre stack below is also absolutely positioned (lv_obj_align with
+  // an offset, not lv_obj_center), and any future absolutely-positioned object that can extend
+  // past the display bounds would silently reopen this exact bug. Found by hardware testing.
+  lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+  centre_macro = lv_label_create(scr);
+  lv_obj_set_style_text_font(centre_macro, &orbitron_bold_24, 0);
+  lv_obj_set_style_text_color(centre_macro, lv_color_white(), 0);
+  lv_obj_set_width(centre_macro, 150);
+  lv_obj_set_style_text_align(centre_macro, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_long_mode(centre_macro, LV_LABEL_LONG_DOT);
+  lv_obj_align(centre_macro, LV_ALIGN_CENTER, 0, -12);
+
+  centre_profile = lv_label_create(scr);
+  lv_obj_set_style_text_font(centre_profile, &orbitron_14, 0);
+  lv_obj_set_style_text_color(centre_profile, lv_color_white(), 0);
+  lv_obj_set_style_text_opa(centre_profile, LV_OPA_80, 0);
+  lv_obj_set_width(centre_profile, 150);
+  lv_obj_set_style_text_align(centre_profile, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_long_mode(centre_profile, LV_LABEL_LONG_DOT);
+  lv_obj_align(centre_profile, LV_ALIGN_CENTER, 0, 18);
 
   rebuild_ring_layout();
   if (active_count > 0) select_idx(selected_idx);
 
+  build_settings_overlay();
   build_pairing_overlay();
 }
 
+// Callbacks run on the esp_timer task, not in an ISR -- plain xQueueSend (not the FromISR variant)
+// is correct here.
 static void _knob_left_cb(void *arg, void *data) {
-  xEventGroupSetBits(knob_events, (1 << 0));
+  int8_t d = -1;
+  if (knob_queue) xQueueSend(knob_queue, &d, 0);
 }
 static void _knob_right_cb(void *arg, void *data) {
-  xEventGroupSetBits(knob_events, (1 << 1));
+  int8_t d = +1;
+  if (knob_queue) xQueueSend(knob_queue, &d, 0);
 }
 
 static void encoder_task(void *arg) {
   for (;;) {
-    EventBits_t bits = xEventGroupWaitBits(knob_events, 0x03, pdTRUE, pdFALSE, portMAX_DELAY);
-    int delta = 0;
-    if (bits & (1 << 0)) delta -= 1;
-    if (bits & (1 << 1)) delta += 1;
-    if (delta != 0 && active_count > 0 && lvgl_lock(100)) {
-      // Re-check INSIDE the lock. The guard above runs before lvgl_lock() blocks, and a profile
-      // reload on the loop task can drop active_count to 0 while this task waits -- making the
-      // modulo below a divide-by-zero, which traps and reboots the S3. Capturing the pre-lock
-      // value into a local would not fix it: a shrunk count would still index out of range.
-      if (active_count > 0) {
-        select_idx((selected_idx + delta + active_count) % active_count);
+    int8_t d;
+    if (xQueueReceive(knob_queue, &d, portMAX_DELAY) != pdTRUE) continue;
+    int delta = d;
+    // Coalesce anything already queued. Unlike the event group this replaced, nothing is lost:
+    // every event contributes exactly once to the accumulated delta.
+    while (xQueueReceive(knob_queue, &d, 0) == pdTRUE) delta += d;
+    TRACE("[knob] delta=%d t=%lu\n", delta, (unsigned long)millis());
+    if (delta == 0) continue;
+    if (!lvgl_lock(100)) continue;
+
+    if (ui_mode == UI_SETTINGS_LIST) {
+      // Clamp, no wrap -- matching the profile list (spec section 5). With one item this is a
+      // no-op and the encoder does nothing here; that is expected, not a dead encoder.
+      int next = settings_sel + delta;
+      if (next < 0) next = 0;
+      if (next > SETTINGS_ITEM_COUNT - 1) next = SETTINGS_ITEM_COUNT - 1;
+      if (next != settings_sel) {
+        settings_sel = next;
+        settings_layout();
       }
-      lvgl_unlock();
+      settings_last_activity = millis();
+    } else if (ui_mode == UI_SETTINGS_EDIT) {
+      const setting_item_t *it = &SETTINGS_ITEMS[settings_sel];
+      it->apply(it->get() + delta * it->step);   // live preview: the panel changes as you turn
+      gauge_refresh();
+      settings_last_activity = millis();
+    } else if (ui_mode == UI_RING) {
+      // Re-check active_count INSIDE the lock. The pre-lock world can change while this task
+      // waits: a profile reload on the loop task can drop it to 0, making the modulo a
+      // divide-by-zero, which traps and reboots the S3. Capturing a pre-lock copy would not
+      // help -- a shrunk count still indexes out of range.
+      if (active_count > 0) {
+        // MINUS delta: turning the knob clockwise spins the RING clockwise, bringing the wedge
+        // counter-clockwise of the top up to the selector. The dial is attached to the knob.
+        select_idx((selected_idx - delta + active_count) % active_count);
+      }
     }
+    lvgl_unlock();
   }
 }
 
@@ -456,6 +1067,11 @@ void setup() {
   Serial.enableReboot(false);
   delay(2000);
   Serial.println("[diag] setup start");
+  // Build stamp. Without this there is no way to tell from a serial capture which firmware is
+  // actually on the board -- the flash pipeline is a BOOT-hold replug, an upload, and a second
+  // physical replug, and a miss at any step is silent. One wasted debugging cycle was spent
+  // asking whether a change had been flashed at all.
+  Serial.printf("[diag] build %s %s\n", __DATE__, __TIME__);
   Serial.println("[diag] host-commanded bootloader reset DISABLED (enableReboot(false))");
   hid_init();
   Serial.println("[diag] hid_init done");
@@ -500,8 +1116,16 @@ void setup() {
 
   lcd_lvgl_Init();
   Serial.printf("[diag] lcd_lvgl_Init done heap=%u\n", ESP.getFreeHeap());
-  lcd_bl_pwm_bsp_init(LCD_PWM_MODE_255);
-  Serial.println("[diag] backlight init done");
+  // Brightness: NVS if it has ever been set on the device, else the profile document's
+  // settings.brightness as a seed. Was hardcoded to LCD_PWM_MODE_255, which meant
+  // settings.brightness existed in the schema and did nothing.
+  //
+  // Ordering is load-bearing: profiles_init() above has already run state_init() and loaded
+  // profilesDoc, so both the NVS handle and the seed are available here.
+  uint8_t boot_brightness = state_brightness(profiles_default_brightness());
+  lcd_bl_pwm_bsp_init(boot_brightness);
+  current_duty = boot_brightness;  // so the gauge opens at the real value, not BRIGHTNESS_MAX
+  Serial.printf("[diag] backlight init done duty=%u\n", (unsigned)boot_brightness);
 
   if (lvgl_lock(-1)) {
     Serial.println("[diag] lvgl locked, building ring ui");
@@ -512,7 +1136,7 @@ void setup() {
     Serial.println("[diag] FAILED to acquire lvgl lock");
   }
 
-  knob_events = xEventGroupCreate();
+  knob_queue = xQueueCreate(32, sizeof(int8_t));
   knob_config_t cfg = {
     .gpio_encoder_a = ENCODER_ECA_PIN,
     .gpio_encoder_b = ENCODER_ECB_PIN,
@@ -530,11 +1154,27 @@ void setup() {
 
 static unsigned long last_loop_print = 0;
 void loop() {
+#if DRAUPNIR_TRACE_INPUT
+  // Raw electrical picture from the knob driver's ring buffer -- drained every tick (not just
+  // when the [diag] heartbeat fires) so the buffer stays shallow and never has to overflow
+  // under normal polling. Diagnostic only; the driver's decode/debounce path is untouched.
+  {
+    uint8_t st; uint32_t t;
+    while (knob_debug_pop(&st, &t)) {
+      Serial.printf("[quad] A=%u B=%u t=%lu\n",
+                    (unsigned)((st >> 1) & 1), (unsigned)(st & 1), (unsigned long)t);
+    }
+    if (knob_debug_overflowed()) Serial.println("[quad] OVERFLOW -- samples dropped");
+  }
+#endif
   macros_update();
   ble_update();
   update_pairing_overlay();
   update_profiles_reload();
+  update_settings();
+  update_profile_switch();
   update_running_pulse();
+  update_ring_rotation();
   if (millis() - last_loop_print > 3000) {
     last_loop_print = millis();
     // any_running is the important new field: a "toggle" macro never terminates, so one left

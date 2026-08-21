@@ -1,7 +1,7 @@
 #include "macro_engine.h"
 #include "trace.h"
 #include <LittleFS.h>
-#include <Preferences.h>
+#include "device_state.h"
 #include "USBHIDKeyboard.h"
 #include "USBHIDConsumerControl.h"
 #include "USBHIDMouse.h"
@@ -12,7 +12,6 @@ static USBHIDKeyboard Keyboard;
 static USBHIDConsumerControl ConsumerControl;
 static USBHIDMouse Mouse;
 
-static Preferences prefs;
 static JsonDocument profilesDoc;
 static int activeProfileIdx = 0;
 
@@ -40,6 +39,16 @@ static const char *defaultProfilesJson = R"=====(
           { "type": "text", "value": "three\n" }
         ] },
         { "pos": 4, "name": "Caps Lock", "color": "#A030E0", "mode": "toggle", "actions": [ { "type": "key", "key": "CAPSLOCK" } ] }
+      ]
+    },
+    {
+      "name": "Media",
+      "color": "#30C060",
+      "macros": [
+        { "pos": 0, "name": "Play/Pause", "color": "#30C060", "mode": "play_once", "actions": [ { "type": "consumer", "code": "PLAY_PAUSE" } ] },
+        { "pos": 1, "name": "Next", "color": "#3080E0", "mode": "play_once", "actions": [ { "type": "consumer", "code": "NEXT" } ] },
+        { "pos": 2, "name": "Prev", "color": "#E0A030", "mode": "play_once", "actions": [ { "type": "consumer", "code": "PREV" } ] },
+        { "pos": 3, "name": "Vol Up", "color": "#A030E0", "mode": "play_once", "actions": [ { "type": "consumer", "code": "VOL_UP" } ] }
       ]
     }
   ]
@@ -101,6 +110,35 @@ bool macros_any_running() {
 // currentActionIndex forever), and the shipped default profile contains one -- fire it, then
 // save profiles from the app, and the use-after-free is guaranteed.
 void macros_stop_all() {
+  // Drain fireQueue FIRST, before touching HID state or runningMacros[]. A fire can be queued
+  // (macros_request_fire()) after a stop was already decided but before this function runs --
+  // e.g. Settings opening: the swipe-up sets settings_open_requested, but the release from that
+  // same swipe can still land as a CLICKED while ui_mode is still UI_RING (loop() hasn't drained
+  // the request flag yet), queueing a fire. Left in the queue, that fire would survive this stop
+  // and be drained by the very next macros_update() tick, restarting the macro this call was
+  // supposed to have killed -- looks stopped for one tick, then isn't.
+  //
+  // Consequence, deliberate and worth flagging: a fire queued BEHIND a MACRO_CMD_STOP_ALL
+  // sentinel is now discarded too, not just fires queued ahead of it. Previously the swipe-down
+  // kill-all path let anything queued after the sentinel go on to fire normally once
+  // macros_update() reached it. "Stop all" that lets a still-queued tap start something a moment
+  // later is not stopping all, so this is the correct semantics -- but it IS a behaviour change
+  // to that existing path, hence written down here rather than left for someone to discover.
+  //
+  // Safe to call from inside macros_update()'s own drain loop, which is where the
+  // MACRO_CMD_STOP_ALL branch calls this: xQueueReceive with a 0 tick timeout returns false the
+  // instant the queue is empty, so this always terminates and never recurses back into
+  // macros_stop_all(). It just means this inner drain absorbs whatever the outer loop would have
+  // processed next, which is exactly the discard behaviour above.
+  int discarded = 0;
+  int pending;
+  while (fireQueue && xQueueReceive(fireQueue, &pending, 0) == pdTRUE) {
+    discarded++;
+  }
+  if (discarded > 0) {
+    Serial.printf("[diag] macros_stop_all: discarded %d pending fire(s) from the queue\n", discarded);
+  }
+
   // A macro interrupted mid-sequence can have modifiers or mouse buttons held down. Release them
   // before clearing state, or the host is left with e.g. a stuck Ctrl and no way to clear it.
   Keyboard.releaseAll();
@@ -180,10 +218,16 @@ void profiles_reload() {
     return;
   }
 
-  activeProfileIdx = prefs.getInt("activeProfile", 0);
+  activeProfileIdx = state_active_profile(0);
   JsonArray profiles = profilesDoc["profiles"];
   Serial.printf("[diag] profiles_reload: activeProfileIdx=%d numProfiles=%u\n", activeProfileIdx, profiles.isNull() ? 0 : profiles.size());
-  if (profiles.isNull() || activeProfileIdx >= (int)profiles.size()) activeProfileIdx = 0;
+  if (profiles.isNull() || activeProfileIdx < 0 || activeProfileIdx >= (int)profiles.size()) {
+    activeProfileIdx = 0;
+    // Write the correction back. Clamping in RAM only left a stale out-of-range index in NVS
+    // forever, re-clamped silently on every boot -- "reading it without ever writing it is the
+    // same as not having it" (spec section 8).
+    state_set_active_profile(activeProfileIdx);
+  }
 }
 
 void profiles_init() {
@@ -193,8 +237,7 @@ void profiles_init() {
     return;
   }
   Serial.println("[diag] profiles_init: LittleFS mounted");
-  prefs.begin("draupnir", false);
-  Serial.println("[diag] profiles_init: prefs.begin done");
+  state_init();
   profiles_reload();
 }
 
@@ -203,6 +246,39 @@ const char *profiles_active_name() {
   if (profiles.isNull() || activeProfileIdx >= (int)profiles.size()) return "No Profiles";
   JsonObject prof = profiles[activeProfileIdx];
   return prof["name"] | "Profile";
+}
+
+const char *profiles_active_color() {
+  JsonArray profiles = profilesDoc["profiles"];
+  if (profiles.isNull() || activeProfileIdx >= (int)profiles.size()) return "#FFFFFF";
+  JsonObject prof = profiles[activeProfileIdx];
+  return prof["color"] | "#FFFFFF";
+}
+
+int profiles_count() {
+  JsonArray profiles = profilesDoc["profiles"];
+  return profiles.isNull() ? 0 : (int)profiles.size();
+}
+
+int profiles_active_index() {
+  return activeProfileIdx;
+}
+
+bool profiles_set_active(int idx) {
+  if (idx < 0 || idx >= profiles_count()) return false;
+  if (idx == activeProfileIdx) return false;
+  macros_stop_all();
+  activeProfileIdx = idx;
+  state_set_active_profile(activeProfileIdx);
+  Serial.printf("[diag] profile -> %d (%s)\n", activeProfileIdx, profiles_active_name());
+  return true;
+}
+
+uint8_t profiles_default_brightness() {
+  int b = profilesDoc["settings"]["brightness"] | 160;
+  if (b < 0)   b = 0;
+  if (b > 255) b = 255;
+  return (uint8_t)b;
 }
 
 JsonObject profiles_find_macro(int pos) {
@@ -302,7 +378,16 @@ static void executeAction(JsonObject action) {
       if (code > 0) {
         Keyboard.press(code);
       } else {
-        Keyboard.press(keyStr[0]);
+        // Lowercase a single alphabetic key so that case can never inject a modifier.
+        // Arduino's Keyboard maps ASCII through _asciimap, where 'L' means Shift+KEY_L --
+        // so mods:["WIN"] + key:"L" silently became Win+Shift+L and Windows ignored it.
+        // Shift must come from an explicit mods entry and nowhere else.
+        //
+        // ONLY alphabetic characters are folded. Punctuation like "!" or "?" legitimately
+        // needs the shifted asciimap entry, since there is no unshifted keycode for them.
+        char c = keyStr[0];
+        if (strlen(keyStr) == 1 && c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        Keyboard.press(c);
       }
     }
     Keyboard.releaseAll();

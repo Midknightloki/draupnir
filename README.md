@@ -85,3 +85,9 @@ The Flutter Companion App is in `companion_app/`.
 ## License
 
 MIT. Firmware and hardware are open — see [LICENSE](LICENSE).
+
+### Bundled font
+
+The firmware embeds Orbitron (SIL Open Font License 1.1), generated into LVGL font tables
+as `firmware/Waveshare_LVGL_Test/orbitron_*.c`. The licence text is in
+`docs/LICENSES/OFL-1.1-Orbitron.txt`. The rest of the project remains MIT.
