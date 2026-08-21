@@ -31,10 +31,11 @@ GATT layer — verified on hardware 2026-08-07. **M7 (NVS persistence) and M8 (o
 switching) are also done**, verified on hardware, on branch `feat/m7-m8-persistence`. M8 grew well
 past its original scope into a full ring rework; see §3.
 
-**The immediate goal is finishing this branch.** Code is written, reviewed, and mostly flashed;
-one commit has never been flashed and a short list of hardware checks from the final review have
-never been run. See §4 and §5. After that, the sequence is M8b/M9 (icons — the ring is now shaped
-to receive them) and then closing the M5Dial's security gap, ahead of M10's comfort items. See §6.
+**The immediate goal is finishing this branch.** Code is written, reviewed, flashed, and the
+final-review hardware pass is complete (§4) — one narrow judgment call remains (the debounce fix's
+untested overflow path) before sign-off. After that, the sequence is M8b/M9 (icons — the ring is
+now shaped to receive them) and then closing the M5Dial's security gap, ahead of M10's comfort
+items. See §6.
 
 ---
 
@@ -71,12 +72,12 @@ f32a255  diag: raw-pin ring buffer for double-detent investigation
 cdfd3b5  fix: saturate knob debounce counter -- itself buggy, see C1 below
 88ed6f2  fix: whole-branch review findings (C1/C2/I1/I2/M3/M4/M6/M7/M9)
 5c6d52c  fix: budget the ellipsis width in wedge_label_fit() before truncation
-9ed000a  fix: stop uppercase key letters from silently injecting Shift    <- HEAD, NOT FLASHED
+9ed000a  fix: stop uppercase key letters from silently injecting Shift    <- HEAD
 ```
 
-Everything up to and including `5c6d52c` has been flashed to the device at some point during this
-milestone. `9ed000a` is the one exception — committed after the last flash, never flashed, never
-seen running. See §4 for exactly which of the flashed fixes have actually been *observed* working.
+Everything through `9ed000a` (HEAD) has now been flashed and hardware-tested — the outstanding
+hardware pass in §4 completed 2026-08-20, all six checks passing. See §4 for exactly what that
+pass did and did not exercise.
 
 ---
 
@@ -109,6 +110,12 @@ verified" as though it were confirmed.
   label stack, tinted selection bloom, outlined wedge labels, FontAwesome chevron indicators. The
   owner's own words on seeing it: **"This looks great."**
 - Heap flat throughout — no drift attributable to a leak was observed at any checkpoint.
+- **The final-review fix wave and the phantom-Shift fix, confirmed 2026-08-20** (§4's "outstanding
+  hardware pass" below has the full record): a long knob hold still produces a detent; a no-op
+  swipe-down no longer fires a macro; a refused swipe inside Settings no longer activates a menu
+  item; a long macro name truncates with an ellipsis instead of smearing; brightness survives a
+  power cycle with the NVS write outside `lvgl_lock()`; and an existing `Win+L` macro now works
+  without being re-created, on both firmware and app.
 
 ### NOT verified on hardware — do not imply otherwise
 
@@ -117,34 +124,43 @@ verified" as though it were confirmed.
   the companion app instead, to keep their real macros. The regeneration path was validated by two
   independent code reviews (JSON correctness, consumer codes checked against
   `getConsumerCode()`), never exercised on the device.
-- **The debounce-counter fix.** The bug (a `uint8_t` counter wrapping after 256 samples at a 3 ms
-  poll, ≈768 ms) needs a hold of that length to reproduce, and that window was never reached in
-  testing — including the final review's own fix for it. See the "outstanding hardware pass"
-  check #1 below.
-- **Everything committed after the last flash.** The final-review fix wave (`88ed6f2` — the
-  gesture-release leak, `5c6d52c` — label truncation with a correctly-budgeted ellipsis, and the
-  NVS write moved out from under the LVGL lock) **is flashed**, but the checks that would confirm
-  it works have not been run — see §5. The uppercase-key fix (`9ed000a`) is not even flashed yet.
+- **The debounce-counter fix's actual overflow path.** See the "outstanding hardware pass" section
+  below — the long-hold check passed, but it did not exercise the bug the fix targets.
 - **Frame pacing at 12–16 macros.** All hardware testing this milestone ran against a 4-macro
-  profile. The ring's draw callback issues up to 9 `lv_draw_label` calls per wedge per repaint,
-  which the final review flagged as unmeasured at higher macro counts (documented fallback: drop
-  to 4 label offsets if it stutters). Nobody has loaded a 12+ macro profile onto the device yet.
+  profile. The ring's draw callback issues up to 9 `lv_draw_label` calls per wedge per repaint, and
+  the final review turned up a detail that makes this worse than it first looked:
+  `EXAMPLE_LVGL_BUF_HEIGHT` is `V_RES / 10`, so `ring_draw_event_cb` runs once per render *stripe*,
+  not once per frame — roughly **10× the earlier back-of-envelope estimate**. Documented fallback
+  is dropping to 4 label offsets if it stutters. Nobody has loaded a 12+ macro profile onto the
+  device yet.
 
-### Outstanding hardware pass — none of these six have been performed yet
+### Outstanding hardware pass — completed 2026-08-20, all six passed
 
-All are newly changed by this milestone's final review and none has been seen on the board:
+All six checks below were run against a build of `9ed000a` and passed (owner, 2026-08-20). This
+confirms the final-review fix wave (`88ed6f2`, `5c6d52c` — gesture-release leak, label truncation,
+the NVS-lock change) and the phantom-Shift fix (`9ed000a`) on both the firmware and app sides.
 
-1. A long knob hold (≥ 1 s) still produces a detent (the debounce-counter fix, `88ed6f2`).
+1. A long knob hold (≥ 1 s) still produces a detent (the debounce-counter fix, `88ed6f2`). **PASS
+   — but read the next paragraph before treating the fix itself as exercised.**
 2. A no-op swipe-down (nothing running) does **not** fire a macro. *This previously sent
-   keystrokes to the host* — a real regression, not a theoretical one.
-3. A refused swipe inside Settings does **not** activate a menu item.
+   keystrokes to the host* — a real regression, not a theoretical one. **PASS.**
+3. A refused swipe inside Settings does **not** activate a menu item. **PASS.**
 4. A long macro name truncates with an ellipsis rather than smearing across the neighbouring
-   wedge (`5c6d52c`).
+   wedge (`5c6d52c`). **PASS.**
 5. Brightness still survives a power cycle — a regression check on the commit that moved the NVS
-   write out from under the LVGL lock.
-6. An existing `Win+L` macro now works **without being re-created** (the uppercase-key fix,
-   `9ed000a` — also the one commit not yet flashed, so this check can't even start until that
-   happens).
+   write out from under the LVGL lock. **PASS.**
+6. An existing `Win+L` macro now works **without being re-created** (the phantom-Shift fix,
+   `9ed000a`). **PASS.**
+
+**Do not over-read check 1.** It proves a long hold does not *break* the detent — it does not
+prove the debounce fix's actual bug path was exercised. That bug needs the contact held **low**
+for more than 768 ms (a `uint8_t` counter wrapping at 256 samples of a 3 ms poll), and earlier
+measurement established that closure duration is set by the mechanical wipe of the contact, not by
+how long the owner holds the knob: the longest closure ever captured was 588 ms, even during holds
+the owner believed were much longer. So the debounce fix remains **correct by inspection** (the
+saturating-counter arithmetic was re-verified by the final review) but **unexercised in practice**
+— nothing has yet triggered the >768 ms path on real hardware, and check 1 passing does not change
+that.
 
 ### Two findings — settled by measurement, do not re-litigate
 
@@ -224,33 +240,25 @@ proposed Visual Studio reinstall that would have fixed nothing.
 
 ## 6. What to do next, in order
 
-### Step 1 — Run the outstanding hardware pass (§4)
+### Step 1 — Final sign-off and merge
 
-Flash `5c6d52c` if the device isn't already running it (it is, as of the last flash on this
-branch), run checks 1–5 from §4's six-item list, and record the results — pass or fail — before
-touching anything else. Do not assume the final-review fixes work because they compiled and passed
-review; per this project's own rule, review and compile are not hardware verification.
+The outstanding hardware pass (§4) is complete — all six checks passed 2026-08-20 against
+`9ed000a`. What remains before merge is narrow: decide whether the debounce fix's >768 ms path
+(§4) needs a deliberate reproduction attempt before sign-off, or ships correct-by-inspection and
+unexercised, which is a judgment call rather than a blocking gap. Then triage the deferred-minor
+list in the ledger's final section (mostly cosmetic — the `state_set_active_profile` sentinel,
+`update_profile_switch`'s pre-lock read, a stale comment — none blocking), and hand off to
+`superpowers:finishing-a-development-branch`.
 
-### Step 2 — Flash and test `9ed000a`
-
-The uppercase-key fix has never run on the device. Flash it, then run check 6 (`Win+L` without
-re-creating the macro) plus a general sanity pass — it touches keyboard report encoding, which is
-also exercised by every other `key`-type macro.
-
-### Step 3 — Final sign-off and merge
-
-Once §4's gaps are closed, this branch is ready for `superpowers:finishing-a-development-branch`.
-Triage the deferred-minor list in the ledger's final section first (mostly cosmetic — the
-`state_set_active_profile` sentinel, `update_profile_switch`'s pre-lock read, a stale comment —
-none blocking).
-
-### Step 4 — M8b, then M9
+### Step 2 — M8b, then M9
 
 M8b (uncap `pos`, key running-macro state by identity, bump `version: 3`) and M9 (icons on the
 ring). The ring geometry M9 will draw icons into is now settled by the Task 8–10 rework, which is
-exactly why M9 was sequenced after it rather than before.
+exactly why M9 was sequenced after it rather than before. M9 should also settle the frame-pacing
+question flagged in §4 — the first natural point at which a 12+ macro profile will actually get
+loaded onto the device.
 
-### Step 5 — M5Dial security gate
+### Step 3 — M5Dial security gate
 
 The M5Dial firmware still has no cryptographic gate at all (§7). This has been the top follow-up
 since M6 closed the equivalent hole on the Waveshare board, and per the locked work order
