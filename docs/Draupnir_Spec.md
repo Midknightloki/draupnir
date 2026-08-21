@@ -312,7 +312,7 @@ silently dropping every macro with `pos > 15`.
 >
 > **The firmware still enforces the 16 cap, and the on-device default still declares
 > `"version": 2`.** `NUM_MACRO_SLOTS` is 16 and is baked into `runningMacros[]`,
-> `macros_is_running()`, `macros_stop_all()`, `active_positions[]`, and `macro_labels[]`;
+> `macros_is_running()`, `macros_stop_all()`, and `active_positions[]`;
 > `scan_active_positions()` scans only 0-15 and `macros_fire()` rejects `pos >= 16`. The companion
 > app's deck is likewise a hardcoded 16 cells, so no normal user flow can currently produce a
 > macro above 15.
@@ -440,15 +440,26 @@ Honest status, not aspiration.
 | M3 | Ring UI: dynamic wedges, colors, selection, tap-to-fire | **Done** (Waveshare) |
 | M4 | Profile store: LittleFS + defaults | **Done** |
 | M5 | BLE transport: chunked send/ack, Companion App connects | **Done** |
-| M6 | **Config hardening** — pairing enforcement, atomic writes, RX bounds, reload safety | **Open — blocking** |
-| M7 | **Persistence** — write `activeProfile` + brightness to NVS and honor them at boot | **Open** |
-| M8 | **On-device profile switching** with directional indicators | **Open** |
+| M6 | **Config hardening** — pairing enforcement, atomic writes, RX bounds, reload safety | **Done (2026-08-07)** — see note below |
+| M7 | **Persistence** — write `activeProfile` + brightness to NVS and honor them at boot | **Done (2026-08-08)**, verified on hardware |
+| M8 | **On-device profile switching** with directional indicators | **Done (2026-08-13)**, verified on hardware — grew beyond its original scope, see note below |
 | M8b | **Uncap `pos`** — key running-macro state by identity, not slot; then bump the default to `version: 3` | **Open** (see §6 warning) |
 | M9 | **Icons on the ring** + encoder detent alignment | **Open** |
-| M10 | Polish — buzzer/haptic feedback, brightness UI, export/import | **Open** |
+| M10 | Polish — buzzer/haptic feedback, export/import | **Open** — brightness UI, originally listed here, was delivered as part of M7/M8 |
 
-M6 is sequenced first because it is the difference between a prototype and a device that is safe
-to leave plugged into a machine.
+**M6:** done-criterion was the H1 negative test, which passed on hardware 2026-08-07 — an
+unbonded central wrote to the RX characteristic and the command handler never received the bytes,
+refused at the GATT layer. Two items from the original hardening test plan were never run and
+remain open, carried forward rather than dropped: H2's overflow-recovery test and H4's
+corruption-recovery test. Heap across a save/reload cycle was also never proven flat over a long
+soak — the one cycle observed went 61,720 → 61,392 bytes, consistent with the document growing
+(919 B) rather than a leak, but a single cycle can't tell the two apart.
+
+**M8:** what shipped is well beyond the original "profile switching with directional indicators"
+line. Three hardware feedback rounds turned it into a full ring rework — a rotating ring under a
+static 12 o'clock selector, a centre label stack (macro name large, profile name small), a tinted
+selection bloom, and real FontAwesome chevron indicators — confirmed on hardware with the owner's
+own words: "This looks great."
 
 ---
 
