@@ -43,7 +43,7 @@ static int active_count = 0;
 // ui_mode is owned by loop(). LVGL-task callbacks (touch, gesture) and encoder_task only ever
 // RAISE a request flag; loop() performs the transition under lvgl_lock(). Same pattern as
 // update_pairing_overlay()/update_profiles_reload(). See spec section 9.
-typedef enum { UI_RING, UI_SETTINGS_LIST, UI_SETTINGS_EDIT, UI_MODE_COUNT } ui_mode_t;
+typedef enum { UI_RING, UI_SETTINGS_LIST, UI_SETTINGS_EDIT, UI_ROTARY, UI_MODE_COUNT } ui_mode_t;
 static ui_mode_t ui_mode = UI_RING;
 
 // Each UI mode declares how it handles input, and the slot each handler occupies states which
@@ -72,6 +72,10 @@ static volatile bool settings_open_requested  = false;
 static volatile bool settings_close_requested = false;
 static volatile bool settings_enter_requested = false;
 
+// Written on the LVGL task (rotary_on_tap), read by loop() (update_rotary()) -- same convention
+// as the settings request flags above.
+static volatile bool rotary_exit_requested = false;
+
 static lv_obj_t *settings_overlay = nullptr;
 static lv_obj_t *settings_list_panel = nullptr;
 static lv_obj_t *settings_edit_panel = nullptr;
@@ -81,6 +85,14 @@ static lv_obj_t *gauge_label = nullptr;
 static lv_obj_t *settings_rows[4];          // sized for growth; SETTINGS_ITEM_COUNT is the truth
 static int settings_sel = 0;
 static unsigned long settings_last_activity = 0;
+
+// ---- Rotary macro mode -------------------------------------------------------------------
+static lv_obj_t *rotary_overlay        = nullptr;
+static lv_obj_t *rotary_name_label     = nullptr;
+static lv_obj_t *rotary_turn_label     = nullptr;
+static lv_obj_t *rotary_exit_label     = nullptr;
+static lv_obj_t *rotary_chevron_left   = nullptr;
+static lv_obj_t *rotary_chevron_right  = nullptr;
 
 #define SETTINGS_IDLE_TIMEOUT_MS 8000
 // Vertical distance between rows. The active row sits at the exact screen centre and the others
@@ -683,12 +695,25 @@ static void settings_edit_on_encoder(int delta) {
   settings_last_activity = millis();
 }
 
+static bool rotary_on_tap(lv_coord_t x, lv_coord_t y) {
+  (void)x; (void)y;
+  rotary_exit_requested = true;
+  return true;
+}
+static void rotary_on_encoder(int delta) {
+  macros_request_rotary_step(delta);   // request form: encoder_task must not run actions itself
+}
+// on_gesture is NULL on purpose: swipe-down falls through to the dispatcher's kill-all default.
+// Unlike Settings, entering rotary mode does NOT stop running macros, so the panic gesture must
+// still work here.
+
 // Positional, in ui_mode_t order -- C++ does not portably support designated array initialisers,
 // and the static_assert below is what catches a mismatch if the enum ever grows out of step.
 static const ui_mode_def_t UI_MODES[UI_MODE_COUNT] = {
   /* UI_RING          */ { "ring",       NULL, NULL, ring_on_encoder,          ring_on_tap,     ring_on_gesture },
   /* UI_SETTINGS_LIST */ { "settings",   NULL, NULL, settings_list_on_encoder, settings_on_tap, settings_on_gesture },
   /* UI_SETTINGS_EDIT */ { "brightness", NULL, NULL, settings_edit_on_encoder, settings_on_tap, settings_on_gesture },
+  /* UI_ROTARY         */ { "rotary",     NULL, NULL, rotary_on_encoder,       rotary_on_tap,   NULL },
 };
 static_assert(sizeof(UI_MODES) / sizeof(UI_MODES[0]) == UI_MODE_COUNT,
               "UI_MODES must have exactly one entry per ui_mode_t value");
@@ -990,6 +1015,63 @@ static void build_settings_overlay(void) {
   lv_obj_align(gauge_label, LV_ALIGN_CENTER, 0, 52);
 }
 
+// Full-screen overlay for a "rotary" macro: the encoder is bound to actions[0]/actions[1] instead
+// of firing anything, so the ring makes no sense here -- this replaces it entirely while active.
+// Mirrors build_settings_overlay()'s structure and the same clickable/scrollable gotcha: a
+// full-screen lv_obj_create() container defaults to both flags set, and left clickable it wins
+// the hit test over `scr` before screen_click_cb ever runs (see the comment on settings_overlay
+// above -- that exact bug made an entire settings gauge unreachable in a previous milestone).
+static void build_rotary_overlay(void) {
+  lv_obj_t *scr = lv_scr_act();
+  rotary_overlay = lv_obj_create(scr);
+  lv_obj_set_size(rotary_overlay, EXAMPLE_LCD_H_RES, EXAMPLE_LCD_V_RES);
+  lv_obj_set_pos(rotary_overlay, 0, 0);
+  lv_obj_set_style_bg_color(rotary_overlay, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(rotary_overlay, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(rotary_overlay, 0, 0);
+  lv_obj_set_style_border_width(rotary_overlay, 0, 0);
+  lv_obj_clear_flag(rotary_overlay, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(rotary_overlay, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(rotary_overlay, LV_OBJ_FLAG_HIDDEN);
+
+  rotary_turn_label = lv_label_create(rotary_overlay);
+  lv_obj_set_style_text_font(rotary_turn_label, &orbitron_14, 0);
+  lv_obj_set_style_text_color(rotary_turn_label, lv_color_white(), 0);
+  lv_obj_set_style_text_opa(rotary_turn_label, LV_OPA_50, 0);
+  lv_label_set_text(rotary_turn_label, "TURN DIAL");
+  lv_obj_align(rotary_turn_label, LV_ALIGN_CENTER, 0, -60);
+
+  rotary_name_label = lv_label_create(rotary_overlay);
+  lv_obj_set_style_text_font(rotary_name_label, &orbitron_bold_24, 0);
+  lv_obj_set_style_text_color(rotary_name_label, lv_color_white(), 0);
+  lv_obj_set_width(rotary_name_label, 220);
+  lv_obj_set_style_text_align(rotary_name_label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_long_mode(rotary_name_label, LV_LABEL_LONG_DOT);
+  lv_label_set_text(rotary_name_label, "Rotary");
+  lv_obj_align(rotary_name_label, LV_ALIGN_CENTER, 0, 0);
+
+  rotary_exit_label = lv_label_create(rotary_overlay);
+  lv_obj_set_style_text_font(rotary_exit_label, &orbitron_14, 0);
+  lv_obj_set_style_text_color(rotary_exit_label, lv_color_white(), 0);
+  lv_obj_set_style_text_opa(rotary_exit_label, LV_OPA_50, 0);
+  lv_label_set_text(rotary_exit_label, "TAP TO EXIT");
+  lv_obj_align(rotary_exit_label, LV_ALIGN_CENTER, 0, 60);
+
+  // Same glyph/font as the ring's own profile-switch chevrons (ring_draw_event_cb) -- a real
+  // FontAwesome LV_SYMBOL_LEFT/RIGHT via lv_font_montserrat_28, not hand-drawn strokes.
+  rotary_chevron_left = lv_label_create(rotary_overlay);
+  lv_obj_set_style_text_font(rotary_chevron_left, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(rotary_chevron_left, lv_color_white(), 0);
+  lv_label_set_text(rotary_chevron_left, LV_SYMBOL_LEFT);
+  lv_obj_align(rotary_chevron_left, LV_ALIGN_CENTER, -140, 0);
+
+  rotary_chevron_right = lv_label_create(rotary_overlay);
+  lv_obj_set_style_text_font(rotary_chevron_right, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(rotary_chevron_right, lv_color_white(), 0);
+  lv_label_set_text(rotary_chevron_right, LV_SYMBOL_RIGHT);
+  lv_obj_align(rotary_chevron_right, LV_ALIGN_CENTER, 140, 0);
+}
+
 // 0..100 across the usable duty range, so the floor reads as 0% rather than 8%. Clamped for
 // display only -- current_duty itself is never clamped here, so the boot value stays honest to
 // whatever was actually stored (e.g. a pre-M7 profiles.json brightness below BRIGHTNESS_MIN,
@@ -1105,6 +1187,46 @@ static void update_settings(void) {
   }
 }
 
+// Owns the rotary mode's entry/exit, mirroring update_settings()'s shape. Unlike Settings,
+// entry here is driven by polling macros_rotary_active() rather than a request flag -- the
+// macro engine flips it the instant macros_fire() binds a "rotary" macro (see macro_engine.cpp),
+// and there is no separate "open" gesture the UI needs to originate itself.
+static void update_rotary(void) {
+  bool active = macros_rotary_active();
+
+  if (ui_mode != UI_ROTARY && active) {
+    // Lock FIRST, matching update_settings()'s open branch -- a timed-out lock here must leave
+    // `active` true so the next tick retries the transition instead of silently dropping it.
+    if (!lvgl_lock(200)) return;
+    ui_mode_set(UI_ROTARY);
+    uint32_t color = parse_hex_color(macros_rotary_color(), 0xFFFFFF);
+    lv_obj_set_style_text_color(rotary_name_label, lv_color_hex(color), 0);
+    lv_obj_set_style_text_color(rotary_chevron_left, lv_color_hex(color), 0);
+    lv_obj_set_style_text_color(rotary_chevron_right, lv_color_hex(color), 0);
+    lv_label_set_text(rotary_name_label, macros_rotary_name());
+    lv_obj_clear_flag(rotary_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(rotary_overlay);
+    if (pairing_overlay) lv_obj_move_foreground(pairing_overlay);
+    lvgl_unlock();
+    Serial.printf("[diag] rotary mode entered: %s\n", macros_rotary_name());
+    return;
+  }
+
+  if (ui_mode == UI_ROTARY && (rotary_exit_requested || !active)) {
+    // Lock BEFORE clearing rotary_exit_requested -- the H5 lesson (see update_settings() and
+    // update_running_pulse()). Clearing first means a single lock timeout consumes the tap
+    // permanently and the overlay never closes.
+    if (!lvgl_lock(200)) return;
+    rotary_exit_requested = false;
+    macros_stop_all();   // drops the JsonObject into profilesDoc; loop()-task only, allowed here
+    ui_mode_set(UI_RING);
+    lv_obj_add_flag(rotary_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_invalidate(lv_scr_act());
+    lvgl_unlock();
+    Serial.println("[diag] rotary mode exited");
+  }
+}
+
 // Runs the switch on the loop task: profiles_set_active() calls macros_stop_all() (loop-only)
 // and rebuild_ring_layout() needs lvgl_lock(). Same hand-off update_profiles_reload() uses.
 static void update_profile_switch(void) {
@@ -1166,6 +1288,7 @@ static void build_ring_ui(void) {
   if (active_count > 0) select_idx(selected_idx);
 
   build_settings_overlay();
+  build_rotary_overlay();
   build_pairing_overlay();
 }
 
@@ -1325,6 +1448,7 @@ void loop() {
   update_pairing_overlay();
   update_profiles_reload();
   update_settings();
+  update_rotary();
   update_profile_switch();
   update_running_pulse();
   update_ring_rotation();

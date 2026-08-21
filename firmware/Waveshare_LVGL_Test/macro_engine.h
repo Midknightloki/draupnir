@@ -103,3 +103,15 @@ void macros_request_stop_all();
 // Unlike the mutating calls above, this is safe to read from the LVGL task: it only reads the
 // `active` booleans, never writes, and a one-frame-stale answer costs at most one frame of pulse.
 bool macros_any_running();
+
+// Rotary macros bind the encoder instead of playing. The encoder runs on its own task and the
+// macro engine is loop()-only, so a turn must be ENQUEUED, exactly as macros_request_fire() does.
+// dir > 0 executes actions[0]; dir < 0 executes actions[1].
+void macros_request_rotary_step(int dir);
+
+// True while a rotary macro owns the encoder. The UI reads these to draw its screen.
+bool        macros_rotary_active(void);
+const char *macros_rotary_name(void);
+// Returns the raw "#RRGGBB" string, not a parsed value: parse_hex_color() lives in the .ino and
+// the macro engine stays free of display concerns.
+const char *macros_rotary_color(void);
