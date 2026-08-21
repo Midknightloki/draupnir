@@ -49,13 +49,86 @@ M5Dial's default JSON but are consumed by neither board. Schema debris, not a po
 3. Firing a `mode: "rotary"` macro enters a rotary screen where the encoder drives `actions[0]`
    clockwise and `actions[1]` counter-clockwise; tapping exits.
 4. Swipe-down still kills all running macros, including from the rotary screen.
-5. Editing one macro in the app does **not** destroy any other macro's icon.
+5. Editing one macro in the app does **not** destroy any other macro's icon — on **either**
+   board.
+6. Adding a future UI mode requires one table entry, not edits at three separate dispatch sites.
 
-All five are behavioural or visual and need a human at the board.
+Criteria 1–5 are behavioural or visual and need a human at the board. Criterion 6 is structural and
+is judged by reading the result.
 
 ---
 
-## 3. Orientation
+## 3. Mode dispatch — the refactor everything else lands on
+
+The UI mode is currently a bare enum, and **three separate call sites each decide independently
+what a mode means**: `screen_click_cb`, `screen_gesture_cb`, and `encoder_task`. That pattern has
+already produced two bugs of identical shape on this branch:
+
+- `screen_click_cb` treats *any* non-ring mode as Settings — `if (ui_mode != UI_RING) {
+  settings_enter_requested = true; return; }`. Adding a fourth mode makes tap-to-exit silently open
+  the brightness editor.
+- Three gesture sites each independently remembered to call `lv_indev_wait_release()`, and the one
+  that forgot let the panic gesture fire a macro into the attached host.
+
+Adding rotary as a fourth mode without fixing this all but guarantees a third instance. So the
+dispatch table comes first and rotary becomes one entry in it.
+
+### The table
+
+```c
+typedef struct {
+  const char *name;                             // diagnostics only
+  void (*enter)(void);                          // loop() task, lvgl_lock HELD by caller
+  void (*exit)(void);                           // loop() task, lvgl_lock HELD by caller
+  void (*on_encoder)(int delta);                // encoder_task, lvgl_lock HELD by caller
+  bool (*on_tap)(lv_coord_t x, lv_coord_t y);   // LVGL task -- flags/LVGL only
+  bool (*on_gesture)(lv_dir_t dir);             // LVGL task -- flags/LVGL only
+} ui_mode_def_t;
+
+static const ui_mode_def_t UI_MODES[] = {
+  [UI_RING]          = { "ring",       ... },
+  [UI_SETTINGS_LIST] = { "settings",   ... },
+  [UI_SETTINGS_EDIT] = { "brightness", ... },
+  [UI_ROTARY]        = { "rotary",     ... },
+};
+```
+
+A `NULL` handler means "this mode does not care", which the dispatcher treats exactly as returning
+`false`.
+
+### Threading contract — per handler
+
+Each slot runs on a specific task. Writing it into the table's declaration is what turns these from
+rules people remember into rules the structure states:
+
+| Handler | Runs on | `lvgl_lock` | May do |
+|---|---|---|---|
+| `enter` / `exit` | `loop()` | held by caller | anything the loop task may, including `macros_stop_all()` |
+| `on_encoder` | `encoder_task` | held by caller | touch LVGL; **never** call the macro engine directly |
+| `on_tap` / `on_gesture` | LVGL task | already held by `lv_timer_handler` | set flags, touch LVGL; **never** the macro engine |
+
+`on_tap` and `on_gesture` must use the request forms — `macros_request_fire()`,
+`macros_request_stop_all()`, or the new rotary-step request — exactly as today's callbacks do.
+
+### Default-safe fall-through
+
+Both input handlers return `true` when they consume the event. When they return `false` the
+dispatcher applies a default, and the defaults are chosen so that a mode which *forgets* something
+gets the safe behaviour rather than no behaviour:
+
+- **`on_gesture` returning false for `LV_DIR_BOTTOM` → kill all macros.** This is how the panic
+  gesture stays universal without every mode having to remember it. A future mode that ignores
+  gestures entirely still cannot trap a running macro behind itself.
+- **`on_tap` returning false → do nothing.** Firing a macro is ring-specific and the ring's own
+  handler does it. This makes *"no non-ring mode may fire a macro"* structural rather than a rule
+  each site must independently observe.
+
+The unconditional `lv_indev_wait_release(indev)` stays at the top of `screen_gesture_cb`, before
+dispatch. A gesture is never also a tap, whatever the mode goes on to decide.
+
+---
+
+## 4. Orientation
 
 ### Mechanism
 
@@ -89,6 +162,11 @@ known-good:
 | 3 (270°) | `0xA0` | `x = V − ty, y = tx` | **derived, unverified** |
 
 If a rotation renders or touches wrong, the transform is the first suspect, not the MADCTL value.
+
+**180° and 270° are the primary use case, not edge cases.** In active use the cable wants to exit
+the top or the right of the dial; any other orientation fouls placement and puts strain on the
+port. So the two rotations that are *unproven* are precisely the two that must work. Expect to
+iterate on them with the board in hand rather than treating a first pass as done.
 
 ### Applying it
 
@@ -126,7 +204,7 @@ the touch transform rotate.
 
 ---
 
-## 4. Icons
+## 5. Icons
 
 ### Data
 
@@ -159,10 +237,18 @@ survives review.
 (`lv_draw_img.h:38`). That lets the icon take the same per-wedge black/white contrast choice the
 labels already use.
 
-**18×18 is load-bearing.** `LV_IMG_BUF_SIZE_ALPHA_1BIT(w,h)` is `((w/8)+1)*h` while the decoder
-computes its stride as `(w+7)>>3`. At w=18 both give 3 bytes per row and 54 bytes total. At any
-width that is an exact multiple of 8 they **disagree**. Do not change the icon size without
-re-deriving both.
+**18×18 is load-bearing, and it is also the shared contract.** The app generates at 18×18 and the
+M5Dial draws at 18×18, so the size is fixed by parity, not just by convenience — the hex payload
+is the interchange format between all three components.
+
+It is additionally load-bearing inside LVGL: `LV_IMG_BUF_SIZE_ALPHA_1BIT(w,h)` is `((w/8)+1)*h`
+while the decoder computes its stride as `(w+7)>>3`. At w=18 both give 3 bytes per row and 54 bytes
+total. At any width that is an exact multiple of 8 they **disagree**. Changing the icon size would
+therefore break parity *and* silently corrupt rendering — do not.
+
+The hex→bytes parse and the bit reversal are board-independent and could be shared; only the draw
+call differs (`lv_draw_img` versus `drawXBitmap`). Sharing them is not required for M9, since the
+M5Dial's parser already works, but the split is worth respecting if this is ever factored out.
 
 ### Placement
 
@@ -177,7 +263,7 @@ to the drawing board.
 
 ---
 
-## 5. Rotary macro mode
+## 6. Rotary macro mode
 
 ### Behaviour
 
@@ -225,27 +311,11 @@ The active rotary macro is held as a `JsonObject` into `profilesDoc`, so — lik
 path and must clear it too, or a reload while the rotary screen is up is a use-after-free of the
 same class H3 fixed.
 
-### The tap handler must become mode-aware
+### Input routing
 
-`screen_click_cb` currently treats **any** non-ring mode as "Settings":
-
-```c
-  if (ui_mode != UI_RING) {
-    settings_enter_requested = true;
-    return;
-  }
-```
-
-That guard exists for a good reason — a menu tap must never reach `macros_request_fire()` — and it
-was correct while `UI_SETTINGS_LIST` and `UI_SETTINGS_EDIT` were the only non-ring modes. Adding
-`UI_ROTARY` breaks it: tap-to-exit would set the Settings enter flag and open the brightness editor
-instead.
-
-Replace the catch-all with an explicit branch per mode: rotary raises a rotary-exit request, the
-settings modes raise the enter request, and the ring falls through to the existing tap handling.
-The invariant to preserve is unchanged — **no non-ring mode may reach `macros_request_fire()`** —
-but it must now be enforced by naming the modes rather than by "not the ring", so the next mode
-added fails loudly rather than inheriting somebody else's behaviour.
+Rotary is a mode like any other: it is one entry in the dispatch table described in §3, declaring
+its own encoder, tap and gesture behaviour. It needs no special-casing anywhere else, which is the
+point of doing that refactor first.
 
 ### Removing the lying comment
 
@@ -254,7 +324,7 @@ implementing the real thing.
 
 ---
 
-## 6. `icon_xbm` strip and merge
+## 7. `icon_xbm` strip and merge
 
 ### Strip on read
 
@@ -280,15 +350,30 @@ if it has no `icon_xbm` and the currently stored macro at the same `pos` in the 
 carry the stored value across.
 
 This makes stripping safe against **any** client — the app, a hand-edited `profiles.json`, nRF
-Connect, or a future desktop client — rather than trusting one client to behave. The same fix
-ported back to the M5Dial closes the bug there.
+Connect, or a future desktop client — rather than trusting one client to behave.
+
+### The M5Dial gets the same fix — it is in scope
+
+The M5Dial already strips and does **not** merge, so the icon-wipe is live on it today: edit one
+macro in the app and every other macro on that device loses its bitmap. It is a silent data-loss
+bug on a supported board.
+
+The requirement for M9 is that a user cannot tell the two devices apart behaviourally, so the merge
+is ported to `firmware/M5_M6_config/M5_M6_config.ino`'s `save_profiles` handler as part of this
+milestone. The implementations differ — different JSON plumbing, different display stack — but the
+observable behaviour must not.
+
+**This is the only M5Dial change in M9.** Its other gaps — no Settings menu, no rotating ring, no
+brightness gauge — stay for the board-sequencing pass after the Waveshare reaches M10, per
+`CLAUDE.md`. Those are absences of Waveshare-only features rather than divergent behaviour in a
+shared one.
 
 The merge happens on the in-memory document before serialization, so it composes with the existing
 H4 atomic write (temp file → verify → rename) rather than replacing it.
 
 ---
 
-## 7. Keep intact
+## 8. Keep intact
 
 - `wedge_center_angle()` / `wedge_index_from_point()` — exact inverses over the animated rotation,
   hand-verified. Nothing here needs them changed.
@@ -305,7 +390,7 @@ H4 atomic write (temp file → verify → rename) rather than replacing it.
 
 ---
 
-## 8. Verification
+## 9. Verification
 
 The compile gate is mandatory. Everything in §2 needs a human at the board. Specific things to
 watch, because each is a known trap rather than a general check:
