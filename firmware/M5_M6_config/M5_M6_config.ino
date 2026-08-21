@@ -800,6 +800,24 @@ void sendBleMessage(const String &msg) {
   Serial.println("BLE TX: sent");
 }
 
+// Looks up a macro by (profileIdx, pos) in the currently-loaded profilesDoc -- i.e. the stored
+// document still in memory, not yet overwritten by an incoming save. Used only by the
+// save_profiles icon_xbm merge below, which must cross-reference every profile in the INCOMING
+// document against what's already on the device, not just the active/on-screen profile. pos is
+// only unique within a profile, hence the separate profileIdx. Returns a null JsonObject (check
+// with .isNull()) if profileIdx or pos don't match anything.
+static JsonObject findStoredMacro(int profileIdx, int pos) {
+  JsonArray profiles = profilesDoc["profiles"];
+  if (profiles.isNull() || profileIdx < 0 || profileIdx >= (int)profiles.size()) return JsonObject();
+  JsonObject prof = profiles[profileIdx];
+  JsonArray macros = prof["macros"];
+  for (JsonObject m : macros) {
+    int p = m["pos"] | -1;
+    if (p == pos) return m;
+  }
+  return JsonObject();
+}
+
 // Takes a mutable char* on purpose: deserializeJson(doc, char*) parses ZERO-COPY — req's
 // strings point into cmdStr itself (unescaped in place) instead of being duplicated, which
 // roughly halves peak RAM while parsing a ~12KB save_profiles command. cmdStr must therefore
@@ -854,7 +872,51 @@ void handleBleCommand(char *cmdStr) {
       sendBleMessage("{\"status\":\"error\",\"message\":\"No profiles object provided\"}");
       return;
     }
-    
+
+    // get_profiles strips icon_xbm on the way out (see ICON_XBM_MARKER above), so the app's
+    // in-memory document never holds bitmaps at all -- and saveProfiles() in the app sends its
+    // WHOLE in-memory document back, only ever writing icon_xbm for the macro actually being
+    // edited (companion_app/lib/screens/editor_panel.dart:106). Stripping without this merge
+    // means saving after editing one macro silently wipes every other macro's icon -- a live
+    // data-loss bug on this board today. Mirrors the Waveshare's fix (f53206f,
+    // firmware/Waveshare_LVGL_Test/ble_engine.cpp / profiles_find_macro_in()); the JSON plumbing
+    // differs -- this board keeps the still-stored profilesDoc around as a plain global to check
+    // against, rather than a dedicated lookup exported from a separate macro-engine module -- but
+    // the observable behaviour must match.
+    //
+    // Runs on the in-memory profilesObj document BEFORE serialization, ahead of the write below,
+    // so it composes with the existing write path instead of restructuring it.
+    {
+      JsonArray incomingProfiles = profilesObj["profiles"];
+      int profileIdx = 0;
+      for (JsonObject incomingProfile : incomingProfiles) {
+        JsonArray incomingMacros = incomingProfile["macros"];
+        for (JsonObject incomingMacro : incomingMacros) {
+          // An incoming icon_xbm always wins -- never overwrite a bitmap the client actually
+          // sent. isNull() (absent) is checked, not emptiness (present-but-empty is left alone).
+          if (!incomingMacro["icon_xbm"].isNull()) continue;
+          int pos = incomingMacro["pos"] | -1;
+          if (pos < 0) continue;
+          // Match by pos within the profile, NOT array index -- the app may reorder macros, and
+          // index matching would transplant one macro's bitmap onto another. Profiles themselves
+          // are matched by index (profileIdx), since pos is only unique within a profile. No
+          // stored counterpart at this pos in this profile means a genuinely new macro -- that
+          // has no bitmap to inherit, which is correct, not an error to log or abort on.
+          JsonObject storedMacro = findStoredMacro(profileIdx, pos);
+          const char *storedIcon = storedMacro["icon_xbm"] | (const char *)nullptr;
+          if (storedIcon != nullptr) {
+            // Copy via String rather than aliasing the const char* -- profilesObj was
+            // deserialized zero-copy from cmdStr (see handleBleCommand's parse above), and
+            // profilesDoc (where storedIcon points) is about to be replaced by loadProfiles()
+            // below, so an unowned pointer into it would be a lifetime trap for whoever touches
+            // this next even though it happens to outlive the serialize a few lines down.
+            incomingMacro["icon_xbm"] = String(storedIcon);
+          }
+        }
+        profileIdx++;
+      }
+    }
+
     File f = LittleFS.open("/profiles.json", "w");
     if (f) {
       serializeJson(profilesObj, f);
