@@ -26,6 +26,13 @@ void profiles_reload();
 const char *profiles_active_name();
 JsonObject profiles_find_macro(int pos);
 
+// Same lookup as profiles_find_macro(), but against an arbitrary profile index rather than only
+// the active one. Used by save_profiles's icon_xbm merge (ble_engine.cpp), which must cross-
+// reference every profile in the INCOMING document against what's already stored on the device,
+// not just whichever one happens to be on screen right now. Returns a null JsonObject (check
+// with .isNull()) if profileIdx or pos don't match anything.
+JsonObject profiles_find_macro_in(int profileIdx, int pos);
+
 // The active document's settings.brightness -- the SEED for NVS brightness, never a source of
 // truth once NVS has been written (see device_state.h). 160 if absent or out of range.
 uint8_t profiles_default_brightness();

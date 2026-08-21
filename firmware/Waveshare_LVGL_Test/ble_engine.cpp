@@ -135,6 +135,77 @@ private:
   uint8_t _seq = 0;
 };
 
+// The ,"icon_xbm":"<hex>" pairs are stripped from get_profiles responses on the fly (the app
+// only needs the icon *name*; the 18x18 1bpp bitmap is display-side data the app never renders).
+// Marker-matching state machine mirrored from M5_M6_config.ino's BleChunkSink (search
+// ICON_XBM_MARKER there), but wrapping BleChunkSink rather than folding into it: unlike the
+// M5Dial, this board's chunk sink already streams with near-zero peak heap (see BleChunkSink
+// above), so stripping here is a bandwidth/latency saving, not the String-fragmentation
+// stability fix it was on the M5Dial -- that heap-pressure history does not apply to this sink
+// and is not why this exists.
+static const char ICON_XBM_MARKER[] = ",\"icon_xbm\":\"";
+
+class IconXbmFilterSink : public Print {
+public:
+  explicit IconXbmFilterSink(Print &out) : _out(out) {}
+
+  size_t write(uint8_t c) override {
+    if (_skipping) {
+      // Swallowing an icon_xbm hex value: it contains no quotes or escapes, so it ends at the
+      // next '"' (also swallowed -- the marker's opening quote was never forwarded).
+      if (c == '"') _skipping = false;
+      return 1;
+    }
+    if (c == (uint8_t)ICON_XBM_MARKER[_matched]) {
+      _matched++;
+      if (ICON_XBM_MARKER[_matched] == '\0') { // full marker matched -- swallow the value next
+        _matched = 0;
+        _skipping = true;
+      }
+      return 1; // matched bytes are withheld until the match fails or completes
+    }
+    if (_matched > 0) {
+      // Partial match broken: forward the withheld marker prefix, then re-run this byte against
+      // the marker start. (Safe single-step fallback: ',' only occurs at position 0 of the
+      // marker, so no longer suffix of a broken match can begin a new match.)
+      int had = _matched;
+      _matched = 0;
+      for (int i = 0; i < had; i++) {
+        if (_out.write((uint8_t)ICON_XBM_MARKER[i]) != 1) return 0;
+      }
+      if (c == (uint8_t)ICON_XBM_MARKER[0]) {
+        _matched = 1;
+        return 1;
+      }
+    }
+    return _out.write(c);
+  }
+
+  size_t write(const uint8_t *buffer, size_t size) override {
+    size_t n = 0;
+    while (n < size && write(buffer[n]) == 1) n++;
+    return n;
+  }
+
+  // Call once, after the trailing '\n' delimiter, before checking the wrapped sink's own
+  // failed/flushRemainder(). Forwards any marker prefix still withheld at end-of-stream (it
+  // can't be a real icon_xbm -- the message ends "}\n" -- but is forwarded anyway for
+  // correctness) so the wrapped sink's buffer holds every byte before it flushes.
+  bool flushRemainder() {
+    int had = _matched;
+    _matched = 0;
+    for (int i = 0; i < had; i++) {
+      if (_out.write((uint8_t)ICON_XBM_MARKER[i]) != 1) return false;
+    }
+    return true;
+  }
+
+private:
+  Print &_out;
+  int _matched = 0;       // bytes of ICON_XBM_MARKER currently matched (withheld)
+  bool _skipping = false; // inside an icon_xbm hex value
+};
+
 static void sendBleMessage(const String &msg) {
   bleSendPreamble();
   int len = msg.length();
@@ -164,10 +235,14 @@ static void handleBleCommand(char *cmdStr) {
   if (cmd == "get_profiles") {
     bleSendPreamble();
     BleChunkSink sink;
-    sink.print("{\"status\":\"ok\",\"profiles\":");
-    profiles_serialize(sink);
-    sink.print("}\n");
-    if (sink.flushRemainder()) {
+    IconXbmFilterSink filtered(sink);
+    filtered.print("{\"status\":\"ok\",\"profiles\":");
+    profiles_serialize(filtered);
+    filtered.print("}\n");
+    // filtered.flushRemainder() forwards any still-withheld marker-prefix bytes into sink's
+    // buffer; sink.flushRemainder() then sends whatever chunk that leaves (and is also what
+    // surfaces a failure sink.write() hit earlier, since it checks `failed` itself).
+    if (filtered.flushRemainder() && sink.flushRemainder()) {
       Serial.printf("[ble] get_profiles: streamed %u bytes\n", (unsigned)sink.totalSent);
     } else {
       Serial.println("[ble] get_profiles: send aborted (ack retries exhausted)");
@@ -185,6 +260,46 @@ static void handleBleCommand(char *cmdStr) {
       sendBleMessage("{\"status\":\"error\",\"message\":\"No profiles object provided\"}");
       return;
     }
+
+    // The app sends its WHOLE in-memory document on save, and only ever writes icon_xbm for the
+    // macro being edited (editor_panel.dart:106). Combined with stripping on read, that means
+    // editing one macro would wipe every other macro's icon. This is a live bug on the M5Dial
+    // today. Merging here makes stripping safe against ANY client -- the app, a hand-edited
+    // profiles.json, nRF Connect, a future desktop client -- rather than trusting one to behave.
+    //
+    // Runs on the in-memory document before serialization, so it composes with the H4 atomic
+    // write (temp -> verify -> rename) rather than replacing it.
+    {
+      JsonArray incomingProfiles = profilesObj["profiles"];
+      int profileIdx = 0;
+      for (JsonObject incomingProfile : incomingProfiles) {
+        JsonArray incomingMacros = incomingProfile["macros"];
+        for (JsonObject incomingMacro : incomingMacros) {
+          // If the incoming macro HAS an icon_xbm, it wins -- never overwrite a bitmap the
+          // client actually sent.
+          if (!incomingMacro["icon_xbm"].isNull()) continue;
+          int pos = incomingMacro["pos"] | -1;
+          if (pos < 0) continue;
+          // Look the stored macro up by pos, not array position -- the app may reorder macros,
+          // and matching by index would transplant one macro's icon onto another. Profiles
+          // themselves are matched by index (profileIdx), since pos is only unique within a
+          // profile. A macro with no stored counterpart at this pos in this profile is genuinely
+          // new and simply has no bitmap to inherit -- that's correct, not an error.
+          JsonObject storedMacro = profiles_find_macro_in(profileIdx, pos);
+          const char *storedIcon = storedMacro["icon_xbm"] | (const char *)nullptr;
+          if (storedIcon != nullptr) {
+            // Copy out of profilesDoc's pool via String rather than aliasing the const char* --
+            // req is deserialized zero-copy from cmdStr (see handleBleCommand's parse above), so
+            // an unowned pointer into a THIRD document's pool (profilesDoc) is an easy lifetime
+            // trap for whoever touches this next, even though within this call it would in fact
+            // outlive the serialize below.
+            incomingMacro["icon_xbm"] = String(storedIcon);
+          }
+        }
+        profileIdx++;
+      }
+    }
+
     // Write-temp-then-rename. Opening /profiles.json with "w" directly truncated the only good
     // copy before a single byte of the new one was written, and the serializeJson() byte count
     // was never checked -- a power loss, a full filesystem, or a short write left a truncated,

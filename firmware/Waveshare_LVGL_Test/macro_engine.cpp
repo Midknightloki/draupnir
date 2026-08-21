@@ -327,6 +327,18 @@ JsonObject profiles_find_macro(int pos) {
   return JsonObject();
 }
 
+JsonObject profiles_find_macro_in(int profileIdx, int pos) {
+  JsonArray profiles = profilesDoc["profiles"];
+  if (profiles.isNull() || profileIdx < 0 || profileIdx >= (int)profiles.size()) return JsonObject();
+  JsonObject prof = profiles[profileIdx];
+  JsonArray macros = prof["macros"];
+  for (JsonObject m : macros) {
+    int p = m["pos"] | -1;
+    if (p == pos) return m;
+  }
+  return JsonObject();
+}
+
 void profiles_serialize(Print &out) {
   serializeJson(profilesDoc, out);
 }
