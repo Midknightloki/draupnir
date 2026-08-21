@@ -114,6 +114,13 @@ bool        macros_rotary_active(void) { return rotaryActive; }
 const char *macros_rotary_name(void)   { return rotaryMacro.isNull() ? "Rotary"  : (const char *)(rotaryMacro["name"]  | "Rotary"); }
 const char *macros_rotary_color(void)  { return rotaryMacro.isNull() ? "#FFFFFF" : (const char *)(rotaryMacro["color"] | "#FFFFFF"); }
 
+// See macro_engine.h: clears ONLY the rotary binding, deliberately leaving runningMacros[]
+// untouched -- exiting a rotary screen is not a kill-all, on the M5Dial or here.
+void macros_rotary_stop(void) {
+  rotaryActive = false;
+  rotaryMacro  = JsonObject();   // drop the reference into the document pool
+}
+
 bool macros_any_running() {
   for (int i = 0; i < NUM_MACRO_SLOTS; i++) {
     if (runningMacros[i].active) return true;

@@ -1218,7 +1218,11 @@ static void update_rotary(void) {
     // permanently and the overlay never closes.
     if (!lvgl_lock(200)) return;
     rotary_exit_requested = false;
-    macros_stop_all();   // drops the JsonObject into profilesDoc; loop()-task only, allowed here
+    // macros_rotary_stop(), NOT macros_stop_all(): exiting a rotary screen stops the knob
+    // driving that macro, not every running macro -- entering rotary mode didn't stop anything
+    // either, and the M5Dial's own rotary exit (M5_M6_config.ino) never calls killAllMacros().
+    // loop()-task only, allowed here.
+    macros_rotary_stop();
     ui_mode_set(UI_RING);
     lv_obj_add_flag(rotary_overlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_invalidate(lv_scr_act());

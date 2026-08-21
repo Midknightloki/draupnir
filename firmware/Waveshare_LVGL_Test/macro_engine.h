@@ -115,3 +115,17 @@ const char *macros_rotary_name(void);
 // Returns the raw "#RRGGBB" string, not a parsed value: parse_hex_color() lives in the .ino and
 // the macro engine stays free of display concerns.
 const char *macros_rotary_color(void);
+
+// Clears ONLY the rotary binding, leaving runningMacros[] alone. Exiting a rotary screen stops
+// the knob driving that macro's actions; it is not a reason to kill unrelated macros, and the
+// M5Dial does not kill them either -- M9 requires the two boards to be indistinguishable.
+//
+// macros_stop_all() still clears rotary state as well, so the profile-reload path keeps its
+// use-after-free protection: rotaryMacro holds a JsonObject into profilesDoc.
+//
+// loop()-task only, same constraint as the rest of the engine's mutating API (macros_fire(),
+// macros_stop_all()): it mutates rotaryActive/rotaryMacro directly with no locking. Callers on
+// any other task (LVGL, BLE) must not call this -- there is no request-queue form because
+// nothing outside loop() currently needs one; add one if that changes rather than calling this
+// directly from another task.
+void macros_rotary_stop(void);
