@@ -488,6 +488,10 @@ static int wedge_index_from_point(lv_coord_t px, lv_coord_t py) {
 static void settings_layout(void);
 static void gauge_refresh(void);
 
+// A tap inside the inner radius (the center label area) fires whatever the encoder currently
+// has selected, without changing the selection. A tap on the ring itself fires that wedge
+// without changing the selection either -- the knob is the only thing that moves the ring.
+// Taps outside the outer radius (round-glass bezel) are ignored.
 static bool ring_on_tap(lv_coord_t px, lv_coord_t py) {
   if (active_count == 0) return true;
   float dx = (float)px - EXAMPLE_LCD_H_RES / 2.0f;
@@ -535,10 +539,15 @@ static bool ring_on_tap(lv_coord_t px, lv_coord_t py) {
 // Returns false for LV_DIR_BOTTOM on purpose, so the dispatcher's default kill-all runs. Keeping
 // kill-all in exactly one place is what stops a future mode from trapping a running macro.
 static bool ring_on_gesture(lv_dir_t dir) {
+  // Swipe UP: open Settings. Refused while the pairing overlay owns the screen -- a passkey
+  // being replaced by a menu mid-pairing is unrecoverable without restarting the pairing.
   if (dir == LV_DIR_TOP) {
     if (!ble_pairing_active()) settings_open_requested = true;
     return true;
   }
+  // Horizontal swipes switch profiles, matching M5_M6_config.ino:1375-1380 so the same gesture
+  // means the same thing on both boards: swipe left = next, swipe right = previous.
+  // Ignored while Settings or the pairing overlay owns the screen.
   if (dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) {
     if (!ble_pairing_active()) profile_switch_delta = (dir == LV_DIR_LEFT) ? 1 : -1;
     return true;
@@ -550,6 +559,8 @@ static void ring_on_encoder(int delta) {
   // Re-check INSIDE the lock: a profile reload on the loop task can drop active_count to 0 while
   // this task waits, making the modulo a divide-by-zero that traps and reboots the S3.
   if (active_count > 0) {
+    // MINUS delta: turning the knob clockwise spins the RING clockwise, bringing the wedge
+    // counter-clockwise of the top up to the selector. The dial is attached to the knob.
     select_idx((selected_idx - delta + active_count) % active_count);
   }
 }
@@ -569,6 +580,8 @@ static bool settings_on_gesture(lv_dir_t dir) {
 }
 
 static void settings_list_on_encoder(int delta) {
+  // Clamp, no wrap -- matching the profile list (spec section 5). With one item this is a
+  // no-op and the encoder does nothing here; that is expected, not a dead encoder.
   int next = settings_sel + delta;
   if (next < 0) next = 0;
   if (next > SETTINGS_ITEM_COUNT - 1) next = SETTINGS_ITEM_COUNT - 1;
@@ -578,7 +591,7 @@ static void settings_list_on_encoder(int delta) {
 
 static void settings_edit_on_encoder(int delta) {
   const setting_item_t *it = &SETTINGS_ITEMS[settings_sel];
-  it->apply(it->get() + delta * it->step);
+  it->apply(it->get() + delta * it->step);   // live preview: the panel changes as you turn
   gauge_refresh();
   settings_last_activity = millis();
 }
@@ -604,10 +617,8 @@ static void ui_mode_set(ui_mode_t next) {
   if (mode_def()->enter) mode_def()->enter();
 }
 
-// A tap inside the inner radius (the center label area) fires whatever the encoder currently
-// has selected, without changing the selection. A tap on the ring itself fires that wedge
-// without changing the selection either -- the knob is the only thing that moves the ring.
-// Taps outside the outer radius (round-glass bezel) are ignored.
+// Dispatches to the active mode's on_tap handler; the per-mode tap semantics (what "inner
+// radius", "ring band", etc. mean) live with each handler -- see ring_on_tap()/settings_on_tap().
 static void screen_click_cb(lv_event_t *e) {
   (void)e;
   lv_indev_t *indev = lv_indev_get_act();
