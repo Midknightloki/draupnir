@@ -786,6 +786,9 @@ static void update_profiles_reload(void) {
   // a use-after-free on the renderer: the same defect class H3 fixed for the macro engine, on a
   // second reader that H3 did not cover.
   profiles_reload();
+  // Orientation is applied live so the screen rotates the moment the app saves. MADCTL and the
+  // touch transform are both cheap; neither needs a reboot.
+  lcd_set_orientation(profiles_orientation());
   rebuild_ring_layout();
   selected_idx = 0;
   if (active_count > 0) select_idx(selected_idx);
@@ -1178,6 +1181,7 @@ void setup() {
 
   lcd_lvgl_Init();
   Serial.printf("[diag] lcd_lvgl_Init done heap=%u\n", ESP.getFreeHeap());
+  lcd_set_orientation(profiles_orientation());
   // Brightness: NVS if it has ever been set on the device, else the profile document's
   // settings.brightness as a seed. Was hardcoded to LCD_PWM_MODE_255, which meant
   // settings.brightness existed in the schema and did nothing.

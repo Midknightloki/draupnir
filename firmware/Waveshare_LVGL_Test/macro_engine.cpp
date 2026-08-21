@@ -281,6 +281,12 @@ uint8_t profiles_default_brightness() {
   return (uint8_t)b;
 }
 
+uint8_t profiles_orientation(void) {
+  int o = profilesDoc["settings"]["orientation"] | 0;
+  if (o < 0 || o > 3) o = 0;
+  return (uint8_t)o;
+}
+
 JsonObject profiles_find_macro(int pos) {
   JsonArray profiles = profilesDoc["profiles"];
   if (profiles.isNull() || activeProfileIdx >= (int)profiles.size()) return JsonObject();

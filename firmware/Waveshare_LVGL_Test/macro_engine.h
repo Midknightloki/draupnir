@@ -30,6 +30,13 @@ JsonObject profiles_find_macro(int pos);
 // truth once NVS has been written (see device_state.h). 160 if absent or out of range.
 uint8_t profiles_default_brightness();
 
+// settings.orientation, 0..3 (0/90/180/270 degrees). 0 if absent or out of range.
+// profiles.json is the SINGLE source of truth for this -- deliberately unlike brightness, which
+// is NVS-authoritative. Brightness has one writer (the device); orientation will have two once
+// the Settings menu gains an entry, and NVS cannot reconcile two writers without the device
+// writing back to JSON anyway -- at which point NVS is a redundant second copy.
+uint8_t profiles_orientation(void);
+
 // Active profile's "color" (e.g. "#3080E0"), "#FFFFFF" if absent. Used for the ring's
 // directional profile indicators.
 const char *profiles_active_color();

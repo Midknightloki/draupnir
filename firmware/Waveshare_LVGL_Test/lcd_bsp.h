@@ -28,6 +28,10 @@ static void example_lvgl_port_task(void *arg);
 static void example_lvgl_unlock(void);
 static bool example_lvgl_lock(int timeout_ms);
 void lcd_lvgl_Init(void);
+// Sets the panel's MADCTL rotation (0=0deg, 1=90deg, 2=180deg, 3=270deg) at runtime. Also
+// updates the touch coordinate transform (example_lvgl_touch_cb reads s_orientation directly).
+// Safe to call again after boot -- e.g. after a profile reload -- no reboot required.
+void lcd_set_orientation(uint8_t o);
 static void example_lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data);
 // Public locking API for building/updating the UI from the .ino -- LVGL itself is not
 // thread-safe, and example_lvgl_port_task() drives lv_timer_handler() continuously on its own

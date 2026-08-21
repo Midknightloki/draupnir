@@ -198,12 +198,27 @@ static const sh8601_lcd_init_cmd_t lcd_init_cmds[] =
   {0x21, (uint8_t[]){0x00}, 1, 0},
   {0x11, (uint8_t[]){0x00}, 1, 120},
   {0x29, (uint8_t[]){0x00}, 1, 0},
-#ifdef EXAMPLE_Rotate_90
-  {0x36, (uint8_t[]){0x60}, 1, 0},
-#else
   {0x36, (uint8_t[]){0x00}, 1, 0},
-#endif
 };
+
+// Rotation is done by the PANEL via MADCTL (0x36), not in software. Do not reach for esp_lcd's
+// rotation API or LVGL's sw_rotate: panel_sh8601_swap_xy() returns ESP_ERR_NOT_SUPPORTED
+// (esp_lcd_sh8601.c:319) and mirror_y is unsupported too, while LVGL's software rotation would
+// re-rotate every flush on a device already rendering ten stripes per frame.
+//
+// 0x00 and 0x60 are proven on this hardware. 0xC0 and 0xA0 are the conventional 180/270 values
+// and are UNVERIFIED -- and they are the two the owner actually needs, because the cable must
+// exit the top or right of the dial in use.
+static const uint8_t MADCTL_FOR_ORIENTATION[4] = { 0x00, 0x60, 0xC0, 0xA0 };
+static uint8_t s_orientation = 0;
+
+void lcd_set_orientation(uint8_t o)
+{
+  if (o > 3) o = 0;
+  s_orientation = o;
+  uint8_t madctl = MADCTL_FOR_ORIENTATION[o];
+  esp_lcd_panel_io_tx_param(amoled_panel_io_handle, 0x36, &madctl, 1);
+}
 
 void lcd_lvgl_Init(void)
 {
@@ -384,13 +399,16 @@ static void example_lvgl_touch_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
   uint8_t win = getTouch(&tp_x,&tp_y);
   if (win)
   {
-    #ifdef EXAMPLE_Rotate_90
-      data->point.x = tp_y;
-      data->point.y = (EXAMPLE_LCD_V_RES - tp_x);
-    #else
-      data->point.x = tp_x;
-      data->point.y = tp_y;
-    #endif
+    // The touch panel is not rotated by MADCTL -- only the display is -- so its coordinates must
+    // be mapped into the rotated display frame here. Only the 90 degree case is proven (it is the
+    // vendor's own); 180 and 270 are derived and must be confirmed by eye. If a rotation displays
+    // correctly but taps land wrong, THIS is the suspect, not the MADCTL value.
+    switch (s_orientation) {
+      case 1:  data->point.x = tp_y;                       data->point.y = EXAMPLE_LCD_V_RES - tp_x; break;
+      case 2:  data->point.x = EXAMPLE_LCD_H_RES - tp_x;   data->point.y = EXAMPLE_LCD_V_RES - tp_y; break;
+      case 3:  data->point.x = EXAMPLE_LCD_V_RES - tp_y;   data->point.y = tp_x;                     break;
+      default: data->point.x = tp_x;                       data->point.y = tp_y;                     break;
+    }
     if(data->point.x > EXAMPLE_LCD_H_RES)
     data->point.x = EXAMPLE_LCD_H_RES;
     if(data->point.y > EXAMPLE_LCD_V_RES)
