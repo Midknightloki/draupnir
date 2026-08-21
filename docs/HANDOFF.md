@@ -32,10 +32,9 @@ switching) are also done**, verified on hardware, on branch `feat/m7-m8-persiste
 past its original scope into a full ring rework; see §3.
 
 **The immediate goal is finishing this branch.** Code is written, reviewed, flashed, and the
-final-review hardware pass is complete (§4) — one narrow judgment call remains (the debounce fix's
-untested overflow path) before sign-off. After that, the sequence is M8b/M9 (icons — the ring is
-now shaped to receive them) and then closing the M5Dial's security gap, ahead of M10's comfort
-items. See §6.
+final-review hardware pass is complete (§4) — all six checks passed. The sequence from here is
+M8b/M9 (icons — the ring is now shaped to receive them) and then closing the M5Dial's security
+gap, ahead of M10's comfort items. See §6.
 
 ---
 
@@ -243,12 +242,20 @@ proposed Visual Studio reinstall that would have fixed nothing.
 ### Step 1 — Final sign-off and merge
 
 The outstanding hardware pass (§4) is complete — all six checks passed 2026-08-20 against
-`9ed000a`. What remains before merge is narrow: decide whether the debounce fix's >768 ms path
-(§4) needs a deliberate reproduction attempt before sign-off, or ships correct-by-inspection and
-unexercised, which is a judgment call rather than a blocking gap. Then triage the deferred-minor
-list in the ledger's final section (mostly cosmetic — the `state_set_active_profile` sentinel,
-`update_profile_switch`'s pre-lock read, a stale comment — none blocking), and hand off to
-`superpowers:finishing-a-development-branch`.
+`9ed000a`.
+
+**The debounce fix's unexercised >768 ms path (§4) was ruled non-blocking**, so that decision does
+not need re-making. The fix saturates the counter at `DEBOUNCE_TICKS`, so the release edge's
+pre-increment yields 3 and passes for every hold length; the counter can never exceed 3, which
+means no wrap is reachable. That arithmetic was independently verified across three hold lengths
+including 1000 polls during the final review. What it prevents is a dropped click — an annoyance,
+not a hazard — and reproducing it requires parking the knob mid-detent to hold the contact low,
+which costs a flash cycle for near-zero information. It is recorded as correct-by-inspection and
+unexercised, and that is where it should stay unless the symptom is ever seen in the wild.
+
+What remains is to triage the deferred-minor list in the ledger's final section — mostly cosmetic
+(the `state_set_active_profile` sentinel, `update_profile_switch`'s pre-lock read, a stale
+comment), none blocking — and hand off to `superpowers:finishing-a-development-branch`.
 
 ### Step 2 — M8b, then M9
 
