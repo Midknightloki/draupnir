@@ -43,8 +43,30 @@ static int active_count = 0;
 // ui_mode is owned by loop(). LVGL-task callbacks (touch, gesture) and encoder_task only ever
 // RAISE a request flag; loop() performs the transition under lvgl_lock(). Same pattern as
 // update_pairing_overlay()/update_profiles_reload(). See spec section 9.
-typedef enum { UI_RING, UI_SETTINGS_LIST, UI_SETTINGS_EDIT } ui_mode_t;
+typedef enum { UI_RING, UI_SETTINGS_LIST, UI_SETTINGS_EDIT, UI_MODE_COUNT } ui_mode_t;
 static ui_mode_t ui_mode = UI_RING;
+
+// Each UI mode declares how it handles input, and the slot each handler occupies states which
+// task runs it and under what lock. Before this table, three separate call sites each decided
+// independently what a mode meant, and that produced two bugs of identical shape: screen_click_cb
+// treating every non-ring mode as Settings, and three gesture sites each having to remember
+// lv_indev_wait_release() -- the one that forgot let the panic gesture fire a macro into the host.
+//
+//   enter/exit    -- loop() task, lvgl_lock HELD by the caller. May call the macro engine.
+//   on_encoder    -- encoder_task, lvgl_lock HELD by the caller. May touch LVGL.
+//                    MUST NOT call the macro engine directly; use the request forms.
+//   on_tap        -- LVGL task (lock already held by lv_timer_handler). Flags and LVGL only.
+//   on_gesture    -- LVGL task, same rule. Returns true if it consumed the gesture.
+//
+// A NULL handler means "this mode does not care" and is treated exactly as returning false.
+typedef struct {
+  const char *name;                             // diagnostics only
+  void (*enter)(void);
+  void (*exit)(void);
+  void (*on_encoder)(int delta);
+  bool (*on_tap)(lv_coord_t x, lv_coord_t y);
+  bool (*on_gesture)(lv_dir_t dir);
+} ui_mode_def_t;
 
 static volatile bool settings_open_requested  = false;
 static volatile bool settings_close_requested = false;
@@ -459,33 +481,23 @@ static int wedge_index_from_point(lv_coord_t px, lv_coord_t py) {
   return ((rel % active_count) + active_count) % active_count;
 }
 
-// A tap inside the inner radius (the center label area) fires whatever the encoder currently
-// has selected, without changing the selection. A tap on the ring itself fires that wedge
-// without changing the selection either -- the knob is the only thing that moves the ring.
-// Taps outside the outer radius (round-glass bezel) are ignored.
-static void screen_click_cb(lv_event_t *e) {
-  // A tap while Settings is open activates the centred item. It must NEVER fall through to
-  // macros_request_fire() -- firing a macro from a menu tap is the wrong surprise on a device
-  // whose whole job is sending keystrokes.
-  if (ui_mode != UI_RING) {
-    settings_enter_requested = true;
-    return;
-  }
+// Forward declarations: settings_list_on_encoder()/settings_edit_on_encoder() below call these,
+// but their bodies (settings_layout(), gauge_refresh()) are defined later in the file alongside
+// the rest of the Settings panel. Declaring here rather than moving those definitions keeps this
+// diff to the dispatch refactor only.
+static void settings_layout(void);
+static void gauge_refresh(void);
 
-  if (active_count == 0) return;
-  lv_indev_t *indev = lv_indev_get_act();
-  if (!indev) return;
-  lv_point_t p;
-  lv_indev_get_point(indev, &p);
-
-  float dx = (float)p.x - EXAMPLE_LCD_H_RES / 2.0f;
-  float dy = (float)p.y - EXAMPLE_LCD_V_RES / 2.0f;
+static bool ring_on_tap(lv_coord_t px, lv_coord_t py) {
+  if (active_count == 0) return true;
+  float dx = (float)px - EXAMPLE_LCD_H_RES / 2.0f;
+  float dy = (float)py - EXAMPLE_LCD_V_RES / 2.0f;
   float dist = sqrtf(dx * dx + dy * dy);
 
   // The touch->fire path had no logging at all, which made a tap that never fired
   // indistinguishable from a tap that never arrived. Gated by DRAUPNIR_TRACE_INPUT.
   TRACE("[tap] CLICKED x=%d y=%d dist=%.1f inner=%d outer=%d active_count=%d\n",
-                (int)p.x, (int)p.y, dist, RING_INNER_R, RING_OUTER_R, active_count);
+                (int)px, (int)py, dist, RING_INNER_R, RING_OUTER_R, active_count);
 
   if (dist < RING_INNER_R) {
     // The indicator hot zones. Live ONLY while their indicator is showing, so at either end of
@@ -494,29 +506,118 @@ static void screen_click_cb(lv_event_t *e) {
     int pcount = profiles_count();
     int pidx   = profiles_active_index();
     if (fabsf(dy) < HOTZONE_MAX_DY && fabsf(dx) > HOTZONE_MIN_DX) {
-      if (dx < 0 && pidx > 0) {
+      if (dx < 0 && pidx > 0)              {
         TRACE("[tap] -> indicator prev\n");
-        profile_switch_delta = -1;
-        return;
+        profile_switch_delta = -1; return true;
       }
-      if (dx > 0 && pidx < pcount - 1) {
+      if (dx > 0 && pidx < pcount - 1)     {
         TRACE("[tap] -> indicator next\n");
-        profile_switch_delta = 1;
-        return;
+        profile_switch_delta =  1; return true;
       }
     }
     TRACE("[tap] -> center, fire pos=%d\n", active_positions[selected_idx]);
     macros_request_fire(active_positions[selected_idx]);
-  } else if (dist <= RING_OUTER_R + 10) {
-    int idx = wedge_index_from_point(p.x, p.y);
+    return true;
+  }
+  if (dist <= RING_OUTER_R + 10) {
+    int idx = wedge_index_from_point(px, py);
     // Fire WITHOUT selecting. Since Task 8 the ring rotates, so select_idx() would spin the
     // tapped wedge up to 12 o'clock -- the owner reported that as unexpected. The knob owns
     // selection; a tap is a shortcut to fire, nothing more.
     TRACE("[tap] -> wedge v=%d fire pos=%d (no reselect)\n", idx, active_positions[idx]);
     macros_request_fire(active_positions[idx]);
-  } else {
-    TRACE("[tap] -> outside ring, ignored\n");
+    return true;
   }
+  TRACE("[tap] -> outside ring, ignored\n");
+  return true;   // outside the ring: consumed and ignored
+}
+
+// Returns false for LV_DIR_BOTTOM on purpose, so the dispatcher's default kill-all runs. Keeping
+// kill-all in exactly one place is what stops a future mode from trapping a running macro.
+static bool ring_on_gesture(lv_dir_t dir) {
+  if (dir == LV_DIR_TOP) {
+    if (!ble_pairing_active()) settings_open_requested = true;
+    return true;
+  }
+  if (dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) {
+    if (!ble_pairing_active()) profile_switch_delta = (dir == LV_DIR_LEFT) ? 1 : -1;
+    return true;
+  }
+  return false;
+}
+
+static void ring_on_encoder(int delta) {
+  // Re-check INSIDE the lock: a profile reload on the loop task can drop active_count to 0 while
+  // this task waits, making the modulo a divide-by-zero that traps and reboots the S3.
+  if (active_count > 0) {
+    select_idx((selected_idx - delta + active_count) % active_count);
+  }
+}
+
+static bool settings_on_tap(lv_coord_t x, lv_coord_t y) {
+  (void)x; (void)y;
+  settings_enter_requested = true;
+  return true;
+}
+
+// Swipe down closes; up and sideways are consumed and ignored (spec section 6's exits table).
+// Returning true for BOTTOM deliberately suppresses the dispatcher's kill-all default: opening
+// Settings already stopped every running macro, so there is nothing to kill.
+static bool settings_on_gesture(lv_dir_t dir) {
+  if (dir == LV_DIR_BOTTOM) settings_close_requested = true;
+  return true;
+}
+
+static void settings_list_on_encoder(int delta) {
+  int next = settings_sel + delta;
+  if (next < 0) next = 0;
+  if (next > SETTINGS_ITEM_COUNT - 1) next = SETTINGS_ITEM_COUNT - 1;
+  if (next != settings_sel) { settings_sel = next; settings_layout(); }
+  settings_last_activity = millis();
+}
+
+static void settings_edit_on_encoder(int delta) {
+  const setting_item_t *it = &SETTINGS_ITEMS[settings_sel];
+  it->apply(it->get() + delta * it->step);
+  gauge_refresh();
+  settings_last_activity = millis();
+}
+
+// Positional, in ui_mode_t order -- C++ does not portably support designated array initialisers,
+// and the static_assert below is what catches a mismatch if the enum ever grows out of step.
+static const ui_mode_def_t UI_MODES[UI_MODE_COUNT] = {
+  /* UI_RING          */ { "ring",       NULL, NULL, ring_on_encoder,          ring_on_tap,     ring_on_gesture },
+  /* UI_SETTINGS_LIST */ { "settings",   NULL, NULL, settings_list_on_encoder, settings_on_tap, settings_on_gesture },
+  /* UI_SETTINGS_EDIT */ { "brightness", NULL, NULL, settings_edit_on_encoder, settings_on_tap, settings_on_gesture },
+};
+static_assert(sizeof(UI_MODES) / sizeof(UI_MODES[0]) == UI_MODE_COUNT,
+              "UI_MODES must have exactly one entry per ui_mode_t value");
+
+static inline const ui_mode_def_t *mode_def(void) { return &UI_MODES[ui_mode]; }
+
+// loop() task only, with lvgl_lock ALREADY HELD by the caller.
+static void ui_mode_set(ui_mode_t next) {
+  if (next == ui_mode) return;
+  const ui_mode_def_t *cur = mode_def();
+  if (cur->exit) cur->exit();
+  ui_mode = next;
+  if (mode_def()->enter) mode_def()->enter();
+}
+
+// A tap inside the inner radius (the center label area) fires whatever the encoder currently
+// has selected, without changing the selection. A tap on the ring itself fires that wedge
+// without changing the selection either -- the knob is the only thing that moves the ring.
+// Taps outside the outer radius (round-glass bezel) are ignored.
+static void screen_click_cb(lv_event_t *e) {
+  (void)e;
+  lv_indev_t *indev = lv_indev_get_act();
+  if (!indev) return;
+  lv_point_t p;
+  lv_indev_get_point(indev, &p);
+  const ui_mode_def_t *m = mode_def();
+  if (m->on_tap) m->on_tap(p.x, p.y);
+  // No default. A tap no mode consumes does NOTHING -- firing a macro is ring-specific and
+  // ring_on_tap does it. This makes "no non-ring mode may fire a macro" structural.
 }
 
 // Swipe down anywhere = stop every running macro. A gesture rather than an on-screen button
@@ -527,13 +628,13 @@ static void screen_click_cb(lv_event_t *e) {
 // Runs on the LVGL task, so it must NOT call macros_stop_all() directly (see macro_engine.h);
 // macros_request_stop_all() queues it for loop().
 static void screen_gesture_cb(lv_event_t *e) {
+  (void)e;
   lv_indev_t *indev = lv_indev_get_act();
   if (!indev) return;
   lv_dir_t dir = lv_indev_get_gesture_dir(indev);
 
-  // This touch is a gesture, so it is never also a tap -- whatever we decide below, including
-  // deciding to ignore it. LVGL delivers LV_EVENT_CLICKED on release regardless of the gesture
-  // (indev_proc_release, core/lv_indev.c), and wait_until_release is the only suppressor.
+  // Unconditional, before dispatch: this touch is a gesture, so it is never also a tap, whatever
+  // the mode decides below. LVGL sends LV_EVENT_CLICKED on release regardless of the gesture.
   //
   // Doing this per-branch has now failed three times: a swipe-up re-firing the macro Settings
   // had just stopped, a no-op swipe-down FIRING a macro when nothing was running, and a swipe
@@ -546,40 +647,16 @@ static void screen_gesture_cb(lv_event_t *e) {
   TRACE("[tap] GESTURE dir=%d (bottom=%d) any_running=%d\n",
                 (int)dir, (int)LV_DIR_BOTTOM, (int)macros_any_running());
 
-  // Swipe UP: open Settings. Refused while the pairing overlay owns the screen -- a passkey
-  // being replaced by a menu mid-pairing is unrecoverable without restarting the pairing.
-  if (dir == LV_DIR_TOP) {
-    if (ui_mode == UI_RING && !ble_pairing_active()) {
-      settings_open_requested = true;
-    }
-    return;
+  const ui_mode_def_t *m = mode_def();
+  if (m->on_gesture && m->on_gesture(dir)) return;
+
+  // Default-safe fall-through: an unhandled swipe-down still kills every running macro. A mode
+  // that ignores gestures entirely therefore cannot trap a looping macro behind itself.
+  if (dir == LV_DIR_BOTTOM && macros_any_running()) {
+    Serial.println("[diag] swipe down -> kill all macros");
+    macros_request_stop_all();
+    haptics_pulse();
   }
-
-  // Horizontal swipes switch profiles, matching M5_M6_config.ino:1375-1380 so the same gesture
-  // means the same thing on both boards: swipe left = next, swipe right = previous.
-  // Ignored while Settings or the pairing overlay owns the screen.
-  if (dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) {
-    if (ui_mode == UI_RING && !ble_pairing_active()) {
-      profile_switch_delta = (dir == LV_DIR_LEFT) ? 1 : -1;
-    }
-    return;
-  }
-
-  if (dir != LV_DIR_BOTTOM) return;
-
-  // Swipe DOWN inside Settings closes it. Safe to overload the panic gesture here ONLY because
-  // opening Settings stopped every running macro, so nothing can be running behind the menu
-  // (spec section 5). Do not reuse it as "back" anywhere a macro could still be live.
-  if (ui_mode != UI_RING) {
-    settings_close_requested = true;
-    return;
-  }
-
-  // Swipe DOWN on the ring: unchanged kill-all.
-  if (!macros_any_running()) return;
-  Serial.println("[diag] swipe down -> kill all macros");
-  macros_request_stop_all();
-  haptics_pulse();
 }
 
 // The running pulse is time-driven, so something has to repaint while a macro runs. Done here
@@ -866,7 +943,7 @@ static void update_settings(void) {
     // task, so calling macros_stop_all() directly is allowed here and ONLY here.
     macros_stop_all();
 
-    ui_mode = UI_SETTINGS_LIST;
+    ui_mode_set(UI_SETTINGS_LIST);
     settings_sel = 0;
     settings_last_activity = millis();
     settings_layout();
@@ -888,13 +965,13 @@ static void update_settings(void) {
     bool commit_pending = false;
     uint8_t commit_duty = 0;
     if (ui_mode == UI_SETTINGS_LIST) {
-      ui_mode = UI_SETTINGS_EDIT;
+      ui_mode_set(UI_SETTINGS_EDIT);
       gauge_refresh();
       lv_obj_add_flag(settings_list_panel, LV_OBJ_FLAG_HIDDEN);
       lv_obj_clear_flag(settings_edit_panel, LV_OBJ_FLAG_HIDDEN);
       Serial.printf("[diag] settings: editing %s\n", SETTINGS_ITEMS[settings_sel].name);
     } else {
-      ui_mode = UI_SETTINGS_LIST;
+      ui_mode_set(UI_SETTINGS_LIST);
       lv_obj_add_flag(settings_edit_panel, LV_OBJ_FLAG_HIDDEN);
       lv_obj_clear_flag(settings_list_panel, LV_OBJ_FLAG_HIDDEN);
       commit_pending = settings_commit_prepare(&commit_duty);
@@ -915,7 +992,7 @@ static void update_settings(void) {
     settings_close_requested = false;
     uint8_t commit_duty = 0;
     bool commit_pending = settings_commit_prepare(&commit_duty);
-    ui_mode = UI_RING;
+    ui_mode_set(UI_RING);
     lv_obj_add_flag(settings_edit_panel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(settings_list_panel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(settings_overlay, LV_OBJ_FLAG_HIDDEN);
@@ -1013,34 +1090,8 @@ static void encoder_task(void *arg) {
     TRACE("[knob] delta=%d t=%lu\n", delta, (unsigned long)millis());
     if (delta == 0) continue;
     if (!lvgl_lock(100)) continue;
-
-    if (ui_mode == UI_SETTINGS_LIST) {
-      // Clamp, no wrap -- matching the profile list (spec section 5). With one item this is a
-      // no-op and the encoder does nothing here; that is expected, not a dead encoder.
-      int next = settings_sel + delta;
-      if (next < 0) next = 0;
-      if (next > SETTINGS_ITEM_COUNT - 1) next = SETTINGS_ITEM_COUNT - 1;
-      if (next != settings_sel) {
-        settings_sel = next;
-        settings_layout();
-      }
-      settings_last_activity = millis();
-    } else if (ui_mode == UI_SETTINGS_EDIT) {
-      const setting_item_t *it = &SETTINGS_ITEMS[settings_sel];
-      it->apply(it->get() + delta * it->step);   // live preview: the panel changes as you turn
-      gauge_refresh();
-      settings_last_activity = millis();
-    } else if (ui_mode == UI_RING) {
-      // Re-check active_count INSIDE the lock. The pre-lock world can change while this task
-      // waits: a profile reload on the loop task can drop it to 0, making the modulo a
-      // divide-by-zero, which traps and reboots the S3. Capturing a pre-lock copy would not
-      // help -- a shrunk count still indexes out of range.
-      if (active_count > 0) {
-        // MINUS delta: turning the knob clockwise spins the RING clockwise, bringing the wedge
-        // counter-clockwise of the top up to the selector. The dial is attached to the knob.
-        select_idx((selected_idx - delta + active_count) % active_count);
-      }
-    }
+    const ui_mode_def_t *m = mode_def();
+    if (m->on_encoder) m->on_encoder(delta);
     lvgl_unlock();
   }
 }
