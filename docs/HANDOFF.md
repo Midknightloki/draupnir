@@ -265,6 +265,76 @@ exactly why M9 was sequenced after it rather than before. M9 should also settle 
 question flagged in §4 — the first natural point at which a 12+ macro profile will actually get
 loaded onto the device.
 
+**M9 also picks up dial orientation**, newly scoped in by the owner. The Companion App's "Dial
+Orientation" dropdown (`companion_app/lib/screens/dashboard_screen.dart:388-402`) already writes an
+int `0..3` to `profiles.json`'s `settings.orientation`
+(`companion_app/lib/state/draupnir_state.dart:481-492`), but the **Waveshare** firmware has zero
+references to `orientation` — the dropdown is wired to nothing on the primary target. (It *is*
+wired on the **M5Dial**: `firmware/M5_M6_config/M5_M6_config.ino` already calls
+`M5Dial.Display.setRotation(orientation)` on every `save_profiles` (three call sites, e.g.
+`:869-870`), and M5GFX rotates the touch matrix along with the display in that one call. That's a
+real, working reference implementation — don't rediscover it as new work — but it doesn't transfer
+to Waveshare's raw `esp_lcd_sh8601` + CST816 stack, which has no equivalent single-call API.)
+
+Start from the MADCTL answer, not from `esp_lcd`'s rotation API — that's a dead end, already ruled
+out:
+
+- Rotation happens in the SH8601 panel via MADCTL (register `0x36`), not in software.
+  `firmware/Waveshare_LVGL_Test/lcd_bsp.c` already ships a compile-time 90° path in the panel-init
+  command list, plus a matching touch-coordinate transform in `example_lvgl_touch_cb()`:
+
+  ```c
+  #ifdef EXAMPLE_Rotate_90
+    {0x36, (uint8_t[]){0x60}, 1, 0},   // MADCTL MX|MV = 90 degrees
+  #else
+    {0x36, (uint8_t[]){0x00}, 1, 0},   // MADCTL 0 degrees
+  #endif
+  ```
+  ```c
+  #ifdef EXAMPLE_Rotate_90
+    data->point.x = tp_y;
+    data->point.y = (EXAMPLE_LCD_V_RES - tp_x);
+  #else
+    data->point.x = tp_x;
+    data->point.y = tp_y;
+  #endif
+  ```
+  The work is making both runtime-selectable from `settings.orientation` and extending them to all
+  four cases.
+- **Do not use `esp_lcd`'s rotation API or LVGL's software rotation** — both are dead ends here.
+  `panel_sh8601_swap_xy()` returns `ESP_ERR_NOT_SUPPORTED` unconditionally
+  (`esp_lcd_sh8601.c:319-323`) and `mirror_y` is unsupported too (`:310`); only `mirror_x` works.
+  LVGL's `sw_rotate` would re-rotate every flush in software on a display that already renders
+  **ten stripes per frame** (`EXAMPLE_LVGL_BUF_HEIGHT = V_RES / 10`) — MADCTL is free by
+  comparison. The panel is square (360x360), so rotation needs no dimension swapping anywhere.
+- MADCTL values are the standard set: `0x00` (0°), `0x60` (90°), `0xC0` (180°), `0xA0` (270°). Only
+  `0x00` and `0x60` are proven on this hardware — confirm `0xC0`/`0xA0` on the device, don't assume
+  them. Likewise only the 90° touch transform above is known-good; the 180°/270° transforms have to
+  be derived and verified by eye, not taken on faith.
+
+Decisions the owner already made — do not re-litigate:
+
+1. **Applies live, on profile save.** MADCTL and the touch transform are both cheap at runtime;
+   hook the change into the existing profile-reload path, under `lvgl_lock()`.
+2. **`profiles.json` is the single source of truth — no NVS**, unlike brightness. Brightness has
+   one writer (the device) and the app round-trips a stale value on every macro edit, so NVS is
+   authoritative there with JSON as seed-only; adopting from JSON on save would stomp the knob's
+   value. Orientation will have **two** writers (app, and eventually an on-device Settings item),
+   which breaks the brightness pattern either way — skip adopting from JSON and the app's dropdown
+   does nothing; adopt it and the next app save stomps the on-device change. The only escape is the
+   device writing back to `profiles.json` through the H4 atomic-write path, at which point NVS
+   would be a redundant second copy. It also avoids leaving the app's dropdown showing a stale
+   value after an on-device change, since the app renders from `profiles.json`. Orientation changes
+   are rare and deliberate, so a ~1-2 KB atomic JSON write per change is fine — unlike brightness,
+   which moves per encoder detent.
+3. **Encoder direction does not change with orientation.** The user turns the knob from the same
+   physical position however the puck is mounted, so clockwise stays clockwise; only the display
+   and touch transform rotate.
+
+Open, not solved: whether changing MADCTL at runtime while LVGL is doing partial-refresh flushes
+(`esp_lcd_panel_draw_bitmap` over stripe regions) keeps the flush regions correct. Needs hardware
+verification; if it misbehaves, fall back to applying orientation only at boot.
+
 ### Step 3 — M5Dial security gate
 
 The M5Dial firmware still has no cryptographic gate at all (§7). This has been the top follow-up

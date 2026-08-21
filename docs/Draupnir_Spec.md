@@ -268,7 +268,7 @@ and the ring divides itself accordingly.
 {
   "version": 3,
   "activeProfile": 0,
-  "settings": { "brightness": 160, "buzzer": true },
+  "settings": { "brightness": 160, "buzzer": true, "orientation": 0 },
   "profiles": [
     {
       "name": "Editing",
@@ -328,6 +328,37 @@ silently dropping every macro with `pos > 15`.
 >
 > Uncapping properly means keying running-macro state by macro identity rather than by `pos`,
 > which is M8+ work. Tracked in §10.
+
+### `settings.orientation` — dial rotation (M9)
+
+An int `0..3`: `0` = 0°, `1` = 90° CW, `2` = 180°, `3` = 270° CCW. The Companion App's Settings
+dialog already reads and writes it (`dashboard_screen.dart:388-402`, `draupnir_state.dart:481-492`)
+— the schema field and the dropdown both exist today. **The Waveshare firmware does not yet
+consume it**; nothing in `firmware/Waveshare_LVGL_Test/` references `orientation`. The **M5Dial**
+firmware already does — `M5_M6_config.ino` calls `M5Dial.Display.setRotation(orientation)` on every
+`save_profiles`, and M5GFX rotates touch along with the display in that one call. Waveshare has no
+equivalent single-call API, which is the actual M9 work.
+
+**Mechanism.** Rotation happens in the SH8601 panel via MADCTL (register `0x36`), not in software.
+`lcd_bsp.c` already ships a compile-time 90° path — a MADCTL write (`0x00`/`0x60`) paired with a
+touch-coordinate swap in `example_lvgl_touch_cb()`. M9 makes both runtime-selectable from
+`settings.orientation` and extends them to all four cases. **Not** `esp_lcd`'s rotation API or
+LVGL's `sw_rotate`: `panel_sh8601_swap_xy()` is `ESP_ERR_NOT_SUPPORTED` unconditionally and
+`mirror_y` is unsupported too (only `mirror_x` works), and software rotation would re-rotate every
+flush on a display already doing ten stripe-flushes per frame. The panel is square (360x360), so no
+dimension swap is needed anywhere. MADCTL values are the standard `0x00`/`0x60`/`0xC0`/`0xA0`; only
+`0x00` and `0x60` (and the paired 90° touch transform) are proven on hardware — 180°/270° are the
+conventional values but unverified, both for MADCTL and for their touch transforms.
+
+**Storage: `profiles.json`, not NVS — unlike brightness, deliberately.** Brightness has one writer
+(the device), so NVS is authoritative and JSON is seed-only. Orientation has two writers (the app,
+and eventually an on-device Settings item), which breaks that pattern either way — the only fix is
+the device writing its own changes back to `profiles.json` via the H4 atomic-write path, making a
+second NVS copy redundant. It also keeps the app's dropdown from showing a stale value after an
+on-device change. Applies live on profile save (cheap at runtime; hooked into the existing reload
+path under `lvgl_lock()`) — whether changing MADCTL mid-partial-refresh keeps flush regions correct
+is unverified; boot-only application is the fallback. Encoder direction does not change with
+orientation — only the display and touch transform rotate.
 
 ### Action types
 
@@ -444,7 +475,7 @@ Honest status, not aspiration.
 | M7 | **Persistence** — write `activeProfile` + brightness to NVS and honor them at boot | **Done (2026-08-08)**, verified on hardware |
 | M8 | **On-device profile switching** with directional indicators | **Done (2026-08-13)**, verified on hardware — grew beyond its original scope, see note below |
 | M8b | **Uncap `pos`** — key running-macro state by identity, not slot; then bump the default to `version: 3` | **Open** (see §6 warning) |
-| M9 | **Icons on the ring** + encoder detent alignment | **Open** |
+| M9 | **Icons on the ring** + encoder detent alignment + dial orientation (`settings.orientation`, see §6) | **Open** |
 | M10 | Polish — buzzer/haptic feedback, export/import | **Open** — brightness UI, originally listed here, was delivered as part of M7/M8 |
 
 **M6:** done-criterion was the H1 negative test, which passed on hardware 2026-08-07 — an
@@ -460,6 +491,11 @@ line. Three hardware feedback rounds turned it into a full ring rework — a rot
 static 12 o'clock selector, a centre label stack (macro name large, profile name small), a tinted
 selection bloom, and real FontAwesome chevron indicators — confirmed on hardware with the owner's
 own words: "This looks great."
+
+**M9** now also covers **dial orientation**: the Companion App's dropdown already writes
+`settings.orientation` to `profiles.json`, but the Waveshare firmware has never read it — see §6
+for the schema, the MADCTL mechanism, and the storage-vs-brightness reasoning. The M5Dial firmware
+already implements the equivalent via `M5Dial.Display.setRotation()`; that part is not new work.
 
 ---
 
