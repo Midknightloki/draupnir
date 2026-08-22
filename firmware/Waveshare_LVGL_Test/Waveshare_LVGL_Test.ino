@@ -334,30 +334,34 @@ static bool wedge_icon_decode(const char *hex, uint8_t *out54) {
 }
 
 #define ICON_SRC_PX     18
-#define ICON_SCALE      3
-#define ICON_DST_PX     (ICON_SRC_PX * ICON_SCALE)          /* 54 */
-#define ICON_SRC_STRIDE ((ICON_SRC_PX + 7) / 8)             /* 3  */
-#define ICON_DST_STRIDE ((ICON_DST_PX + 7) / 8)             /* 7  */
-#define ICON_DST_BYTES  (ICON_DST_STRIDE * ICON_DST_PX)     /* 378 */
+#define ICON_DST_PX     45                                  /* 2.5x of 18 */
+#define ICON_SRC_STRIDE ((ICON_SRC_PX + 7) / 8)             /* 3 */
+#define ICON_DST_STRIDE ((ICON_DST_PX + 7) / 8)             /* 6 */
+#define ICON_DST_BYTES  (ICON_DST_STRIDE * ICON_DST_PX)     /* 270 */
 
-// Nearest-neighbour 3x expansion of an 18x18 1-bit bitmap into a 54x54 one.
+// Nearest-neighbour resample of the 18x18 1-bit icon into ICON_DST_PX square.
 //
-// LVGL 8.4 CANNOT zoom an ALPHA_1BIT image. lv_draw_sw_img.c takes the transform path whenever
+// LVGL 8.4 CANNOT zoom an ALPHA_1BIT image: lv_draw_sw_img.c takes the transform path whenever
 // zoom != LV_IMG_ZOOM_NONE, and lv_draw_sw_transform.c handles only TRUE_COLOR,
 // TRUE_COLOR_ALPHA, TRUE_COLOR_CHROMA_KEYED and RGB565A8 -- a 1-bit source renders NOTHING.
-// Measured on hardware: icons were visible at 1:1 and vanished entirely at zoom=768.
-// Scaling here keeps the format on the supported non-transform path.
+// Measured on hardware: icons were visible at 1:1 and vanished entirely at zoom=768. Scaling
+// here keeps the format on the supported non-transform path.
+//
+// INVERSE mapping (walk the destination, sample the source) rather than replicating each source
+// pixel into a fixed block, because the scale is no longer an integer: at 18 -> 45 some source
+// rows expand to three destination rows and some to two. Forward replication cannot express
+// that and would leave gaps. Inverse mapping writes every destination pixel exactly once at any
+// ratio, and degenerates to exact replication when the ratio happens to be whole.
 //
 // Bit order is MSB-first on both sides, matching LVGL's pos = 7 - (x & 0x7).
-static void icon_scale3(const uint8_t *src, uint8_t *dst) {
+static void icon_scale(const uint8_t *src, uint8_t *dst) {
   memset(dst, 0, ICON_DST_BYTES);
-  for (int sy = 0; sy < ICON_SRC_PX; sy++) {
-    for (int sx = 0; sx < ICON_SRC_PX; sx++) {
-      if (!(src[sy * ICON_SRC_STRIDE + (sx >> 3)] & (0x80 >> (sx & 7)))) continue;
-      for (int dy = sy * ICON_SCALE; dy < (sy + 1) * ICON_SCALE; dy++) {
-        for (int dx = sx * ICON_SCALE; dx < (sx + 1) * ICON_SCALE; dx++) {
-          dst[dy * ICON_DST_STRIDE + (dx >> 3)] |= (uint8_t)(0x80 >> (dx & 7));
-        }
+  for (int dy = 0; dy < ICON_DST_PX; dy++) {
+    int sy = (dy * ICON_SRC_PX) / ICON_DST_PX;
+    for (int dx = 0; dx < ICON_DST_PX; dx++) {
+      int sx = (dx * ICON_SRC_PX) / ICON_DST_PX;
+      if (src[sy * ICON_SRC_STRIDE + (sx >> 3)] & (0x80 >> (sx & 7))) {
+        dst[dy * ICON_DST_STRIDE + (dx >> 3)] |= (uint8_t)(0x80 >> (dx & 7));
       }
     }
   }
@@ -407,17 +411,17 @@ static void ring_draw_event_cb(lv_event_t *e) {
         // app and the M5Dial, AND LV_IMG_BUF_SIZE_ALPHA_1BIT ((w/8)+1)*h disagrees with the
         // decoder's stride (w+7)>>3 at any width that is a multiple of 8. Do not change it.
         //
-        // The RENDER is scaled instead, via icon_scale3() above -- LVGL 8.4 cannot zoom an
-        // ALPHA_1BIT image (see the comment on icon_scale3), so the bitmap is pre-expanded to
-        // 54x54 here and drawn at zoom = LV_IMG_ZOOM_NONE, which keeps the draw on the
-        // non-transform path that actually renders 1-bit sources.
+        // The RENDER is scaled instead, via icon_scale() above -- LVGL 8.4 cannot zoom an
+        // ALPHA_1BIT image (see the comment on icon_scale), so the bitmap is pre-expanded to
+        // ICON_DST_PX square here and drawn at zoom = LV_IMG_ZOOM_NONE, which keeps the draw on
+        // the non-transform path that actually renders 1-bit sources.
         //
-        // `static` because 378 bytes is a lot for the LVGL task's 4 KB stack, and this callback
-        // only ever runs on that one task (LV_EVENT_DRAW_MAIN_END is dispatched from lv_timer_handler
-        // on the LVGL task), so a single shared buffer is safe -- no reentrancy, no other task
-        // touches it.
+        // `static` because ICON_DST_BYTES is a lot for the LVGL task's 4 KB stack, and this
+        // callback only ever runs on that one task (LV_EVENT_DRAW_MAIN_END is dispatched from
+        // lv_timer_handler on the LVGL task), so a single shared buffer is safe -- no
+        // reentrancy, no other task touches it.
         static uint8_t iconscaled[ICON_DST_BYTES];
-        icon_scale3(iconbits, iconscaled);
+        icon_scale(iconbits, iconscaled);
 
         lv_img_dsc_t idata;
         idata.header.cf         = LV_IMG_CF_ALPHA_1BIT;
@@ -435,15 +439,15 @@ static void ring_draw_event_cb(lv_event_t *e) {
         // are left unset -- both only matter on the transform path, which this draw no longer
         // takes.
 
-        // lv_area_t bounds are inclusive, so a 54px span is c-27 .. c+26.
-        lv_area_t ia = { (lv_coord_t)(lx - 27), (lv_coord_t)(ly - 27),
-                         (lv_coord_t)(lx + 26), (lv_coord_t)(ly + 26) };
+        // lv_area_t bounds are inclusive, so a 45px span is c-22 .. c+22.
+        lv_area_t ia = { (lv_coord_t)(lx - 22), (lv_coord_t)(ly - 22),
+                         (lv_coord_t)(lx + 22), (lv_coord_t)(ly + 22) };
 
         // Two passes: a one-pixel drop shadow in the opposite colour, then the glyph itself on
         // top. Picking black-or-white by luminance alone tops out near 4.6:1 on a mid-tone
         // wedge, so the shadow is what guarantees a hard edge on ANY user-chosen colour -- at
         // one extra draw rather than the eight the label outline costs. `sa` is `ia` shifted by
-        // exactly +1 in both axes (still a 54px span), derived rather than re-typed so the two
+        // exactly +1 in both axes (still a 45px span), derived rather than re-typed so the two
         // areas cannot drift apart. The shadow stays offset by exactly 1 screen pixel, same as
         // before the scaling change.
         lv_area_t sa = { (lv_coord_t)(ia.x1 + 1), (lv_coord_t)(ia.y1 + 1),
