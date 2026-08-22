@@ -170,7 +170,7 @@ static const char *wedge_label_fit(const char *name, char *out_buf, size_t out_b
   memcpy(out_buf, name, len);
   out_buf[len] = '\0';
 
-  if (lv_txt_get_width(out_buf, (uint32_t)strlen(out_buf), &orbitron_12, 0, LV_TEXT_FLAG_NONE) <= max_w) {
+  if (lv_txt_get_width(out_buf, (uint32_t)strlen(out_buf), &orbitron_18, 0, LV_TEXT_FLAG_NONE) <= max_w) {
     return out_buf;
   }
 
@@ -185,13 +185,13 @@ static const char *wedge_label_fit(const char *name, char *out_buf, size_t out_b
   }
 
   // Budget for the ellipsis BEFORE choosing the prefix. Measuring only the kept prefix and
-  // appending "..." afterwards overshoots by the ellipsis width -- 9 px in orbitron_12 -- which
+  // appending "..." afterwards overshoots by the ellipsis width, which
   // is enough to wrap, and lv_draw_label paints the wrapped line outside the box.
-  lv_coord_t ell_w = lv_txt_get_width("...", 3, &orbitron_12, 0, LV_TEXT_FLAG_NONE);
+  lv_coord_t ell_w = lv_txt_get_width("...", 3, &orbitron_18, 0, LV_TEXT_FLAG_NONE);
   lv_coord_t fit_w = (max_w > ell_w) ? (lv_coord_t)(max_w - ell_w) : (lv_coord_t)0;
 
   while (len > 1 &&
-         lv_txt_get_width(out_buf, (uint32_t)len, &orbitron_12, 0, LV_TEXT_FLAG_NONE) > fit_w) {
+         lv_txt_get_width(out_buf, (uint32_t)len, &orbitron_18, 0, LV_TEXT_FLAG_NONE) > fit_w) {
     len--;
     out_buf[len] = '\0';
   }
@@ -468,7 +468,7 @@ static void ring_draw_event_cb(lv_event_t *e) {
         const char *nm = wedge_label_fit((const char *)(macro["name"] | "?"), nmbuf, sizeof(nmbuf), 84);
         lv_draw_label_dsc_t wl;
         lv_draw_label_dsc_init(&wl);
-        wl.font  = &orbitron_12;
+        wl.font  = &orbitron_18;
         wl.opa   = LV_OPA_COVER;
         wl.align = LV_TEXT_ALIGN_CENTER;
 
