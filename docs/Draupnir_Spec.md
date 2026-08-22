@@ -475,7 +475,7 @@ Honest status, not aspiration.
 | M7 | **Persistence** — write `activeProfile` + brightness to NVS and honor them at boot | **Done (2026-08-08)**, verified on hardware |
 | M8 | **On-device profile switching** with directional indicators | **Done (2026-08-13)**, verified on hardware — grew beyond its original scope, see note below |
 | M8b | **Uncap `pos`** — key running-macro state by identity, not slot; then bump the default to `version: 3` | **Open** (see §6 warning) |
-| M9 | **Icons on the ring** + encoder detent alignment + dial orientation (`settings.orientation`, see §6) | **Open** |
+| M9 | **Icons on the ring** + dial orientation + rotary macro mode — encoder detent alignment dropped, see note below | **Done (2026-08-22)**, verified on hardware (Waveshare) |
 | M10 | Polish — buzzer/haptic feedback, export/import | **Open** — brightness UI, originally listed here, was delivered as part of M7/M8 |
 
 **M6:** done-criterion was the H1 negative test, which passed on hardware 2026-08-07 — an
@@ -492,10 +492,31 @@ static 12 o'clock selector, a centre label stack (macro name large, profile name
 selection bloom, and real FontAwesome chevron indicators — confirmed on hardware with the owner's
 own words: "This looks great."
 
-**M9** now also covers **dial orientation**: the Companion App's dropdown already writes
-`settings.orientation` to `profiles.json`, but the Waveshare firmware has never read it — see §6
-for the schema, the MADCTL mechanism, and the storage-vs-brightness reasoning. The M5Dial firmware
-already implements the equivalent via `M5Dial.Display.setRotation()`; that part is not new work.
+**M9:** done-criterion was the owner's hardware sign-off on the Waveshare, given 2026-08-22 after
+three feedback rounds ("This looks good, I think we can mark M9 complete."). What shipped differs
+from the original "icons + encoder detent alignment" line in three ways, each worth recording
+rather than silently rewriting the milestone description:
+
+- **Dial orientation was added.** This turned out to be a port gap rather than new product surface:
+  the Companion App's dropdown had always written `settings.orientation` to `profiles.json`, and the
+  M5Dial firmware had always consumed it via `M5Dial.Display.setRotation()`, but the Waveshare
+  ignored the field entirely. M9 closed that gap for all four values (`0`/`1`/`2`/`3`), in both the
+  MADCTL display write and the touch-coordinate transform — see §6 for the schema and mechanism.
+- **Rotary macro mode was added.** Same class of gap, and the more dangerous one: the app already
+  offered it and the M5Dial already implemented it, while the Waveshare silently ran a
+  rotary-mode macro as an ordinary `play_once`, discarding the distinction without any error. M9
+  brought the Waveshare to parity, including matching the M5Dial's behavior of *not* stopping macros
+  on rotary entry while stopping only the rotary binding (not all macros) on exit.
+- **Encoder detent alignment was dropped.** It was superseded by the M7/M8 ring rework: selection
+  now always lands centred at 12 o'clock regardless of which detent it came from, so there was
+  nothing left to align. The remaining ~15% mechanical double-step (two contact closures per
+  detent) was measured, traced to the physical switch rather than firmware, and deliberately
+  accepted rather than fixed with a lockout window that would also cap deliberate fast turning.
+
+**Verified on the Waveshare only.** The M5Dial half of M9 — porting the icon-merge fix that closes
+a live data-loss bug (editing one macro was wiping every other macro's icon) — compiled cleanly
+against the M5Dial FQBN and was code-reviewed, but the board has not been flashed this milestone.
+Its acceptance criterion has not been run. See `docs/HANDOFF.md` for the full breakdown.
 
 ---
 
