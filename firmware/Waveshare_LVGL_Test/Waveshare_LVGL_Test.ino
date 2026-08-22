@@ -389,6 +389,26 @@ static void ring_draw_event_cb(lv_event_t *e) {
         lv_draw_img_dsc_init(&idsc);
         idsc.recolor_opa = LV_OPA_COVER;
 
+        // 18x18 is the interchange size (shared with the app and the M5Dial) and must not
+        // change -- but the M5Dial's screen is 240x240 against this board's 360x360, so the same
+        // pixel count reads as nearly invisible here. Scale the RENDER, not the data: zoom keeps
+        // `coords`/idata at 18x18 and only the drawn output grows.
+        //
+        // Per LVGL source (lv_draw_img.c decode_and_draw(), lv_img_buf.c
+        // _lv_img_buf_get_transformed_area()/lv_point_transform(), lv_draw_sw_transform.c):
+        // `coords` passed to lv_draw_img must stay the UNSCALED 18x18 area -- LVGL derives w/h
+        // from coords itself and internally computes an expanded clip rect from angle/zoom/pivot;
+        // it does not want a pre-expanded coords. But lv_draw_img_dsc_init() zero-fills pivot, and
+        // every transform point is computed as (p - pivot) * zoom + pivot -- so a zeroed pivot
+        // anchors the scale at coords' TOP-LEFT corner, not its centre. Left at {0,0}, a 3x zoom
+        // would shift the icon ~18px down-right of the wedge position instead of growing in place.
+        // pivot must be the image centre in LOCAL (coords-relative) space, i.e. w/2,h/2 = {9,9}.
+        idsc.zoom      = 768;   // LV_IMG_ZOOM_NONE is 256, so 768 = 3x -> 54x54 drawn from 18x18
+        idsc.antialias = 0;     // hard edges: a 1-bit source upscaled 3x looks better blocky than
+                                // smeared, and antialiasing a 1-bit alpha mask muddies the glyph
+        idsc.pivot.x   = 9;
+        idsc.pivot.y   = 9;
+
         lv_area_t ia = { (lv_coord_t)(lx - 9), (lv_coord_t)(ly - 9),
                          (lv_coord_t)(lx + 8), (lv_coord_t)(ly + 8) };
 
@@ -397,7 +417,10 @@ static void ring_draw_event_cb(lv_event_t *e) {
         // wedge, so the shadow is what guarantees a hard edge on ANY user-chosen colour -- at
         // one extra draw rather than the eight the label outline costs. `sa` is `ia` shifted by
         // exactly +1 in both axes (still an 18px span), derived rather than re-typed so the two
-        // areas cannot drift apart.
+        // areas cannot drift apart. This offset stays 1 SCREEN pixel under zoom, not 3: pivot is
+        // always the centre of whichever 18x18 area is passed (both ia and sa carry their own
+        // coords->x1/y1), so each pass scales in place around its own centre and the two centres
+        // stay exactly (ia.x1,ia.y1)+1 apart, same as with zoom off.
         lv_area_t sa = { (lv_coord_t)(ia.x1 + 1), (lv_coord_t)(ia.y1 + 1),
                          (lv_coord_t)(ia.x2 + 1), (lv_coord_t)(ia.y2 + 1) };
         idsc.recolor = contrast_shadow_on(color);
@@ -563,6 +586,24 @@ static void select_idx(int idx) {
   lv_obj_invalidate(lv_scr_act());
 }
 
+// Relative move, for the encoder. select_idx() sets an ABSOLUTE index and derives the rotation
+// target by shortest angular path, which is right when something jumps the selection somewhere
+// (a profile switch, a reload). It is wrong for the encoder: encoder_task coalesces several
+// detents into one delta, so a three-detent flick moves the WRAPPED index by 3, the target jumps
+// most of a turn, and the shortest path then rotates the ring backwards. Tracking the real delta
+// keeps the ring following the hand however fast it is turned.
+static void select_idx_by(int delta) {
+  if (active_count <= 0) return;
+  float wedge_deg = 360.0f / active_count;
+  // Same MINUS-delta convention as select_idx()'s caller (ring_on_encoder): turning the knob
+  // clockwise spins the ring clockwise, bringing the wedge counter-clockwise of the top up to
+  // the selector.
+  selected_idx = ((selected_idx - delta) % active_count + active_count) % active_count;
+  ring_rot_target -= delta * wedge_deg;
+  update_centre_stack();
+  lv_obj_invalidate(lv_scr_act());
+}
+
 // Inverse of wedge_center_angle() -- maps a tap point to a wedge index using the same angle
 // convention (atan2f already returns angle in exactly lv_draw_arc's units, since that
 // convention IS the standard x=R*cos/y=R*sin parametrization; see wedge_center_angle's comment).
@@ -657,10 +698,14 @@ static bool ring_on_gesture(lv_dir_t dir) {
 static void ring_on_encoder(int delta) {
   // Re-check INSIDE the lock: a profile reload on the loop task can drop active_count to 0 while
   // this task waits, making the modulo a divide-by-zero that traps and reboots the S3.
+  //
+  // select_idx_by(), not select_idx(): encoder_task coalesces several detents into one delta, so
+  // a fast flick can move the WRAPPED index by more than half the ring. select_idx() would then
+  // take the shortest angular path to that wrapped index and spin the ring BACKWARDS -- measured
+  // on hardware as a chaotic judder on a fast spin. select_idx_by() advances the rotation target
+  // by the actual delta instead, so the ring tracks the real turn at any speed.
   if (active_count > 0) {
-    // MINUS delta: turning the knob clockwise spins the RING clockwise, bringing the wedge
-    // counter-clockwise of the top up to the selector. The dial is attached to the knob.
-    select_idx((selected_idx - delta + active_count) % active_count);
+    select_idx_by(delta);
   }
 }
 

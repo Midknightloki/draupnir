@@ -212,12 +212,19 @@ static const sh8601_lcd_init_cmd_t lcd_init_cmds[] =
 static const uint8_t MADCTL_FOR_ORIENTATION[4] = { 0x00, 0x60, 0xC0, 0xA0 };
 static uint8_t s_orientation = 0;
 
+// The SH8601 is a QSPI panel: a command must carry the write opcode in bits 31..24 and the
+// command byte in bits 15..8, exactly as the driver's own static tx_param() builds it
+// (esp_lcd_sh8601.c). Sending a raw 0x36 reaches the panel as an unrecognised command and is
+// silently dropped -- which presented on hardware as "touch rotates, display does not",
+// because the touch transform is plain C and worked regardless.
+#define SH8601_QSPI_CMD(c) ((int)((0x02UL << 24) | (((uint32_t)(c) & 0xFFUL) << 8)))
+
 void lcd_set_orientation(uint8_t o)
 {
   if (o > 3) o = 0;
   s_orientation = o;
   uint8_t madctl = MADCTL_FOR_ORIENTATION[o];
-  esp_lcd_panel_io_tx_param(amoled_panel_io_handle, 0x36, &madctl, 1);
+  esp_lcd_panel_io_tx_param(amoled_panel_io_handle, SH8601_QSPI_CMD(0x36), &madctl, 1);
 }
 
 void lcd_lvgl_Init(void)
@@ -290,9 +297,13 @@ void lcd_lvgl_Init(void)
   // Measured on hardware: one swipe-up and two swipe-lefts detected across two minutes of
   // continuous swiping. Everything downstream was working; the gestures never arrived.
   //
-  // min_velocity 1 means only a genuinely stationary finger resets the accumulator.
-  // gesture_limit stays generous enough that an ordinary tap cannot be mistaken for a swipe.
-  indev_drv.gesture_min_velocity = 1;
+  // 0, not 1: LVGL resets the accumulated gesture travel when |vect| < min_velocity on BOTH
+  // axes. At 1 that fires on every poll where the finger moved zero pixels -- constant during a
+  // deliberate swipe at a 3 ms poll interval -- so the accumulator kept resetting under the
+  // limit and only a fast flick registered. At 0 the test can never be true, so travel is purely
+  // cumulative and gesture_limit alone decides. Measured on hardware: at 1, swipe-down often
+  // arrived as a tap and fired the wedge under the finger.
+  indev_drv.gesture_min_velocity = 0;
   indev_drv.gesture_limit        = 40;
 
   lv_indev_drv_register(&indev_drv);
