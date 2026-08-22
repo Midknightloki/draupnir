@@ -329,26 +329,30 @@ silently dropping every macro with `pos > 15`.
 > Uncapping properly means keying running-macro state by macro identity rather than by `pos`,
 > which is M8+ work. Tracked in §10.
 
-### `settings.orientation` — dial rotation (M9)
+### `settings.orientation` — dial rotation (shipped in M9)
 
 An int `0..3`: `0` = 0°, `1` = 90° CW, `2` = 180°, `3` = 270° CCW. The Companion App's Settings
-dialog already reads and writes it (`dashboard_screen.dart:388-402`, `draupnir_state.dart:481-492`)
-— the schema field and the dropdown both exist today. **The Waveshare firmware does not yet
-consume it**; nothing in `firmware/Waveshare_LVGL_Test/` references `orientation`. The **M5Dial**
-firmware already does — `M5_M6_config.ino` calls `M5Dial.Display.setRotation(orientation)` on every
-`save_profiles`, and M5GFX rotates touch along with the display in that one call. Waveshare has no
-equivalent single-call API, which is the actual M9 work.
+dialog reads and writes it (`dashboard_screen.dart:388-402`, `draupnir_state.dart:481-492`), and
+**both firmwares now consume it.** The **M5Dial** always did — `M5_M6_config.ino` calls
+`M5Dial.Display.setRotation(orientation)` on every `save_profiles`, and M5GFX rotates touch along
+with the display in that one call. The **Waveshare** has no equivalent single-call API, and its
+ignoring the field was a port gap rather than an unbuilt feature: the app wrote the setting, one
+supported board honoured it, the other silently did not. M9 closed that.
 
 **Mechanism.** Rotation happens in the SH8601 panel via MADCTL (register `0x36`), not in software.
-`lcd_bsp.c` already ships a compile-time 90° path — a MADCTL write (`0x00`/`0x60`) paired with a
-touch-coordinate swap in `example_lvgl_touch_cb()`. M9 makes both runtime-selectable from
-`settings.orientation` and extends them to all four cases. **Not** `esp_lcd`'s rotation API or
-LVGL's `sw_rotate`: `panel_sh8601_swap_xy()` is `ESP_ERR_NOT_SUPPORTED` unconditionally and
-`mirror_y` is unsupported too (only `mirror_x` works), and software rotation would re-rotate every
-flush on a display already doing ten stripe-flushes per frame. The panel is square (360x360), so no
-dimension swap is needed anywhere. MADCTL values are the standard `0x00`/`0x60`/`0xC0`/`0xA0`; only
-`0x00` and `0x60` (and the paired 90° touch transform) are proven on hardware — 180°/270° are the
-conventional values but unverified, both for MADCTL and for their touch transforms.
+`lcd_bsp.c` previously shipped a compile-time 90° path; M9 made it runtime-selectable from
+`settings.orientation` across all four cases, MADCTL paired with a matching touch transform in
+`example_lvgl_touch_cb()`. **Not** `esp_lcd`'s rotation API or LVGL's `sw_rotate`:
+`panel_sh8601_swap_xy()` is `ESP_ERR_NOT_SUPPORTED` unconditionally and `mirror_y` is unsupported
+too (only `mirror_x` works), and software rotation would re-rotate every flush on a display already
+doing ten stripe-flushes per frame. The panel is square (360x360), so no dimension swap is needed
+anywhere. MADCTL values are the standard `0x00`/`0x60`/`0xC0`/`0xA0`, and **all four orientations
+are now proven on hardware**, display and touch together.
+
+> **The trap, and it cost a hardware round: the SH8601 is driven over QSPI, so a command must carry
+> the write opcode** — `(cmd & 0xff) << 8 | (0x02 << 24)`. Sent as a raw byte, MADCTL is silently
+> ignored: no error, no effect. This presented as "touch rotates but the display does not", because
+> the touch transform is plain C and worked regardless of the panel.
 
 **Storage: `profiles.json`, not NVS — unlike brightness, deliberately.** Brightness has one writer
 (the device), so NVS is authoritative and JSON is seed-only. Orientation has two writers (the app,
@@ -356,9 +360,11 @@ and eventually an on-device Settings item), which breaks that pattern either way
 the device writing its own changes back to `profiles.json` via the H4 atomic-write path, making a
 second NVS copy redundant. It also keeps the app's dropdown from showing a stale value after an
 on-device change. Applies live on profile save (cheap at runtime; hooked into the existing reload
-path under `lvgl_lock()`) — whether changing MADCTL mid-partial-refresh keeps flush regions correct
-is unverified; boot-only application is the fallback. Encoder direction does not change with
-orientation — only the display and touch transform rotate.
+path under `lvgl_lock()`). The open worry there — whether changing MADCTL mid-partial-refresh leaves
+flush regions correct — did not materialise: rotating from the app repaints cleanly, and no torn or
+offset stripes were seen. That is an observation from ordinary use, not a targeted stress test, so
+boot-only application remains the fallback if it ever does surface. Encoder direction does not
+change with orientation — only the display and touch transform rotate.
 
 ### Action types
 
