@@ -309,6 +309,12 @@ static void rebuild_ring_layout(void) {
   Serial.printf("[diag] rebuild_ring_layout: active_count=%d\n", active_count);
 }
 
+#define ICON_SRC_PX     18
+#define ICON_DST_PX     45                                  /* 2.5x of 18 */
+#define ICON_SRC_STRIDE ((ICON_SRC_PX + 7) / 8)             /* 3 */
+#define ICON_DST_STRIDE ((ICON_DST_PX + 7) / 8)             /* 6 */
+#define ICON_DST_BYTES  (ICON_DST_STRIDE * ICON_DST_PX)     /* 270 */
+
 // The app renders each Feather icon to an 18x18 monochrome bitmap and stores it as `icon_xbm`:
 // 108 hex characters = 54 bytes = 3 bytes per row. Returns false unless the string is exactly
 // that, so a malformed or absent value falls back to the name rather than drawing garbage.
@@ -318,6 +324,10 @@ static void rebuild_ring_layout(void) {
 // renders mirrored within each byte -- it compiles and draws SOMETHING, which is exactly how this
 // class of bug survives review.
 static bool wedge_icon_decode(const char *hex, uint8_t *out54) {
+  // The 54 and the 108 are ICON_SRC_STRIDE * ICON_SRC_PX and twice that (two hex chars a byte).
+  // Tied down here because the caller's buffer is a bare `uint8_t[54]` that the ICON_SRC_* macros
+  // do not govern: changing the source size without changing these would overrun it silently.
+  static_assert(ICON_SRC_STRIDE * ICON_SRC_PX == 54, "icon source buffer size drifted from ICON_SRC_*");
   if (hex == nullptr || strlen(hex) != 108) return false;
   for (int b = 0; b < 54; b++) {
     char pair[3] = { hex[b * 2], hex[b * 2 + 1], '\0' };
@@ -332,12 +342,6 @@ static bool wedge_icon_decode(const char *hex, uint8_t *out54) {
   }
   return true;
 }
-
-#define ICON_SRC_PX     18
-#define ICON_DST_PX     45                                  /* 2.5x of 18 */
-#define ICON_SRC_STRIDE ((ICON_SRC_PX + 7) / 8)             /* 3 */
-#define ICON_DST_STRIDE ((ICON_DST_PX + 7) / 8)             /* 6 */
-#define ICON_DST_BYTES  (ICON_DST_STRIDE * ICON_DST_PX)     /* 270 */
 
 // Nearest-neighbour resample of the 18x18 1-bit icon into ICON_DST_PX square.
 //

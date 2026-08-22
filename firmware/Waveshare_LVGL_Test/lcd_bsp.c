@@ -206,9 +206,9 @@ static const sh8601_lcd_init_cmd_t lcd_init_cmds[] =
 // (esp_lcd_sh8601.c:319) and mirror_y is unsupported too, while LVGL's software rotation would
 // re-rotate every flush on a device already rendering ten stripes per frame.
 //
-// 0x00 and 0x60 are proven on this hardware. 0xC0 and 0xA0 are the conventional 180/270 values
-// and are UNVERIFIED -- and they are the two the owner actually needs, because the cable must
-// exit the top or right of the dial in use.
+// All four are proven on this hardware (2026-08-22), display and touch together. 180 and 270 are
+// the two the owner actually uses -- the cable must exit the top or right of the dial, or it
+// fouls placement and strains the port.
 static const uint8_t MADCTL_FOR_ORIENTATION[4] = { 0x00, 0x60, 0xC0, 0xA0 };
 static uint8_t s_orientation = 0;
 
