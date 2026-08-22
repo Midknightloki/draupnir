@@ -304,7 +304,12 @@ void lcd_lvgl_Init(void)
   // cumulative and gesture_limit alone decides. Measured on hardware: at 1, swipe-down often
   // arrived as a tap and fired the wedge under the finger.
   indev_drv.gesture_min_velocity = 0;
-  indev_drv.gesture_limit        = 40;
+
+  // 25, not 40: a deliberate but short swipe releases before accumulating 40 px of travel, so no
+  // gesture is emitted and the release lands as a tap -- on the ring that fires whatever wedge
+  // the finger is over. 25 px on a 360 px panel is still far above the few pixels a stationary
+  // tap wanders, so taps are not at risk of being read as swipes.
+  indev_drv.gesture_limit = 25;
 
   lv_indev_drv_register(&indev_drv);
 

@@ -333,6 +333,36 @@ static bool wedge_icon_decode(const char *hex, uint8_t *out54) {
   return true;
 }
 
+#define ICON_SRC_PX     18
+#define ICON_SCALE      3
+#define ICON_DST_PX     (ICON_SRC_PX * ICON_SCALE)          /* 54 */
+#define ICON_SRC_STRIDE ((ICON_SRC_PX + 7) / 8)             /* 3  */
+#define ICON_DST_STRIDE ((ICON_DST_PX + 7) / 8)             /* 7  */
+#define ICON_DST_BYTES  (ICON_DST_STRIDE * ICON_DST_PX)     /* 378 */
+
+// Nearest-neighbour 3x expansion of an 18x18 1-bit bitmap into a 54x54 one.
+//
+// LVGL 8.4 CANNOT zoom an ALPHA_1BIT image. lv_draw_sw_img.c takes the transform path whenever
+// zoom != LV_IMG_ZOOM_NONE, and lv_draw_sw_transform.c handles only TRUE_COLOR,
+// TRUE_COLOR_ALPHA, TRUE_COLOR_CHROMA_KEYED and RGB565A8 -- a 1-bit source renders NOTHING.
+// Measured on hardware: icons were visible at 1:1 and vanished entirely at zoom=768.
+// Scaling here keeps the format on the supported non-transform path.
+//
+// Bit order is MSB-first on both sides, matching LVGL's pos = 7 - (x & 0x7).
+static void icon_scale3(const uint8_t *src, uint8_t *dst) {
+  memset(dst, 0, ICON_DST_BYTES);
+  for (int sy = 0; sy < ICON_SRC_PX; sy++) {
+    for (int sx = 0; sx < ICON_SRC_PX; sx++) {
+      if (!(src[sy * ICON_SRC_STRIDE + (sx >> 3)] & (0x80 >> (sx & 7)))) continue;
+      for (int dy = sy * ICON_SCALE; dy < (sy + 1) * ICON_SCALE; dy++) {
+        for (int dx = sx * ICON_SCALE; dx < (sx + 1) * ICON_SCALE; dx++) {
+          dst[dy * ICON_DST_STRIDE + (dx >> 3)] |= (uint8_t)(0x80 >> (dx & 7));
+        }
+      }
+    }
+  }
+}
+
 // Draws the donut wedges directly on the screen every repaint (selection change, layout
 // rebuild, etc.) -- LVGL has no built-in clickable "pie slice" widget, so this hand-draws with
 // lv_draw_arc (the same primitive lv_arc uses internally) instead of per-wedge button objects.
@@ -376,51 +406,46 @@ static void ring_draw_event_cb(lv_event_t *e) {
         // (lv_draw_img.h:38). 18x18 is load-bearing: it is the interchange size shared with the
         // app and the M5Dial, AND LV_IMG_BUF_SIZE_ALPHA_1BIT ((w/8)+1)*h disagrees with the
         // decoder's stride (w+7)>>3 at any width that is a multiple of 8. Do not change it.
+        //
+        // The RENDER is scaled instead, via icon_scale3() above -- LVGL 8.4 cannot zoom an
+        // ALPHA_1BIT image (see the comment on icon_scale3), so the bitmap is pre-expanded to
+        // 54x54 here and drawn at zoom = LV_IMG_ZOOM_NONE, which keeps the draw on the
+        // non-transform path that actually renders 1-bit sources.
+        //
+        // `static` because 378 bytes is a lot for the LVGL task's 4 KB stack, and this callback
+        // only ever runs on that one task (LV_EVENT_DRAW_MAIN_END is dispatched from lv_timer_handler
+        // on the LVGL task), so a single shared buffer is safe -- no reentrancy, no other task
+        // touches it.
+        static uint8_t iconscaled[ICON_DST_BYTES];
+        icon_scale3(iconbits, iconscaled);
+
         lv_img_dsc_t idata;
         idata.header.cf         = LV_IMG_CF_ALPHA_1BIT;
         idata.header.always_zero = 0;
         idata.header.reserved   = 0;
-        idata.header.w          = 18;
-        idata.header.h          = 18;
-        idata.data_size         = 54;
-        idata.data              = iconbits;
+        idata.header.w          = ICON_DST_PX;
+        idata.header.h          = ICON_DST_PX;
+        idata.data_size         = ICON_DST_BYTES;
+        idata.data              = iconscaled;
 
         lv_draw_img_dsc_t idsc;
         lv_draw_img_dsc_init(&idsc);
         idsc.recolor_opa = LV_OPA_COVER;
+        // zoom stays at lv_draw_img_dsc_init()'s default (LV_IMG_ZOOM_NONE) and pivot/antialias
+        // are left unset -- both only matter on the transform path, which this draw no longer
+        // takes.
 
-        // 18x18 is the interchange size (shared with the app and the M5Dial) and must not
-        // change -- but the M5Dial's screen is 240x240 against this board's 360x360, so the same
-        // pixel count reads as nearly invisible here. Scale the RENDER, not the data: zoom keeps
-        // `coords`/idata at 18x18 and only the drawn output grows.
-        //
-        // Per LVGL source (lv_draw_img.c decode_and_draw(), lv_img_buf.c
-        // _lv_img_buf_get_transformed_area()/lv_point_transform(), lv_draw_sw_transform.c):
-        // `coords` passed to lv_draw_img must stay the UNSCALED 18x18 area -- LVGL derives w/h
-        // from coords itself and internally computes an expanded clip rect from angle/zoom/pivot;
-        // it does not want a pre-expanded coords. But lv_draw_img_dsc_init() zero-fills pivot, and
-        // every transform point is computed as (p - pivot) * zoom + pivot -- so a zeroed pivot
-        // anchors the scale at coords' TOP-LEFT corner, not its centre. Left at {0,0}, a 3x zoom
-        // would shift the icon ~18px down-right of the wedge position instead of growing in place.
-        // pivot must be the image centre in LOCAL (coords-relative) space, i.e. w/2,h/2 = {9,9}.
-        idsc.zoom      = 768;   // LV_IMG_ZOOM_NONE is 256, so 768 = 3x -> 54x54 drawn from 18x18
-        idsc.antialias = 0;     // hard edges: a 1-bit source upscaled 3x looks better blocky than
-                                // smeared, and antialiasing a 1-bit alpha mask muddies the glyph
-        idsc.pivot.x   = 9;
-        idsc.pivot.y   = 9;
-
-        lv_area_t ia = { (lv_coord_t)(lx - 9), (lv_coord_t)(ly - 9),
-                         (lv_coord_t)(lx + 8), (lv_coord_t)(ly + 8) };
+        // lv_area_t bounds are inclusive, so a 54px span is c-27 .. c+26.
+        lv_area_t ia = { (lv_coord_t)(lx - 27), (lv_coord_t)(ly - 27),
+                         (lv_coord_t)(lx + 26), (lv_coord_t)(ly + 26) };
 
         // Two passes: a one-pixel drop shadow in the opposite colour, then the glyph itself on
         // top. Picking black-or-white by luminance alone tops out near 4.6:1 on a mid-tone
         // wedge, so the shadow is what guarantees a hard edge on ANY user-chosen colour -- at
         // one extra draw rather than the eight the label outline costs. `sa` is `ia` shifted by
-        // exactly +1 in both axes (still an 18px span), derived rather than re-typed so the two
-        // areas cannot drift apart. This offset stays 1 SCREEN pixel under zoom, not 3: pivot is
-        // always the centre of whichever 18x18 area is passed (both ia and sa carry their own
-        // coords->x1/y1), so each pass scales in place around its own centre and the two centres
-        // stay exactly (ia.x1,ia.y1)+1 apart, same as with zoom off.
+        // exactly +1 in both axes (still a 54px span), derived rather than re-typed so the two
+        // areas cannot drift apart. The shadow stays offset by exactly 1 screen pixel, same as
+        // before the scaling change.
         lv_area_t sa = { (lv_coord_t)(ia.x1 + 1), (lv_coord_t)(ia.y1 + 1),
                          (lv_coord_t)(ia.x2 + 1), (lv_coord_t)(ia.y2 + 1) };
         idsc.recolor = contrast_shadow_on(color);
@@ -873,6 +898,19 @@ static void update_ring_rotation(void) {
   if (now - last_ring_anim < 16) return;   // ~60 fps
   last_ring_anim = now;
   if (!lvgl_lock(50)) return;              // leave the delta pending; next tick retries
+
+  // Bound the lag. The ease closes ~90 degrees in about six 16 ms frames, so a spin faster than
+  // roughly ten detents per second outruns it and the ring falls progressively further behind --
+  // which reads on hardware as a freeze followed by a catch-up when the knob stops. Snapping the
+  // current angle to within two wedges of the target keeps the ring responsive at any speed while
+  // preserving the ease for ordinary single detents.
+  if (active_count > 0) {
+    float max_lag = (360.0f / active_count) * 2.0f;
+    float lag = ring_rot_target - ring_rot;
+    if (lag >  max_lag) ring_rot = ring_rot_target - max_lag;
+    if (lag < -max_lag) ring_rot = ring_rot_target + max_lag;
+  }
+
   float diff = ring_rot_target - ring_rot;
   if (fabsf(diff) < 0.5f) ring_rot = ring_rot_target;
   else                    ring_rot += diff * 0.58f;   // ease factor tuned via hardware feedback (3 rounds). Math: with 0.5° snap threshold, 90° step needs (1-f)^n*90 <= 0.5; n=6 frames gives f=0.58. At 16ms/frame: ~96ms settle time (vs ~140ms at 0.45f, ~230ms at 0.30f).
