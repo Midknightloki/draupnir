@@ -27,11 +27,11 @@ Draupnir is a **USB-HID macro controller in a knob** — round touch screen plus
 driverless over USB HID, configured from a Flutter phone app over BLE. Macros show as a ring of
 colored wedges; rotate to select, tap center or tap a wedge to fire.
 
-**M6 (config hardening), M7 (NVS persistence) and M8 (on-device profile switching) are done**,
-verified on hardware. **M9 (icons, dial orientation, rotary macro mode) is done on the Waveshare**,
-verified on hardware across three feedback rounds — see §4. **The M5Dial half of M9 is not**: a
-data-loss fix was ported to that board's firmware but the board has never been flashed this
-milestone. That is the single most important outstanding item; see §4 and §6.
+**M6 (config hardening), M7 (NVS persistence), M8 (on-device profile switching) and M9 (icons,
+dial orientation, rotary macro mode) are done**, verified on hardware. M9's Waveshare work was
+signed off 2026-08-22 after three feedback rounds; the M5Dial's `icon_xbm` save-merge — a fix for
+live data loss on that board — was flashed and verified 2026-08-25. Editing one macro no longer
+wipes the icons on the others. See §4.
 
 ---
 
@@ -61,8 +61,19 @@ Tasks 1–6 of the M9 plan are each individually review-clean (see the ledger fo
 on each). A final whole-branch review then caught two cross-task defects invisible to any
 single-task review — a Critical UI-mode guard that could route an exit-tap into firing a macro, and
 an Important rotary multi-detent coalescing bug — both fixed in `bd9b358` and re-reviewed clean.
-Everything from `3ec0a1a` onward is a hardware-round fix (see §4); none of those four commits went
-through a task brief or a reviewer — see the review-gate debt note in §8.
+Everything from `3ec0a1a` onward is a hardware-round fix (see §4). None of those four commits went
+through a task brief or a reviewer at the time — they were written live during hardware debugging,
+when the feedback loop was the bottleneck rather than the code. That debt was cleared before the
+PR: all four were reviewed together against the full diff, returning **0 Critical, 1 Important,
+7 Minor**. The two worth worrying about — the icon scaler's bounds arithmetic and
+`select_idx_by()`'s task affinity — were checked against the installed LVGL 8.4.0 sources and the
+vendored SH8601 driver, and are correct. Three risk-free items were fixed (`ef72c3e`); the rest are
+parked with reasoning in
+`.superpowers/sdd/2026-08-20-m9-icons-orientation-rotary/hw-rounds-review.md`.
+
+Worth recording that skipping the gate *was* a gamble that happened to pay, not a process this
+project validated. It was defensible under live hardware debugging and should not become the
+default.
 
 ---
 
@@ -97,19 +108,14 @@ verified" as though it were confirmed.
   40→25) — "much better," then working at both fast and slow swipe speeds.
 - Fast encoder spin tracking the target angle without freezing or reversing, after two rounds
   (`select_idx_by()`, then a bounded ease lag) — confirmed smooth in round 2.
+- **The M5Dial's `icon_xbm` save-merge (2026-08-25).** Flashed to the M5Dial and verified against
+  its stated criterion: edit one macro in the app, the other macros keep their icons. This closed
+  live data loss — before it, every save wiped the bitmaps on every macro the user had not just
+  edited. Note what a pass does *not* cover: that board's `profiles.json` write is still a direct
+  truncate-and-write, so power loss mid-save still corrupts it (see §6).
 
 ### NOT verified — read this before assuming otherwise
 
-- **The M5Dial half of M9.** Task 6 ported the `icon_xbm` save-merge to
-  `firmware/M5_M6_config/M5_M6_config.ino`, closing a **live data-loss bug** on that board — editing
-  one macro in the app currently wipes every other macro's icon. The change passed its own compile
-  gate against the M5Dial FQBN (49% flash) and was code-reviewed (0 findings, both merge blocks
-  diffed line-for-line against the Waveshare version for behavioral parity). **The board has not
-  been flashed this milestone.** Its acceptance criterion — edit one macro, verify the others keep
-  their icons — has not been run by anyone. This matters more than a typical unverified item: the
-  fix exists specifically to stop silent, ongoing data loss on a currently-shipping board, and
-  "compiles and reviews clean" is a weak guarantee for a merge that reaches into a second JSON
-  document. **Flash and verify this before anything else.**
 - **Frame pacing at high macro counts.** Still unmeasured — all M9 hardware testing ran against
   small profiles. This is now a harder question than it was at the end of M7/M8: the ring draw
   callback issues up to 9 `lv_draw_label` calls per wedge per repaint (unchanged from before), and
@@ -220,37 +226,42 @@ proposed Visual Studio reinstall that would have fixed nothing.
 
 ## 6. What to do next, in order
 
-### Step 1 — Flash and verify the M5Dial
-
-This is the top priority, ahead of any new feature work: `firmware/M5_M6_config/M5_M6_config.ino`
-carries a fix (`4d182e2`) for a live data-loss bug (editing one macro wipes every other macro's
-icon) that has never been run on the actual board. Flash it, edit a macro with at least one other
-macro carrying an icon, and confirm the other macro's icon survives. If it doesn't, the merge logic
-needs a second look despite its clean review — a review against a diff is not a review against
-hardware.
-
-### Step 2 — M8b
+### Step 1 — M8b
 
 Uncap `pos`, key running-macro state by macro identity rather than slot, then bump the on-device
 default to `version: 3`. The full detail and the reason it must precede the version bump is in
 `docs/Draupnir_Spec.md` §6's "NOT YET IMPLEMENTED" box — still accurate, unchanged by M9.
 
-### Step 3 — M5Dial security gate
+This is the last thing standing between the schema and what the spec has claimed since v3. It is
+also cheap relative to its blast radius: the cap is a leftover from when `pos` addressed a physical
+key on a 16-key grid, and that grid no longer exists.
+
+### Step 2 — The M5Dial security gate
 
 The M5Dial firmware still has no cryptographic gate at all (§8). This has been the top follow-up
 since M6 closed the equivalent hole on the Waveshare, and per the locked work order (`CLAUDE.md`),
-Waveshare polish work should not keep displacing it indefinitely — it goes ahead of M10's comfort
-items. It is an unauthenticated keystroke-injection path on a currently-supported board.
+Waveshare polish should not keep displacing it — it goes ahead of M10's comfort items. It is an
+unauthenticated keystroke-injection path on a currently-supported board: any BLE central in range
+can write macros to it and have them typed into whatever host it is plugged into.
+
+Fold the non-atomic `profiles.json` write (§6 gaps) into the same pass. Both are the same shape of
+debt — hardening the Waveshare already received and the M5Dial never did — and both touch that
+sketch's config path, so doing them together costs one review cycle instead of two.
+
+### Step 3 — M10, polish
+
+Buzzer/haptic feedback and export/import. Note that haptics are currently blocked by a hardware
+interaction, not by effort: `haptics_init()` breaks the CST816 touch controller (§6 gaps). That
+needs diagnosing before the milestone can be scoped honestly.
 
 ### Also worth doing, not blocking
 
-- Triage the review-gate debt (§8): four M9 commits (two hardware-round fix waves, the icon-scale
-  retarget, the label-size change) went straight from a hardware finding to implementation with no
-  brief and no reviewer. They're substantive — the QSPI opcode fix and the icon scaler among them —
-  and should get a look before this branch merges.
-- Frame-pacing measurement at 12+ macros, now more overdue given the larger icon assets (§4).
-- `superpowers:finishing-a-development-branch` once the M5Dial verification and the review-gate
-  triage are done. Note PR #2 (M7/M8) is still open and this branch is based on it.
+- **Frame-pacing measurement at 12+ macros** (§4). This is the oldest unmeasured assumption in the
+  project and it got worse in M9, not better. It also gates a known optimisation: `icon_scale()`
+  re-derives every icon on every repaint for a result that only changes on profile reload, and the
+  fix is a ~4.3 KB cache — but nobody should spend RAM on a problem nobody has measured.
+- The five parked Minor findings from the M9 hardware-round review, recorded with reasoning in
+  `.superpowers/sdd/2026-08-20-m9-icons-orientation-rotary/hw-rounds-review.md`.
 
 ---
 
