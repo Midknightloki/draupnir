@@ -26,9 +26,23 @@ void profiles_reload();
 const char *profiles_active_name();
 JsonObject profiles_find_macro(int pos);
 
+// Same lookup as profiles_find_macro(), but against an arbitrary profile index rather than only
+// the active one. Used by save_profiles's icon_xbm merge (ble_engine.cpp), which must cross-
+// reference every profile in the INCOMING document against what's already stored on the device,
+// not just whichever one happens to be on screen right now. Returns a null JsonObject (check
+// with .isNull()) if profileIdx or pos don't match anything.
+JsonObject profiles_find_macro_in(int profileIdx, int pos);
+
 // The active document's settings.brightness -- the SEED for NVS brightness, never a source of
 // truth once NVS has been written (see device_state.h). 160 if absent or out of range.
 uint8_t profiles_default_brightness();
+
+// settings.orientation, 0..3 (0/90/180/270 degrees). 0 if absent or out of range.
+// profiles.json is the SINGLE source of truth for this -- deliberately unlike brightness, which
+// is NVS-authoritative. Brightness has one writer (the device); orientation will have two once
+// the Settings menu gains an entry, and NVS cannot reconcile two writers without the device
+// writing back to JSON anyway -- at which point NVS is a redundant second copy.
+uint8_t profiles_orientation(void);
 
 // Active profile's "color" (e.g. "#3080E0"), "#FFFFFF" if absent. Used for the ring's
 // directional profile indicators.
@@ -96,3 +110,29 @@ void macros_request_stop_all();
 // Unlike the mutating calls above, this is safe to read from the LVGL task: it only reads the
 // `active` booleans, never writes, and a one-frame-stale answer costs at most one frame of pulse.
 bool macros_any_running();
+
+// Rotary macros bind the encoder instead of playing. The encoder runs on its own task and the
+// macro engine is loop()-only, so a turn must be ENQUEUED, exactly as macros_request_fire() does.
+// dir > 0 executes actions[0]; dir < 0 executes actions[1].
+void macros_request_rotary_step(int dir);
+
+// True while a rotary macro owns the encoder. The UI reads these to draw its screen.
+bool        macros_rotary_active(void);
+const char *macros_rotary_name(void);
+// Returns the raw "#RRGGBB" string, not a parsed value: parse_hex_color() lives in the .ino and
+// the macro engine stays free of display concerns.
+const char *macros_rotary_color(void);
+
+// Clears ONLY the rotary binding, leaving runningMacros[] alone. Exiting a rotary screen stops
+// the knob driving that macro's actions; it is not a reason to kill unrelated macros, and the
+// M5Dial does not kill them either -- M9 requires the two boards to be indistinguishable.
+//
+// macros_stop_all() still clears rotary state as well, so the profile-reload path keeps its
+// use-after-free protection: rotaryMacro holds a JsonObject into profilesDoc.
+//
+// loop()-task only, same constraint as the rest of the engine's mutating API (macros_fire(),
+// macros_stop_all()): it mutates rotaryActive/rotaryMacro directly with no locking. Callers on
+// any other task (LVGL, BLE) must not call this -- there is no request-queue form because
+// nothing outside loop() currently needs one; add one if that changes rather than calling this
+// directly from another task.
+void macros_rotary_stop(void);

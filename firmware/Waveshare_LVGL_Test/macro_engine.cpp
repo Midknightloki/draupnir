@@ -78,6 +78,15 @@ void hid_init() {
 // swipe can never be overtaken by a tap that was requested first.
 #define MACRO_CMD_STOP_ALL (-99)
 
+#define MACRO_CMD_ROTARY_CW  (-97)
+#define MACRO_CMD_ROTARY_CCW (-98)
+
+// Holds a JsonObject into profilesDoc, exactly like ActiveMacro -- so it MUST be dropped whenever
+// the document is reloaded, or a save arriving while the rotary screen is up dereferences a freed
+// pool. Same defect class H3 fixed, on a new trigger. macros_stop_all() clears it.
+static JsonObject rotaryMacro;
+static bool       rotaryActive = false;
+
 void macros_request_fire(int pos) {
   if (!fireQueue) {
     TRACE("[fire] request DROPPED: no queue\n");
@@ -94,6 +103,31 @@ void macros_request_stop_all() {
   if (!fireQueue) return;
   int cmd = MACRO_CMD_STOP_ALL;
   xQueueSend(fireQueue, &cmd, 0);
+}
+
+// One sentinel per detent, not per wake. encoder_task coalesces every tick queued since it last
+// woke into a single delta, which is right for the ring and the brightness gauge (both treat
+// delta as a magnitude) but would silently drop detents here -- a three-detent flick would fire
+// the bound action once. The M5Dial catches up one step per loop pass, so dropping them would be
+// a parity break.
+//
+// xQueueSend with a 0 timeout drops silently when the queue is full (depth 8, drained every
+// loop tick), which bounds a pathological spin rather than blocking the encoder task.
+void macros_request_rotary_step(int dir) {
+  if (!fireQueue || dir == 0) return;
+  int cmd = (dir > 0) ? MACRO_CMD_ROTARY_CW : MACRO_CMD_ROTARY_CCW;
+  int steps = (dir > 0) ? dir : -dir;
+  for (int i = 0; i < steps; i++) xQueueSend(fireQueue, &cmd, 0);
+}
+bool        macros_rotary_active(void) { return rotaryActive; }
+const char *macros_rotary_name(void)   { return rotaryMacro.isNull() ? "Rotary"  : (const char *)(rotaryMacro["name"]  | "Rotary"); }
+const char *macros_rotary_color(void)  { return rotaryMacro.isNull() ? "#FFFFFF" : (const char *)(rotaryMacro["color"] | "#FFFFFF"); }
+
+// See macro_engine.h: clears ONLY the rotary binding, deliberately leaving runningMacros[]
+// untouched -- exiting a rotary screen is not a kill-all, on the M5Dial or here.
+void macros_rotary_stop(void) {
+  rotaryActive = false;
+  rotaryMacro  = JsonObject();   // drop the reference into the document pool
 }
 
 bool macros_any_running() {
@@ -153,6 +187,9 @@ void macros_stop_all() {
     runningMacros[i].currentActionIndex = 0;
     runningMacros[i].nextActionTime = 0;
   }
+
+  rotaryActive = false;
+  rotaryMacro  = JsonObject();   // drop the reference into the old document pool
 }
 
 // Rewrites /profiles.json with the built-in default and loads it into profilesDoc. Shared by
@@ -281,10 +318,28 @@ uint8_t profiles_default_brightness() {
   return (uint8_t)b;
 }
 
+uint8_t profiles_orientation(void) {
+  int o = profilesDoc["settings"]["orientation"] | 0;
+  if (o < 0 || o > 3) o = 0;
+  return (uint8_t)o;
+}
+
 JsonObject profiles_find_macro(int pos) {
   JsonArray profiles = profilesDoc["profiles"];
   if (profiles.isNull() || activeProfileIdx >= (int)profiles.size()) return JsonObject();
   JsonObject prof = profiles[activeProfileIdx];
+  JsonArray macros = prof["macros"];
+  for (JsonObject m : macros) {
+    int p = m["pos"] | -1;
+    if (p == pos) return m;
+  }
+  return JsonObject();
+}
+
+JsonObject profiles_find_macro_in(int profileIdx, int pos) {
+  JsonArray profiles = profilesDoc["profiles"];
+  if (profiles.isNull() || profileIdx < 0 || profileIdx >= (int)profiles.size()) return JsonObject();
+  JsonObject prof = profiles[profileIdx];
   JsonArray macros = prof["macros"];
   for (JsonObject m : macros) {
     int p = m["pos"] | -1;
@@ -445,7 +500,6 @@ static void executeAction(JsonObject action) {
       }
     }
   }
-  // "delay" and "rotary" modes are handled by the caller (updateMacros / fireMacro), not here.
 }
 
 void macros_fire(int pos) {
@@ -462,6 +516,11 @@ void macros_fire(int pos) {
   }
 
   const char *mode = macro["mode"] | "play_once";
+  if (strcmp(mode, "rotary") == 0) {
+    rotaryMacro  = macro;
+    rotaryActive = true;
+    return;               // a rotary macro binds the encoder; it does not play
+  }
   bool isToggle = (strcmp(mode, "toggle") == 0);
 
   if (runningMacros[pos].active && runningMacros[pos].isToggle) {
@@ -491,6 +550,12 @@ void macros_update() {
     if (pendingPos == MACRO_CMD_STOP_ALL) {
       Serial.println("[diag] kill-all requested (swipe down)");
       macros_stop_all();
+    } else if (pendingPos == MACRO_CMD_ROTARY_CW || pendingPos == MACRO_CMD_ROTARY_CCW) {
+      if (rotaryActive && !rotaryMacro.isNull()) {
+        JsonArray acts = rotaryMacro["actions"];
+        int idx = (pendingPos == MACRO_CMD_ROTARY_CW) ? 0 : 1;
+        if ((int)acts.size() > idx) executeAction(acts[idx]);
+      }
     } else {
       macros_fire(pendingPos);
     }

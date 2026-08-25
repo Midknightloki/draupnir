@@ -329,26 +329,30 @@ silently dropping every macro with `pos > 15`.
 > Uncapping properly means keying running-macro state by macro identity rather than by `pos`,
 > which is M8+ work. Tracked in §10.
 
-### `settings.orientation` — dial rotation (M9)
+### `settings.orientation` — dial rotation (shipped in M9)
 
 An int `0..3`: `0` = 0°, `1` = 90° CW, `2` = 180°, `3` = 270° CCW. The Companion App's Settings
-dialog already reads and writes it (`dashboard_screen.dart:388-402`, `draupnir_state.dart:481-492`)
-— the schema field and the dropdown both exist today. **The Waveshare firmware does not yet
-consume it**; nothing in `firmware/Waveshare_LVGL_Test/` references `orientation`. The **M5Dial**
-firmware already does — `M5_M6_config.ino` calls `M5Dial.Display.setRotation(orientation)` on every
-`save_profiles`, and M5GFX rotates touch along with the display in that one call. Waveshare has no
-equivalent single-call API, which is the actual M9 work.
+dialog reads and writes it (`dashboard_screen.dart:388-402`, `draupnir_state.dart:481-492`), and
+**both firmwares now consume it.** The **M5Dial** always did — `M5_M6_config.ino` calls
+`M5Dial.Display.setRotation(orientation)` on every `save_profiles`, and M5GFX rotates touch along
+with the display in that one call. The **Waveshare** has no equivalent single-call API, and its
+ignoring the field was a port gap rather than an unbuilt feature: the app wrote the setting, one
+supported board honoured it, the other silently did not. M9 closed that.
 
 **Mechanism.** Rotation happens in the SH8601 panel via MADCTL (register `0x36`), not in software.
-`lcd_bsp.c` already ships a compile-time 90° path — a MADCTL write (`0x00`/`0x60`) paired with a
-touch-coordinate swap in `example_lvgl_touch_cb()`. M9 makes both runtime-selectable from
-`settings.orientation` and extends them to all four cases. **Not** `esp_lcd`'s rotation API or
-LVGL's `sw_rotate`: `panel_sh8601_swap_xy()` is `ESP_ERR_NOT_SUPPORTED` unconditionally and
-`mirror_y` is unsupported too (only `mirror_x` works), and software rotation would re-rotate every
-flush on a display already doing ten stripe-flushes per frame. The panel is square (360x360), so no
-dimension swap is needed anywhere. MADCTL values are the standard `0x00`/`0x60`/`0xC0`/`0xA0`; only
-`0x00` and `0x60` (and the paired 90° touch transform) are proven on hardware — 180°/270° are the
-conventional values but unverified, both for MADCTL and for their touch transforms.
+`lcd_bsp.c` previously shipped a compile-time 90° path; M9 made it runtime-selectable from
+`settings.orientation` across all four cases, MADCTL paired with a matching touch transform in
+`example_lvgl_touch_cb()`. **Not** `esp_lcd`'s rotation API or LVGL's `sw_rotate`:
+`panel_sh8601_swap_xy()` is `ESP_ERR_NOT_SUPPORTED` unconditionally and `mirror_y` is unsupported
+too (only `mirror_x` works), and software rotation would re-rotate every flush on a display already
+doing ten stripe-flushes per frame. The panel is square (360x360), so no dimension swap is needed
+anywhere. MADCTL values are the standard `0x00`/`0x60`/`0xC0`/`0xA0`, and **all four orientations
+are now proven on hardware**, display and touch together.
+
+> **The trap, and it cost a hardware round: the SH8601 is driven over QSPI, so a command must carry
+> the write opcode** — `(cmd & 0xff) << 8 | (0x02 << 24)`. Sent as a raw byte, MADCTL is silently
+> ignored: no error, no effect. This presented as "touch rotates but the display does not", because
+> the touch transform is plain C and worked regardless of the panel.
 
 **Storage: `profiles.json`, not NVS — unlike brightness, deliberately.** Brightness has one writer
 (the device), so NVS is authoritative and JSON is seed-only. Orientation has two writers (the app,
@@ -356,9 +360,11 @@ and eventually an on-device Settings item), which breaks that pattern either way
 the device writing its own changes back to `profiles.json` via the H4 atomic-write path, making a
 second NVS copy redundant. It also keeps the app's dropdown from showing a stale value after an
 on-device change. Applies live on profile save (cheap at runtime; hooked into the existing reload
-path under `lvgl_lock()`) — whether changing MADCTL mid-partial-refresh keeps flush regions correct
-is unverified; boot-only application is the fallback. Encoder direction does not change with
-orientation — only the display and touch transform rotate.
+path under `lvgl_lock()`). The open worry there — whether changing MADCTL mid-partial-refresh leaves
+flush regions correct — did not materialise: rotating from the app repaints cleanly, and no torn or
+offset stripes were seen. That is an observation from ordinary use, not a targeted stress test, so
+boot-only application remains the fallback if it ever does surface. Encoder direction does not
+change with orientation — only the display and touch transform rotate.
 
 ### Action types
 
@@ -475,7 +481,7 @@ Honest status, not aspiration.
 | M7 | **Persistence** — write `activeProfile` + brightness to NVS and honor them at boot | **Done (2026-08-08)**, verified on hardware |
 | M8 | **On-device profile switching** with directional indicators | **Done (2026-08-13)**, verified on hardware — grew beyond its original scope, see note below |
 | M8b | **Uncap `pos`** — key running-macro state by identity, not slot; then bump the default to `version: 3` | **Open** (see §6 warning) |
-| M9 | **Icons on the ring** + encoder detent alignment + dial orientation (`settings.orientation`, see §6) | **Open** |
+| M9 | **Icons on the ring** + dial orientation + rotary macro mode — encoder detent alignment dropped, see note below | **Done (2026-08-22)**, verified on hardware (Waveshare) |
 | M10 | Polish — buzzer/haptic feedback, export/import | **Open** — brightness UI, originally listed here, was delivered as part of M7/M8 |
 
 **M6:** done-criterion was the H1 negative test, which passed on hardware 2026-08-07 — an
@@ -492,10 +498,31 @@ static 12 o'clock selector, a centre label stack (macro name large, profile name
 selection bloom, and real FontAwesome chevron indicators — confirmed on hardware with the owner's
 own words: "This looks great."
 
-**M9** now also covers **dial orientation**: the Companion App's dropdown already writes
-`settings.orientation` to `profiles.json`, but the Waveshare firmware has never read it — see §6
-for the schema, the MADCTL mechanism, and the storage-vs-brightness reasoning. The M5Dial firmware
-already implements the equivalent via `M5Dial.Display.setRotation()`; that part is not new work.
+**M9:** done-criterion was the owner's hardware sign-off on the Waveshare, given 2026-08-22 after
+three feedback rounds ("This looks good, I think we can mark M9 complete."). What shipped differs
+from the original "icons + encoder detent alignment" line in three ways, each worth recording
+rather than silently rewriting the milestone description:
+
+- **Dial orientation was added.** This turned out to be a port gap rather than new product surface:
+  the Companion App's dropdown had always written `settings.orientation` to `profiles.json`, and the
+  M5Dial firmware had always consumed it via `M5Dial.Display.setRotation()`, but the Waveshare
+  ignored the field entirely. M9 closed that gap for all four values (`0`/`1`/`2`/`3`), in both the
+  MADCTL display write and the touch-coordinate transform — see §6 for the schema and mechanism.
+- **Rotary macro mode was added.** Same class of gap, and the more dangerous one: the app already
+  offered it and the M5Dial already implemented it, while the Waveshare silently ran a
+  rotary-mode macro as an ordinary `play_once`, discarding the distinction without any error. M9
+  brought the Waveshare to parity, including matching the M5Dial's behavior of *not* stopping macros
+  on rotary entry while stopping only the rotary binding (not all macros) on exit.
+- **Encoder detent alignment was dropped.** It was superseded by the M7/M8 ring rework: selection
+  now always lands centred at 12 o'clock regardless of which detent it came from, so there was
+  nothing left to align. The remaining ~15% mechanical double-step (two contact closures per
+  detent) was measured, traced to the physical switch rather than firmware, and deliberately
+  accepted rather than fixed with a lockout window that would also cap deliberate fast turning.
+
+**Verified on the Waveshare only.** The M5Dial half of M9 — porting the icon-merge fix that closes
+a live data-loss bug (editing one macro was wiping every other macro's icon) — compiled cleanly
+against the M5Dial FQBN and was code-reviewed, but the board has not been flashed this milestone.
+Its acceptance criterion has not been run. See `docs/HANDOFF.md` for the full breakdown.
 
 ---
 

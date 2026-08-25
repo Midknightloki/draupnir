@@ -1,6 +1,6 @@
 # Draupnir — Session Handoff
 
-*Written 2026-08-20. Pick up here.*
+*Written 2026-08-22. Pick up here.*
 
 This is a continuation brief for whoever works on Draupnir next — another agent, a fresh session,
 or the owner. It assumes **no prior context**.
@@ -13,9 +13,10 @@ or the owner. It assumes **no prior context**.
 |---|---|
 | `CLAUDE.md` / `AGENTS.md` | Persona, locked decisions, threading rules, FQBNs. Identical copies — **edit both together.** |
 | `docs/Draupnir_Spec.md` (v3) | The brief. Concept, hardware, data model, BLE protocol, milestones (§10 has the current state). |
-| `docs/superpowers/specs/2026-08-07-m7-m8-persistence-design.md` | The design this milestone was built against. |
-| `docs/superpowers/plans/2026-08-07-m7-m8-persistence.md` | The task-by-task implementation plan. |
-| `.superpowers/sdd/2026-08-07-m7-m8-persistence/progress.md` | The full execution ledger for this milestone — every task, review finding, hardware checkpoint, and owner decision, in order. This document is a summary of it; the ledger is the source of truth. |
+| `docs/superpowers/specs/2026-08-20-m9-icons-orientation-rotary-design.md` | The design this milestone was built against. |
+| `docs/superpowers/plans/2026-08-20-m9-icons-orientation-rotary.md` | The task-by-task implementation plan. |
+| `.superpowers/sdd/2026-08-20-m9-icons-orientation-rotary/progress.md` | The full execution ledger for this milestone — every task, review finding, hardware round, and owner decision, in order. This document is a summary of it; the ledger is the source of truth. |
+| `.superpowers/sdd/2026-08-07-m7-m8-persistence/progress.md` | The equivalent ledger for the previous milestone (M7/M8), still relevant background. |
 | `docs/Toolchain_arduino-cli.md` | **Read before touching hardware.** Board quirks below will otherwise cost you hours. |
 
 ---
@@ -26,57 +27,42 @@ Draupnir is a **USB-HID macro controller in a knob** — round touch screen plus
 driverless over USB HID, configured from a Flutter phone app over BLE. Macros show as a ring of
 colored wedges; rotate to select, tap center or tap a wedge to fire.
 
-**M6 (config hardening) is done.** The BLE config channel now refuses an unbonded central at the
-GATT layer — verified on hardware 2026-08-07. **M7 (NVS persistence) and M8 (on-device profile
-switching) are also done**, verified on hardware, on branch `feat/m7-m8-persistence`. M8 grew well
-past its original scope into a full ring rework; see §3.
-
-**The immediate goal is finishing this branch.** Code is written, reviewed, flashed, and the
-final-review hardware pass is complete (§4) — all six checks passed. The sequence from here is
-M8b/M9 (icons — the ring is now shaped to receive them) and then closing the M5Dial's security
-gap, ahead of M10's comfort items. See §6.
+**M6 (config hardening), M7 (NVS persistence) and M8 (on-device profile switching) are done**,
+verified on hardware. **M9 (icons, dial orientation, rotary macro mode) is done on the Waveshare**,
+verified on hardware across three feedback rounds — see §4. **The M5Dial half of M9 is not**: a
+data-loss fix was ported to that board's firmware but the board has never been flashed this
+milestone. That is the single most important outstanding item; see §4 and §6.
 
 ---
 
 ## 3. Where things stand
 
-Branch `feat/m7-m8-persistence`, 28 commits ahead of `review/waveshare-m6-foundation` (base
-`a254067`, the M6 foundation branch — not `main`, which is further behind). Nothing on this branch
-has been merged yet.
-
-Highlights, oldest to newest (full detail, including every review round and hardware checkpoint,
-is in the ledger at `.superpowers/sdd/2026-08-07-m7-m8-persistence/progress.md`):
+Branch `feat/m9-icons-orientation-rotary`, 13 commits ahead of `feat/m7-m8-persistence` (which it
+branches from — that branch has an open PR #2 and M9 merges/rebases naturally once it lands).
 
 ```
-c21baac  feat(ui): Orbitron replaces Montserrat on the ring
-0ee54d4  feat(m7): device_state owns NVS; brightness applied at boot
-c16e77f  fix(m7): use Preferences::isKey() instead of a sentinel value
-b1c7f5e  feat(m7): Settings menu -- swipe up opens and kills macros, swipe down closes
-c256725  feat(m7): on-device brightness with a half-moon gauge
-175d3b3  fix(m7): settings panels were swallowing every tap
-085ddc6  fix(m7): swipe-up's release re-fires the macro settings just stopped
-8ef54da  feat: ship a second default profile so switching is testable
-1b335f4  feat(m8): on-device profile switching, and activeProfile finally gets a writer
-3fa8ece  feat(m8): directional profile indicators, tappable
-ba32d42  fix: tune LVGL gesture thresholds so swipes actually register
-01d6829  fix: clear LV_OBJ_FLAG_SCROLLABLE on the ring screen -- horizontal swipes never gestured
-2b3551e..e0ecec5  chevron indicator iterations (superseded by Task 8's glyph, below)
-783fab0  feat(waveshare): ring rework -- rotating ring, centre label stack, tinted bloom
-6b37127  fix: ring rework round 2 -- animated rotation, tap-fires-no-select, wedge names
-9c85c57  feat(ring): lit-wedge selection, outlined labels, crisp bloom ring
-e68b017, afcecb7  tune: ring rotation easing, per owner hardware feedback (0.30 -> 0.45 -> 0.58)
-1a36d53  fix: replace lossy knob event group with a counting queue
-b2a7aa3  fix: quadrature phase decode -- REVERTED in 3ada93d, killed the dial entirely
-f32a255  diag: raw-pin ring buffer for double-detent investigation
-cdfd3b5  fix: saturate knob debounce counter -- itself buggy, see C1 below
-88ed6f2  fix: whole-branch review findings (C1/C2/I1/I2/M3/M4/M6/M7/M9)
-5c6d52c  fix: budget the ellipsis width in wedge_label_fit() before truncation
-9ed000a  fix: stop uppercase key letters from silently injecting Shift    <- HEAD
+7a29c90  refactor(ui): dispatch input through a mode table
+a65d8a8  docs(ui): restore comments dropped in the mode-table refactor
+2387c33  feat(m9): consume settings.orientation via MADCTL
+cd1a353  feat(m9): render macro icons on the ring
+94ca06e  fix(m9): add icon drop shadow, refactor contrast into bg_is_light()
+417546b  feat(m9): implement rotary macro mode
+570285a  fix(m9): rotary exit must not kill unrelated macros
+f53206f  feat(m9): strip icon_xbm on read, merge it on save
+4d182e2  fix(m5): merge preserved icon_xbm on save
+bd9b358  fix: rotary/settings idle-timeout tap leak + per-detent rotary firing
+3ec0a1a  fix: four M9 hardware-testing bugs — MADCTL opcode, icon zoom, gesture reset, encoder judder
+d04a90c  fix: three M9 hardware round-2 bugs — icon zoom, swipe-as-tap, spin lag
+0b84066  fix: retarget macro icon scaling to 2.5x via inverse-mapping resample
+e4b6db8  feat: add orbitron_18 font, bump wedge labels to 18px    <- HEAD
 ```
 
-Everything through `9ed000a` (HEAD) has now been flashed and hardware-tested — the outstanding
-hardware pass in §4 completed 2026-08-20, all six checks passing. See §4 for exactly what that
-pass did and did not exercise.
+Tasks 1–6 of the M9 plan are each individually review-clean (see the ledger for the finding trail
+on each). A final whole-branch review then caught two cross-task defects invisible to any
+single-task review — a Critical UI-mode guard that could route an exit-tap into firing a macro, and
+an Important rotary multi-detent coalescing bug — both fixed in `bd9b358` and re-reviewed clean.
+Everything from `3ec0a1a` onward is a hardware-round fix (see §4); none of those four commits went
+through a task brief or a reviewer — see the review-gate debt note in §8.
 
 ---
 
@@ -85,98 +71,93 @@ pass did and did not exercise.
 **This is the most important section in this document.** Do not build on anything listed as "not
 verified" as though it were confirmed.
 
-### Verified on hardware during this milestone
+### Verified on hardware during M9 (Waveshare)
 
-- Orbitron rendering on the ring.
-- Brightness: JSON seed → NVS → boot → panel. The screen is visibly dimmer at a low stored value,
-  and `settings.brightness` — present in the schema since the first profile store and never
-  wired to anything — now does something.
-- The Settings menu and the brightness gauge, **including tap-to-enter and tap-to-confirm** (this
-  was a Critical finding: `lv_obj_create()` sets `LV_OBJ_FLAG_CLICKABLE` by default, and the
-  settings panels never cleared it, so a full-screen container was silently stealing every tap).
-- Exactly one NVS write per Settings session, not one per detent (`Preferences::isKey()` guards
-  it) — confirmed by serial log, and a second edit session with no change produced no write.
-- Macros stopping when Settings opens, **and staying stopped.** This took two rounds: the first
-  fix stopped the macro but a queued fire from the finger's release event immediately restarted
-  it; the second drained the pending-fire queue as part of `macros_stop_all()`.
-- Profile switching: persists across a power cycle, survives a switch away from a *running*
-  toggle macro with no crash and no `rst:0x` anywhere in the capture.
-- Swipes registering reliably, both directions. This needed two independent fixes layered on top
-  of each other — tuned gesture thresholds (`ba32d42`) and clearing `LV_OBJ_FLAG_SCROLLABLE` on
-  the ring screen (`01d6829`, the actual root cause: label overflow was making the screen
-  scrollable, and a scrolling object eats gestures before LVGL ever checks thresholds).
-- The complete ring rework (Tasks 8–10): rotating ring under a static 12 o'clock selector, centre
-  label stack, tinted selection bloom, outlined wedge labels, FontAwesome chevron indicators. The
-  owner's own words on seeing it: **"This looks great."**
-- Heap flat throughout — no drift attributable to a leak was observed at any checkpoint.
-- **The final-review fix wave and the phantom-Shift fix, confirmed 2026-08-20** (§4's "outstanding
-  hardware pass" below has the full record): a long knob hold still produces a detent; a no-op
-  swipe-down no longer fires a macro; a refused swipe inside Settings no longer activates a menu
-  item; a long macro name truncates with an ellipsis instead of smearing; brightness survives a
-  power cycle with the NVS write outside `lvgl_lock()`; and an existing `Win+L` macro now works
-  without being re-created, on both firmware and app.
+- **The mode-dispatch refactor** (`7a29c90`), behavior unchanged — confirmed across all the
+  hardware rounds below, which exercised ring, settings and rotary modes repeatedly with no
+  regression traceable to the refactor itself.
+- **Dial orientation**, all four values (`0`/`1`/`2`/`3`), in **both** the display (MADCTL write)
+  and touch (coordinate transform). Round 1 found orientation doing nothing visually while touch
+  still rotated — the two are independent code paths and can be right/wrong independently, which is
+  exactly what happened. Round 2 confirmed the display now rotates correctly for all four values
+  after the QSPI opcode fix (see §8 finding 1).
+- **Macro icons at 45×45**, luminance-picked black-or-white plus an opposite-colour 1px drop
+  shadow. This took three sizing rounds on hardware: 18×18 (the app/M5Dial interchange size) was
+  far too small on the 360×360 panel, 3× zoom made icons vanish entirely (see §8 finding 2), the
+  fallback pre-scale to 54×54 worked but was "slightly large," and the final 45×45 (2.5×,
+  inverse-mapping resample) was accepted — "pixelized look I didn't intend, but I don't hate it."
+- **Rotary macro mode** — "works great" (owner, round 1). Entering does not stop macros; exiting
+  stops only the rotary binding, matching the M5Dial's behavior; per-detent firing was confirmed
+  after the multi-detent coalescing fix (`bd9b358`).
+- **`icon_xbm` strip-and-merge on the Waveshare** — editing one macro preserves every other macro's
+  icon, confirmed on hardware (round 1: "editing macros/icons preserves other macros' icons").
+- **Wedge labels at 18px** (`orbitron_18`), confirmed together with the 45px icons in the final
+  hardware round: "This looks good, I think we can mark M9 complete." (owner, 2026-08-22).
+- Swipe gestures, after two rounds of tuning (`gesture_min_velocity` 1→0, then `gesture_limit`
+  40→25) — "much better," then working at both fast and slow swipe speeds.
+- Fast encoder spin tracking the target angle without freezing or reversing, after two rounds
+  (`select_idx_by()`, then a bounded ease lag) — confirmed smooth in round 2.
 
-### NOT verified on hardware — do not imply otherwise
+### NOT verified — read this before assuming otherwise
 
-- **Task 5's built-in second default profile.** It only regenerates on a wiped device or a
-  missing/corrupt `profiles.json`, and the owner deliberately chose to add a second profile from
-  the companion app instead, to keep their real macros. The regeneration path was validated by two
-  independent code reviews (JSON correctness, consumer codes checked against
-  `getConsumerCode()`), never exercised on the device.
-- **The debounce-counter fix's actual overflow path.** See the "outstanding hardware pass" section
-  below — the long-hold check passed, but it did not exercise the bug the fix targets.
-- **Frame pacing at 12–16 macros.** All hardware testing this milestone ran against a 4-macro
-  profile. The ring's draw callback issues up to 9 `lv_draw_label` calls per wedge per repaint, and
-  the final review turned up a detail that makes this worse than it first looked:
-  `EXAMPLE_LVGL_BUF_HEIGHT` is `V_RES / 10`, so `ring_draw_event_cb` runs once per render *stripe*,
-  not once per frame — roughly **10× the earlier back-of-envelope estimate**. Documented fallback
-  is dropping to 4 label offsets if it stutters. Nobody has loaded a 12+ macro profile onto the
-  device yet.
+- **The M5Dial half of M9.** Task 6 ported the `icon_xbm` save-merge to
+  `firmware/M5_M6_config/M5_M6_config.ino`, closing a **live data-loss bug** on that board — editing
+  one macro in the app currently wipes every other macro's icon. The change passed its own compile
+  gate against the M5Dial FQBN (49% flash) and was code-reviewed (0 findings, both merge blocks
+  diffed line-for-line against the Waveshare version for behavioral parity). **The board has not
+  been flashed this milestone.** Its acceptance criterion — edit one macro, verify the others keep
+  their icons — has not been run by anyone. This matters more than a typical unverified item: the
+  fix exists specifically to stop silent, ongoing data loss on a currently-shipping board, and
+  "compiles and reviews clean" is a weak guarantee for a merge that reaches into a second JSON
+  document. **Flash and verify this before anything else.**
+- **Frame pacing at high macro counts.** Still unmeasured — all M9 hardware testing ran against
+  small profiles. This is now a harder question than it was at the end of M7/M8: the ring draw
+  callback issues up to 9 `lv_draw_label` calls per wedge per repaint (unchanged from before), and
+  each wedge now also draws a 45×45 icon plus its drop shadow, in the same nine-outline-copy
+  pattern. Nobody has loaded a 12+ macro profile onto the device since M7/M8, let alone with M9's
+  larger assets.
+- Swipe-down killing macros from the rotary screen — implemented, not specifically hardware-tested
+  this milestone.
+- 180°/270° touch accuracy in isolation — orientation was reported working as a whole, but round 1
+  showed display and touch can be right/wrong independently of each other, so a value-by-value
+  breakdown was never isolated; only the aggregate "rotates for all four values" was confirmed.
 
-### Outstanding hardware pass — completed 2026-08-20, all six passed
+### Four findings — do not re-derive these on the next hardware round
 
-All six checks below were run against a build of `9ed000a` and passed (owner, 2026-08-20). This
-confirms the final-review fix wave (`88ed6f2`, `5c6d52c` — gesture-release leak, label truncation,
-the NVS-lock change) and the phantom-Shift fix (`9ed000a`) on both the firmware and app sides.
+Each of these cost a full hardware round (flash → observe → diagnose → fix → reflash) to find. All
+four are instances of code that compiles cleanly and does nothing observable — treat that symptom
+as the first hypothesis, not a last resort (see the tally below).
 
-1. A long knob hold (≥ 1 s) still produces a detent (the debounce-counter fix, `88ed6f2`). **PASS
-   — but read the next paragraph before treating the fix itself as exercised.**
-2. A no-op swipe-down (nothing running) does **not** fire a macro. *This previously sent
-   keystrokes to the host* — a real regression, not a theoretical one. **PASS.**
-3. A refused swipe inside Settings does **not** activate a menu item. **PASS.**
-4. A long macro name truncates with an ellipsis rather than smearing across the neighbouring
-   wedge (`5c6d52c`). **PASS.**
-5. Brightness still survives a power cycle — a regression check on the commit that moved the NVS
-   write out from under the LVGL lock. **PASS.**
-6. An existing `Win+L` macro now works **without being re-created** (the phantom-Shift fix,
-   `9ed000a`). **PASS.**
+1. **The SH8601 is a QSPI panel; commands must carry the write opcode.** `lcd_set_orientation()`
+   sent a raw `0x36` MADCTL byte, which the panel silently ignored, while the touch transform (plain
+   C, no panel involvement) worked regardless — hence "touch rotates, display does not." The
+   driver's own command path wraps every byte as `(cmd & 0xff) << 8 | (0x02 << 24)`; fixed with a
+   `SH8601_QSPI_CMD()` macro replicating that encoding.
+2. **LVGL 8.4 cannot zoom an `ALPHA_1BIT` image.** `lv_draw_sw_img.c` takes the transform path
+   whenever `zoom != LV_IMG_ZOOM_NONE`, and `lv_draw_sw_transform.c` only implements
+   `TRUE_COLOR`/`TRUE_COLOR_ALPHA`/`TRUE_COLOR_CHROMA_KEYED`/`RGB565A8`. A 1-bit source under `zoom`
+   renders nothing — not small, not distorted, absent. Fixed by pre-scaling the bitmap in software
+   (nearest-neighbour, later switched to inverse-mapping to support the non-integer 2.5× ratio) and
+   drawing at 1:1 on the supported path.
+3. **`gesture_min_velocity` must be 0, not 1.** LVGL resets accumulated gesture travel whenever
+   `|vect| < min_velocity` on both axes. At 1, that condition is true on every poll where the finger
+   moved zero pixels between samples — which is constant during a slow, deliberate swipe at a 3 ms
+   poll rate. The reset then fires the whole way through the swipe, so the eventual release lands as
+   a tap instead, firing whatever wedge is under the finger (including, once, a rotary macro the
+   owner was only swiping past). A previous milestone had already moved this 3→1 and stopped one
+   short of the value that disables the reset entirely.
+4. **The wedge label font is referenced in four places and they must change together.** Three are
+   inside `wedge_label_fit()` (the fits-as-is check, the ellipsis width, the truncation loop); the
+   fourth is the draw call itself. `lv_draw_label` does not clip to its `coords`, so a
+   measure/draw font mismatch makes text overflow its box and paint across the neighbouring wedge —
+   in all nine outline-drawing copies. This exact failure class was fixed once already in an earlier
+   milestone for a different reason; the M9 font swap (`orbitron_12` → `orbitron_18`) had to
+   re-satisfy the same four-site invariant, verified by grepping the old font down to 0 references
+   afterward.
 
-**Do not over-read check 1.** It proves a long hold does not *break* the detent — it does not
-prove the debounce fix's actual bug path was exercised. That bug needs the contact held **low**
-for more than 768 ms (a `uint8_t` counter wrapping at 256 samples of a 3 ms poll), and earlier
-measurement established that closure duration is set by the mechanical wipe of the contact, not by
-how long the owner holds the knob: the longest closure ever captured was 588 ms, even during holds
-the owner believed were much longer. So the debounce fix remains **correct by inspection** (the
-saturating-counter arithmetic was re-verified by the final review) but **unexercised in practice**
-— nothing has yet triggered the >768 ms path on real hardware, and check 1 passing does not change
-that.
-
-### Two findings — settled by measurement, do not re-litigate
-
-- **The encoder is not a quadrature device.** Raw-pin capture (2026-08-13): rest state is
-  `A=1 B=1`; one direction pulses `A` low while `B` never moves, the other direction pulses `B`
-  low while `A` never moves. It is two independent momentary contacts, not a Gray-code encoder. A
-  quadrature-decode rewrite was attempted (`b2a7aa3`) on the theory that "not currently decoded as
-  quadrature" meant "should be" — it emitted zero events across a 90 s capture and was reverted
-  (`3ada93d`). The vendor driver's edge-per-pin design is correct for this hardware. **Do not
-  attempt a quadrature decode on this board again** without new electrical evidence.
-- **~15% of detents emit two contact closures.** Measured: 29 of 189 same-direction inter-event
-  gaps under 250 ms, cleanly separated from the 39 gaps in the 400–700 ms band that are genuine
-  consecutive clicks. This is mechanical (two full closures ~240 ms apart is not healthy detent
-  behaviour), not decodable in firmware — nothing in the signal distinguishes an intentional fast
-  double-click from a bouncing switch. The owner has decided to live with it rather than add a
-  lockout window, which would also cap deliberate fast turning. **If revisited, suspect the
-  physical switch before suspecting firmware.**
+**Tally worth keeping in view:** seven LVGL/esp_lcd APIs have now compiled cleanly and done nothing
+in this project's history, two of them (findings 1 and 2 above) in M9 alone. When something "should
+work" and visibly doesn't, absence-not-error is the pattern to suspect first here.
 
 ---
 
@@ -184,7 +165,7 @@ that.
 
 The board is a **Waveshare ESP32-S3 knob**: ESP32-S3 rev v0.2, 16 MB quad flash, 8 MB PSRAM
 (present but currently disabled), 360×360 AMOLED, CST816 touch, encoder on GPIO 8/7.
-A **500 MB microSD card is installed** but the firmware does not use it (see §7).
+A **500 MB microSD card is installed** but the firmware does not use it (see §8).
 
 ### FQBN
 
@@ -239,108 +220,37 @@ proposed Visual Studio reinstall that would have fixed nothing.
 
 ## 6. What to do next, in order
 
-### Step 1 — Final sign-off and merge
+### Step 1 — Flash and verify the M5Dial
 
-The outstanding hardware pass (§4) is complete — all six checks passed 2026-08-20 against
-`9ed000a`.
+This is the top priority, ahead of any new feature work: `firmware/M5_M6_config/M5_M6_config.ino`
+carries a fix (`4d182e2`) for a live data-loss bug (editing one macro wipes every other macro's
+icon) that has never been run on the actual board. Flash it, edit a macro with at least one other
+macro carrying an icon, and confirm the other macro's icon survives. If it doesn't, the merge logic
+needs a second look despite its clean review — a review against a diff is not a review against
+hardware.
 
-**The debounce fix's unexercised >768 ms path (§4) was ruled non-blocking**, so that decision does
-not need re-making. The fix saturates the counter at `DEBOUNCE_TICKS`, so the release edge's
-pre-increment yields 3 and passes for every hold length; the counter can never exceed 3, which
-means no wrap is reachable. That arithmetic was independently verified across three hold lengths
-including 1000 polls during the final review. What it prevents is a dropped click — an annoyance,
-not a hazard — and reproducing it requires parking the knob mid-detent to hold the contact low,
-which costs a flash cycle for near-zero information. It is recorded as correct-by-inspection and
-unexercised, and that is where it should stay unless the symptom is ever seen in the wild.
+### Step 2 — M8b
 
-What remains is to triage the deferred-minor list in the ledger's final section — mostly cosmetic
-(the `state_set_active_profile` sentinel, `update_profile_switch`'s pre-lock read, a stale
-comment), none blocking — and hand off to `superpowers:finishing-a-development-branch`.
-
-### Step 2 — M8b, then M9
-
-M8b (uncap `pos`, key running-macro state by identity, bump `version: 3`) and M9 (icons on the
-ring). The ring geometry M9 will draw icons into is now settled by the Task 8–10 rework, which is
-exactly why M9 was sequenced after it rather than before. M9 should also settle the frame-pacing
-question flagged in §4 — the first natural point at which a 12+ macro profile will actually get
-loaded onto the device.
-
-**M9 also picks up dial orientation**, newly scoped in by the owner. The Companion App's "Dial
-Orientation" dropdown (`companion_app/lib/screens/dashboard_screen.dart:388-402`) already writes an
-int `0..3` to `profiles.json`'s `settings.orientation`
-(`companion_app/lib/state/draupnir_state.dart:481-492`), but the **Waveshare** firmware has zero
-references to `orientation` — the dropdown is wired to nothing on the primary target. (It *is*
-wired on the **M5Dial**: `firmware/M5_M6_config/M5_M6_config.ino` already calls
-`M5Dial.Display.setRotation(orientation)` on every `save_profiles` (three call sites, e.g.
-`:869-870`), and M5GFX rotates the touch matrix along with the display in that one call. That's a
-real, working reference implementation — don't rediscover it as new work — but it doesn't transfer
-to Waveshare's raw `esp_lcd_sh8601` + CST816 stack, which has no equivalent single-call API.)
-
-Start from the MADCTL answer, not from `esp_lcd`'s rotation API — that's a dead end, already ruled
-out:
-
-- Rotation happens in the SH8601 panel via MADCTL (register `0x36`), not in software.
-  `firmware/Waveshare_LVGL_Test/lcd_bsp.c` already ships a compile-time 90° path in the panel-init
-  command list, plus a matching touch-coordinate transform in `example_lvgl_touch_cb()`:
-
-  ```c
-  #ifdef EXAMPLE_Rotate_90
-    {0x36, (uint8_t[]){0x60}, 1, 0},   // MADCTL MX|MV = 90 degrees
-  #else
-    {0x36, (uint8_t[]){0x00}, 1, 0},   // MADCTL 0 degrees
-  #endif
-  ```
-  ```c
-  #ifdef EXAMPLE_Rotate_90
-    data->point.x = tp_y;
-    data->point.y = (EXAMPLE_LCD_V_RES - tp_x);
-  #else
-    data->point.x = tp_x;
-    data->point.y = tp_y;
-  #endif
-  ```
-  The work is making both runtime-selectable from `settings.orientation` and extending them to all
-  four cases.
-- **Do not use `esp_lcd`'s rotation API or LVGL's software rotation** — both are dead ends here.
-  `panel_sh8601_swap_xy()` returns `ESP_ERR_NOT_SUPPORTED` unconditionally
-  (`esp_lcd_sh8601.c:319-323`) and `mirror_y` is unsupported too (`:310`); only `mirror_x` works.
-  LVGL's `sw_rotate` would re-rotate every flush in software on a display that already renders
-  **ten stripes per frame** (`EXAMPLE_LVGL_BUF_HEIGHT = V_RES / 10`) — MADCTL is free by
-  comparison. The panel is square (360x360), so rotation needs no dimension swapping anywhere.
-- MADCTL values are the standard set: `0x00` (0°), `0x60` (90°), `0xC0` (180°), `0xA0` (270°). Only
-  `0x00` and `0x60` are proven on this hardware — confirm `0xC0`/`0xA0` on the device, don't assume
-  them. Likewise only the 90° touch transform above is known-good; the 180°/270° transforms have to
-  be derived and verified by eye, not taken on faith.
-
-Decisions the owner already made — do not re-litigate:
-
-1. **Applies live, on profile save.** MADCTL and the touch transform are both cheap at runtime;
-   hook the change into the existing profile-reload path, under `lvgl_lock()`.
-2. **`profiles.json` is the single source of truth — no NVS**, unlike brightness. Brightness has
-   one writer (the device) and the app round-trips a stale value on every macro edit, so NVS is
-   authoritative there with JSON as seed-only; adopting from JSON on save would stomp the knob's
-   value. Orientation will have **two** writers (app, and eventually an on-device Settings item),
-   which breaks the brightness pattern either way — skip adopting from JSON and the app's dropdown
-   does nothing; adopt it and the next app save stomps the on-device change. The only escape is the
-   device writing back to `profiles.json` through the H4 atomic-write path, at which point NVS
-   would be a redundant second copy. It also avoids leaving the app's dropdown showing a stale
-   value after an on-device change, since the app renders from `profiles.json`. Orientation changes
-   are rare and deliberate, so a ~1-2 KB atomic JSON write per change is fine — unlike brightness,
-   which moves per encoder detent.
-3. **Encoder direction does not change with orientation.** The user turns the knob from the same
-   physical position however the puck is mounted, so clockwise stays clockwise; only the display
-   and touch transform rotate.
-
-Open, not solved: whether changing MADCTL at runtime while LVGL is doing partial-refresh flushes
-(`esp_lcd_panel_draw_bitmap` over stripe regions) keeps the flush regions correct. Needs hardware
-verification; if it misbehaves, fall back to applying orientation only at boot.
+Uncap `pos`, key running-macro state by macro identity rather than slot, then bump the on-device
+default to `version: 3`. The full detail and the reason it must precede the version bump is in
+`docs/Draupnir_Spec.md` §6's "NOT YET IMPLEMENTED" box — still accurate, unchanged by M9.
 
 ### Step 3 — M5Dial security gate
 
-The M5Dial firmware still has no cryptographic gate at all (§7). This has been the top follow-up
-since M6 closed the equivalent hole on the Waveshare board, and per the locked work order
-(`CLAUDE.md`), Waveshare polish work should not keep displacing it indefinitely — it goes ahead of
-M10's comfort items.
+The M5Dial firmware still has no cryptographic gate at all (§8). This has been the top follow-up
+since M6 closed the equivalent hole on the Waveshare, and per the locked work order (`CLAUDE.md`),
+Waveshare polish work should not keep displacing it indefinitely — it goes ahead of M10's comfort
+items. It is an unauthenticated keystroke-injection path on a currently-supported board.
+
+### Also worth doing, not blocking
+
+- Triage the review-gate debt (§8): four M9 commits (two hardware-round fix waves, the icon-scale
+  retarget, the label-size change) went straight from a hardware finding to implementation with no
+  brief and no reviewer. They're substantive — the QSPI opcode fix and the icon scaler among them —
+  and should get a look before this branch merges.
+- Frame-pacing measurement at 12+ macros, now more overdue given the larger icon assets (§4).
+- `superpowers:finishing-a-development-branch` once the M5Dial verification and the review-gate
+  triage are done. Note PR #2 (M7/M8) is still open and this branch is based on it.
 
 ---
 
@@ -354,14 +264,14 @@ M10's comfort items.
    audit and the removal held up under scrutiny.
 3. **Threading rules** (spec §5, `CLAUDE.md`): macro engine is loop()-task only; UI callbacks use
    `macros_request_fire()`; LVGL only under `lvgl_lock()`; BLE callbacks hand off via queues; stop
-   running macros (and drain the pending-fire queue — see §4) before a profile reload.
+   running macros (and drain the pending-fire queue) before a profile reload.
 4. **Verify BLE and LVGL APIs against the installed core's headers, don't assume.** This build uses
    Bluedroid-styled class names but is **NimBLE-backed**, and the wrapper keeps the Bluedroid API
    surface while silently neutering it — `setAccessPermissions()` compiles and does nothing,
    `PROPERTY_*_ENC` is `0` on the Bluedroid branch, `addDescriptor(BLE2902)` is discarded. All fail
-   *silently and insecurely*. This already caused two wrong prescriptions during M6, and this
-   milestone's `LV_OBJ_FLAG_CLICKABLE` Critical (§4) is the same lesson applied to LVGL: a default
-   assumed rather than read from source cost a working tap-to-enter.
+   *silently and insecurely*. M9 turned up two more instances of the same lesson applied to
+   LVGL/esp_lcd (§4's findings 1 and 2) — a default assumed rather than read from source, twice,
+   in the same milestone.
 5. **Do not claim hardware verification you did not perform.** State plainly what was observed and
    what was not. §4 exists because of this rule.
 
@@ -373,6 +283,20 @@ M10's comfort items.
 to live in this section are not lost — they're in this file's git history, in the version dated
 2026-07-25. This rewrite compresses them because M6 is done; go there for the raw serial evidence.*
 
+- **M5Dial firmware has no cryptographic gate.** That sketch has no `BLESecurity` setup and no
+  GATT permission flags at all — config access is gated solely on `CONFIG_MODE`. The second
+  supported board still carries the vulnerability M6 exists to close. **Top follow-up**, sequenced
+  ahead of M10 (see §6 Step 3). Deferred by the board sequencing (spec §3), not by tooling — the
+  hardware is on hand.
+  > **Do not close this by restoring the `pairingToken`.** An external audit (2026-08) called the
+  > removal a blocking regression; it was not. The token was checked *only outside* `CONFIG_MODE`,
+  > and `CONFIG_MODE` is the only mode serving config commands — so in the mode that mattered
+  > there was never a check. Accepted requests went from `{CONFIG_MODE: any} ∪ {RUN_MODE: token}`
+  > to `{CONFIG_MODE: any}`: a strict subset, i.e. net *tightening*. The old `pair` command also
+  > handed the token to any central in `CONFIG_MODE` and persisted it to NVS, converting one
+  > moment of physical access into permanent remote `RUN_MODE` access. Full reasoning is in the
+  > header comment of `firmware/M5_M6_config/M5_M6_config.ino`.
+  > Verified against the real baseline: `origin/main:584` carries exactly that gate.
 - **`TX CCCD` notify permission is still gated on encryption, not authentication — resolved, but
   conditionally.** `BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN` (`0x10000`) truncates away because
   `BLECharacteristic` stores properties in a `uint16_t`; that code has not changed. What the H1
@@ -385,30 +309,51 @@ to live in this section are not lost — they're in this file's git history, in 
   the passkey prompt to make pairing friendlier, the CCCD becomes genuinely unprotected against
   Just Works with nothing flagging it, because the truncated bit was never actually enforcing
   anything — the MITM requirement upstream was.
-- **M5Dial firmware has no cryptographic gate.** That sketch has no `BLESecurity` setup and no
-  GATT permission flags at all — config access is gated solely on `CONFIG_MODE`. The second
-  supported board still carries the vulnerability M6 exists to close. **Top follow-up**, now
-  explicitly sequenced ahead of M10 (see §6 Step 5). Deferred by the board sequencing (spec §3),
-  not by tooling — the hardware is on hand.
-  > **Do not close this by restoring the `pairingToken`.** An external audit (2026-08) called the
-  > removal a blocking regression; it was not. The token was checked *only outside* `CONFIG_MODE`,
-  > and `CONFIG_MODE` is the only mode serving config commands — so in the mode that mattered
-  > there was never a check. Accepted requests went from `{CONFIG_MODE: any} ∪ {RUN_MODE: token}`
-  > to `{CONFIG_MODE: any}`: a strict subset, i.e. net *tightening*. The old `pair` command also
-  > handed the token to any central in `CONFIG_MODE` and persisted it to NVS, converting one
-  > moment of physical access into permanent remote `RUN_MODE` access. Full reasoning is in the
-  > header comment of `firmware/M5_M6_config/M5_M6_config.ino`.
-  > Verified against the real baseline: `origin/main:584` carries exactly that gate.
+- **Review-gate debt (M9).** Four commits went straight from a hardware finding to implementation
+  with no task brief and no reviewer: the two hardware-round fix waves (`3ec0a1a`, `d04a90c`) and
+  the two later icon/label sizing changes (`0b84066`, `e4b6db8`). They are substantive — the QSPI
+  opcode fix and the icon scaler are among them — and a reviewer should see them before this branch
+  merges. Same handling as the M7/M8 milestone's own hardware-round commits, which carry the same
+  debt and haven't been retroactively reviewed either.
+- **Frame pacing at 12+ macro profiles.** Unmeasured through both M7/M8 and M9. The ring draw
+  callback issues up to 9 `lv_draw_label` calls per wedge per repaint, and now also draws a 45×45
+  icon plus drop shadow per wedge in the same pattern; `EXAMPLE_LVGL_BUF_HEIGHT` is `V_RES / 10`, so
+  the callback runs once per render stripe, not once per frame. Documented fallback is dropping to
+  4 label offsets if it stutters. Nobody has loaded a 12+ macro profile onto the device yet.
+- **fireQueue depth 8 vs. the rotary mode's multiplicative enqueue.** `encoder_task` coalesces from
+  a 32-deep raw queue; a spin fast enough to queue more than 8 detents before the fire-queue drains
+  will silently drop the excess. Parked deliberately (documented tradeoff, human spins rarely exceed
+  a handful of detents per wake, `macros_update()` drains to empty every loop tick). Testable on
+  hardware: if a fast spin during a rotary macro visibly drops detents, the fix is
+  `xQueueCreate(8 → 16)`, one character.
+- **`macros_request_rotary_step()`'s `-dir` is UB on `INT_MIN`** in the abstract. Parked: `dir`
+  comes only from a coalesced sum of `int8_t` ticks off a 32-deep queue, bounded near ±4064 — the
+  path is structurally unreachable.
+- **The encoder is not a quadrature device.** Raw-pin capture (2026-08-13): rest state is
+  `A=1 B=1`; one direction pulses `A` low while `B` never moves, the other direction pulses `B`
+  low while `A` never moves. It is two independent momentary contacts, not a Gray-code encoder. A
+  quadrature-decode rewrite was attempted on the theory that "not currently decoded as quadrature"
+  meant "should be" — it emitted zero events across a 90 s capture and was reverted. The vendor
+  driver's edge-per-pin design is correct for this hardware. **Do not attempt a quadrature decode on
+  this board again** without new electrical evidence.
+- **~15% of detents emit two contact closures.** Measured: 29 of 189 same-direction inter-event
+  gaps under 250 ms, cleanly separated from the 39 gaps in the 400–700 ms band that are genuine
+  consecutive clicks. This is mechanical (two full closures ~240 ms apart is not healthy detent
+  behavior), not decodable in firmware — nothing in the signal distinguishes an intentional fast
+  double-click from a bouncing switch. The owner has decided to live with it rather than add a
+  lockout window, which would also cap deliberate fast turning. This is also why encoder detent
+  alignment was dropped from M9's scope (spec §10) rather than delivered — the M7/M8 ring rework
+  already centres every selection at 12 o'clock, so there was no alignment left to do; only this
+  mechanical double-step remains, and it isn't a firmware problem. **If revisited, suspect the
+  physical switch before suspecting firmware.**
 - **Haptics remain disabled** (breaks the CST816). A three-step single-variable re-enable plan is
   written at the call site in `Waveshare_LVGL_Test.ino`. Test by tapping *and* swiping — the
   encoder kept working right through the original failure, so it proves nothing.
-- **PSRAM is disabled although 8 MB is present.** Kept out of the M6 stability diagnosis
-  originally; that diagnosis is now settled (M6 is done), so enabling `PSRAM=opi` is a reasonable
-  isolated experiment. Free heap has stayed flat all through M7/M8 (§4), which is workable but not
-  generous, especially with M9's icon assets still to come.
+- **PSRAM is disabled although 8 MB is present.** Free heap has stayed flat through M7/M8/M9, which
+  is workable but not generous, especially now that M9 added icon assets and a larger font. Enabling
+  `PSRAM=opi` remains a reasonable isolated experiment.
 - **500 MB microSD installed, unused.** Recommendation unchanged: keep `profiles.json` in LittleFS
-  (internal, always present, no eject/corruption risk). The SD is a good home for **icon assets**
-  at M9, which is the one thing likely to outgrow internal flash.
+  (internal, always present, no eject/corruption risk).
 - **The app finds the device by scanning ONLY** (`draupnir_state.dart:248-287`) and never consults
   `FlutterBluePlus.systemDevices`. A peripheral does not advertise while a link is open, so if
   Android holds a stale ACL connection the scan returns nothing and the app reports "No Draupnir
@@ -426,9 +371,14 @@ to live in this section are not lost — they're in this file's git history, in 
   firmware drives it with SH8601 and works. Unresolved, low priority.
 - **`firmware/Waveshare_Knob_Config/`** is a superseded Adafruit_GFX port, still untracked, with
   leftover `refactor*.py` scripts. Safe to delete once nothing is owed to it.
+- **The M5Dial's `profiles.json` write is non-atomic.** Direct `LittleFS.open(..., "w")`
+  truncate-and-write, unlike the Waveshare's temp→verify→rename (the H4 hardening). A power loss
+  mid-save corrupts the config on the M5Dial and cannot on the Waveshare. Not user-visible in normal
+  operation, so not a parity break M9 needed to fix, but it's a real robustness divergence between
+  two supported boards — belongs in the M5Dial catch-up pass alongside the security gate.
 - **Two long-lived branches exist and they are unrelated histories.** `main` is the real trunk.
   `origin/master` is a bare "Initial commit" that holds almost none of the tree, yet it is the
   repo's *default* branch (`origin/HEAD -> origin/master`), so tooling and fresh clones land on the
   empty one. Diffing against `master` gives a meaningless "all new" result. **Use `main`** (or, for
-  this milestone's own history, `review/waveshare-m6-foundation`). Worth deleting or repointing
-  `master` before it misleads anyone else.
+  this milestone's own history, `feat/m9-icons-orientation-rotary` / `feat/m7-m8-persistence`).
+  Worth deleting or repointing `master` before it misleads anyone else.
