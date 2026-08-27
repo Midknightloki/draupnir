@@ -110,7 +110,7 @@ unsigned long lastRedrawTime = 0;
 
 const char* defaultProfilesJson = R"=====(
 {
-  "version": 2,
+  "version": 3,
   "activeProfile": 0,
   "settings": { "brightness": 160, "ledBrightness": 60, "buzzer": true },
   "profiles": [
@@ -132,16 +132,57 @@ const char* defaultProfilesJson = R"=====(
 }
 )=====";
 
+// M8b: pos is a stable identifier and ring-ordering key, NOT an index. See
+// docs/Draupnir_Spec.md section 6 and the Waveshare's macro_engine.cpp, which took the same
+// change -- the macro engine is shared-layer, only the display differs.
+//
+// MAX_MACROS is the data-model ceiling (highest legal pos is 31). RUNNING_SLOTS is a RAM limit:
+// how many macros can play at once. They were the same number only because one array served both
+// jobs.
+#define MAX_MACROS     32
+#define RUNNING_SLOTS  16
+#define SCHEMA_VERSION 3
+
 struct ActiveMacro {
   bool active = false;
   bool isToggle = false;
-  int keyIndex = -1;
+  int pos = -1;                 // WHICH macro this slot plays -- the identity, not an index
   JsonObject macroDef;
   int currentActionIndex = 0;
   unsigned long nextActionTime = 0;
   uint16_t color = 0;
 };
-ActiveMacro runningMacros[16];
+
+// A POOL. The array index means nothing -- slot 3 is not pos 3. `.pos` is the identity and every
+// query goes through findRunningSlot(). Before M8b this was indexed BY pos, which is what
+// actually capped macros at 16.
+ActiveMacro runningMacros[RUNNING_SLOTS];
+
+// Index of the slot playing `pos`, or -1.
+int findRunningSlot(int pos) {
+  for (int i = 0; i < RUNNING_SLOTS; i++) {
+    if (runningMacros[i].active && runningMacros[i].pos == pos) return i;
+  }
+  return -1;
+}
+
+// Index of a free slot, or -1 when all RUNNING_SLOTS are busy.
+int claimFreeSlot() {
+  for (int i = 0; i < RUNNING_SLOTS; i++) {
+    if (!runningMacros[i].active) return i;
+  }
+  return -1;
+}
+
+// True if this firmware understands the document's declared schema version. Refuses only versions
+// ABOVE SCHEMA_VERSION -- v3 is a strict relaxation of v2, so every v2 file is a valid v3 file,
+// and a missing `version` is legacy rather than an error.
+bool schemaVersionOk(JsonVariantConst doc) {
+  JsonVariantConst v = doc["version"];
+  if (v.isNull()) return true;
+  int ver = v | 0;
+  return ver <= SCHEMA_VERSION;
+}
 
 bool inRotaryMode = false;
 JsonObject activeRotaryMacro;
@@ -221,6 +262,16 @@ void drawRunUI() {
   uint16_t selectedMacroColor = TFT_WHITE;
   uint16_t unselectedColor = hexToRGB565("#24242D");
   
+  // THIS 16 IS DELIBERATE AND STAYS. This ring is 16 FIXED dots -- one per position around the
+  // circle -- not the Waveshare's N-wedges-sized-to-fill. M8b uncapped the ENGINE on this board,
+  // not the ring: a macro above pos 15 stores, loads, fires and stops correctly here, is
+  // triggerable from the app and over BLE, but has no dot to be drawn in and cannot be selected
+  // on this screen.
+  //
+  // That is an accepted, documented divergence between the two supported boards (see
+  // docs/Draupnir_Spec.md section 4 of the M8b design). Closing it means porting the dynamic
+  // wedge ring onto M5GFX at 240x240 with no LVGL, which is most of the deferred M5Dial catch-up
+  // and belongs with the security gate -- not here. Do not "fix" this loop in isolation.
   for (int i = 0; i < 16; i++) {
     float angle = -PI / 2 + (i * PI * 2 / 16.0);
     int cx = centerX + cos(angle) * radius;
@@ -279,7 +330,9 @@ void drawRunUI() {
       d.fillCircle(cx, cy, 18, unselectedColor);
     }
     
-    if (runningMacros[i].active) {
+    // `i` here is a RING POSITION (this ring is 16 fixed dots), so ask by pos rather than
+    // indexing the pool -- those coincided only while runningMacros[] was indexed by pos.
+    if (findRunningSlot(i) >= 0) {
       d.drawCircle(cx, cy, 19, TFT_GREEN);
       d.drawCircle(cx, cy, 20, TFT_GREEN);
     }
@@ -297,9 +350,10 @@ void drawRunUI() {
     d.drawString("Empty", 120, 160);
   }
   
-  // Draw Kill All if any macro is running
+  // Draw Kill All if any macro is running. Scans the POOL, so it still sees a macro above pos 15
+  // even though this ring cannot draw one.
   bool anyRunning = false;
-  for (int i=0; i<16; i++) {
+  for (int i = 0; i < RUNNING_SLOTS; i++) {
     if (runningMacros[i].active) anyRunning = true;
   }
   if (anyRunning) {
@@ -325,6 +379,15 @@ void loadProfiles() {
   
   if (error) {
     Serial.println("Failed to parse profiles.json");
+  } else if (!schemaVersionOk(profilesDoc)) {
+    // A file from a NEWER firmware or client. Refuse rather than load a document whose meaning we
+    // do not know -- silently dropping whatever we fail to understand is the exact failure the
+    // version field exists to prevent.
+    Serial.printf("profiles.json declares version %d, this firmware understands %d -- refusing\n",
+                  (int)(profilesDoc["version"] | 0), SCHEMA_VERSION);
+    profilesDoc.clear();
+    deserializeJson(profilesDoc, defaultProfilesJson);
+    activeProfileIdx = 0;
   } else {
     Serial.println("Loaded profiles.json");
     activeProfileIdx = prefs.getInt("activeProfile", 0);
@@ -399,41 +462,61 @@ uint8_t getSpecialKeyCode(const char* key) {
   return 0;
 }
 
-void fireMacro(JsonObject macro, int keyIdx) {
+void fireMacro(JsonObject macro, int pos) {
   const char* mode = macro["mode"] | "play_once";
-  
+
   if (strcmp(mode, "rotary") == 0) {
     inRotaryMode = true;
     activeRotaryMacro = macro;
     requestRedraw();
     return;
   }
-  
+
+  if (pos < 0 || pos >= MAX_MACROS) {
+    Serial.printf("fireMacro: pos=%d out of range\n", pos);
+    return;
+  }
+
   bool isToggle = (strcmp(mode, "toggle") == 0);
-  
-  if (runningMacros[keyIdx].active && runningMacros[keyIdx].isToggle) {
+
+  int slot = findRunningSlot(pos);
+  if (slot >= 0 && runningMacros[slot].isToggle) {
     // Kill toggle macro
-    runningMacros[keyIdx].active = false;
-    if (trellisFound) {
-      trellis.pixels.setPixelColor(keyIdx, 0);
+    runningMacros[slot].active = false;
+    runningMacros[slot].pos = -1;
+    runningMacros[slot].macroDef = JsonObject();
+    // The NeoTrellis LED is addressed by KEY index, which is only the same as pos for the 16
+    // physical keys -- the pad genuinely has 16. A macro above that has no LED to clear.
+    if (trellisFound && pos < 16) {
+      trellis.pixels.setPixelColor(pos, 0);
       trellis.pixels.show();
     }
     // Redraw UI to possibly remove Kill All button
     requestRedraw();
     return;
   }
-  
-  runningMacros[keyIdx].active = true;
-  runningMacros[keyIdx].isToggle = isToggle;
-  runningMacros[keyIdx].keyIndex = keyIdx;
-  runningMacros[keyIdx].macroDef = macro;
-  runningMacros[keyIdx].currentActionIndex = 0;
-  runningMacros[keyIdx].nextActionTime = millis();
-  
+
+  // Re-firing a non-toggle macro already playing reuses its slot rather than claiming a second;
+  // two slots on one pos would make findRunningSlot() ambiguous.
+  if (slot < 0) slot = claimFreeSlot();
+  if (slot < 0) {
+    // Refuse rather than evict -- an eviction can strand held modifiers, and killAllMacros() is
+    // the only path that releases HID state.
+    Serial.printf("fireMacro: pos=%d refused, all %d running slots busy\n", pos, RUNNING_SLOTS);
+    return;
+  }
+
+  runningMacros[slot].active = true;
+  runningMacros[slot].isToggle = isToggle;
+  runningMacros[slot].pos = pos;
+  runningMacros[slot].macroDef = macro;
+  runningMacros[slot].currentActionIndex = 0;
+  runningMacros[slot].nextActionTime = millis();
+
   const char* colorHex = macro["color"] | "#FFFFFF";
   long rgb = strtol(colorHex + 1, nullptr, 16);
-  runningMacros[keyIdx].color = rgb;
-  
+  runningMacros[slot].color = rgb;
+
   requestRedraw(); // Show kill all button if needed
 }
 
@@ -505,17 +588,22 @@ void executeAction(JsonObject action) {
 
 void updateMacros() {
   unsigned long now = millis();
-  for (int i = 0; i < 16; i++) {
+  for (int i = 0; i < RUNNING_SLOTS; i++) {
     if (runningMacros[i].active) {
       if (now >= runningMacros[i].nextActionTime) {
         JsonArray actions = runningMacros[i].macroDef["actions"];
         if (runningMacros[i].currentActionIndex >= actions.size()) {
           if (runningMacros[i].isToggle) {
-            runningMacros[i].currentActionIndex = 0; 
+            runningMacros[i].currentActionIndex = 0;
           } else {
+            int donePos = runningMacros[i].pos;
+            // Release the slot back to the pool: identity and JsonObject too, not just the flag.
             runningMacros[i].active = false;
-            if (trellisFound) {
-              trellis.pixels.setPixelColor(i, 0);
+            runningMacros[i].pos = -1;
+            runningMacros[i].macroDef = JsonObject();
+            // LED is addressed by KEY index; the pad has 16 physical keys.
+            if (trellisFound && donePos >= 0 && donePos < 16) {
+              trellis.pixels.setPixelColor(donePos, 0);
               trellis.pixels.show();
             }
             requestRedraw(); // hide kill all if needed
@@ -543,11 +631,16 @@ void updateMacros() {
 
 void killAllMacros() {
   bool changed = false;
-  for (int i = 0; i < 16; i++) {
+  for (int i = 0; i < RUNNING_SLOTS; i++) {
     if (runningMacros[i].active) {
+      int pos = runningMacros[i].pos;
       runningMacros[i].active = false;
+      runningMacros[i].pos = -1;
+      runningMacros[i].macroDef = JsonObject();  // drop the reference into the document pool
       changed = true;
-      if (trellisFound) trellis.pixels.setPixelColor(i, 0);
+      // The LED index is the KEY index, not the slot index -- those coincided only while this
+      // array was indexed by pos. The pad has 16 physical keys; a macro above that has no LED.
+      if (trellisFound && pos >= 0 && pos < 16) trellis.pixels.setPixelColor(pos, 0);
     }
   }
   if (trellisFound) trellis.pixels.show();
@@ -870,6 +963,22 @@ void handleBleCommand(char *cmdStr) {
     JsonObject profilesObj = req["profiles"];
     if (profilesObj.isNull()) {
       sendBleMessage("{\"status\":\"error\",\"message\":\"No profiles object provided\"}");
+      return;
+    }
+
+    // Refuse a newer-schema document before anything touches flash, and TELL the app -- a save
+    // that silently does nothing is the failure this check exists to remove. Note this board's
+    // write is still a direct truncate-and-write rather than the Waveshare's temp/verify/rename,
+    // so returning early here matters more: there is no atomic commit to abort further down.
+    if (!schemaVersionOk(profilesObj)) {
+      int ver = profilesObj["version"] | 0;
+      Serial.printf("save_profiles: REFUSED, document declares version %d, firmware understands %d\n",
+                    ver, SCHEMA_VERSION);
+      char msg[128];
+      snprintf(msg, sizeof(msg),
+               "{\"status\":\"error\",\"message\":\"Schema version %d not supported (max %d) -- update the firmware\"}",
+               ver, SCHEMA_VERSION);
+      sendBleMessage(msg);
       return;
     }
 
