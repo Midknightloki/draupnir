@@ -51,6 +51,14 @@ JsonObject profiles_find_macro(int pos);
 // with .isNull()) if profileIdx or pos don't match anything.
 JsonObject profiles_find_macro_in(int profileIdx, int pos);
 
+// True if this firmware understands the document's declared schema version -- i.e. `version` is
+// absent (legacy) or <= SCHEMA_VERSION. Refuses only versions ABOVE what we know; older is always
+// fine, since v3 is a strict relaxation of v2 and every v2 file is a valid v3 file.
+//
+// Called on the load path with the whole document, and by ble_engine's save_profiles with the
+// incoming `profiles` object BEFORE anything reaches flash.
+bool profiles_schema_version_ok(JsonVariantConst doc);
+
 // How many macros the ACTIVE profile declares, and the `pos` of the idx'th one in DOCUMENT order
 // (not sorted -- the caller sorts, see scan_active_positions()). Together these let the ring
 // enumerate what exists instead of probing every pos in a fixed range, which is what the old

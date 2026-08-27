@@ -20,7 +20,7 @@ static int activeProfileIdx = 0;
 // this board specifically.
 static const char *defaultProfilesJson = R"=====(
 {
-  "version": 2,
+  "version": 3,
   "activeProfile": 0,
   "settings": { "brightness": 160 },
   "profiles": [
@@ -230,6 +230,27 @@ void macros_stop_all() {
 // profilesDoc in whatever state a failed deserialize left it and no way back to a working config
 // short of a reflash. The unguarded "w" open in that old path was also a real bug: it called
 // file.print() on an invalid File and carried on regardless.
+// True if this firmware understands the document's declared schema version.
+//
+// Refuses only versions ABOVE SCHEMA_VERSION. Older is always fine -- v3 is a strict relaxation
+// of v2 (pos uncapped from 16 to MAX_MACROS), so every v2 file is a valid v3 file, and a missing
+// `version` is treated as legacy rather than as an error.
+//
+// Without this the version number is decorative. docs/Draupnir_Spec.md section 6 justified the
+// v3 bump as making v2 firmware REFUSE a v3 file rather than silently dropping every macro above
+// pos 15 -- but no firmware ever read the field, so that refusal never happened. It cannot be
+// made to happen retroactively in already-deployed v2 builds; what this buys is that from v3
+// onward, a version a device does not understand is refused instead of silently mangled.
+// Takes JsonVariantConst rather than JsonDocument& so the same check serves both callers: the
+// load path passes the whole document, and ble_engine's save_profiles passes the incoming
+// `profiles` OBJECT out of a different document, before anything is written to flash.
+bool profiles_schema_version_ok(JsonVariantConst doc) {
+  JsonVariantConst v = doc["version"];
+  if (v.isNull()) return true;                 // legacy file, predates the field
+  int ver = v | 0;
+  return ver <= SCHEMA_VERSION;
+}
+
 static bool write_and_load_defaults(const char *reason) {
   Serial.printf("[diag] profiles: falling back to built-in defaults (%s)\n", reason);
 
@@ -272,6 +293,14 @@ void profiles_reload() {
     if (error) {
       Serial.printf("Failed to parse profiles.json (%s) -- config is corrupt, restoring defaults\n", error.c_str());
       loaded = write_and_load_defaults("profiles.json failed to parse");
+    } else if (!profiles_schema_version_ok(profilesDoc)) {
+      // A file from a NEWER firmware or client. Treated exactly like a parse failure: fall back
+      // to the built-in defaults rather than loading a document whose meaning we do not know.
+      // Booting to an empty ring because some future client wrote a v4 file is the worse failure
+      // -- the device is a keyboard, and a keyboard that does nothing is useless.
+      Serial.printf("profiles.json declares version %d, this firmware understands %d -- refusing\n",
+                    (int)(profilesDoc["version"] | 0), SCHEMA_VERSION);
+      loaded = write_and_load_defaults("profiles.json schema version too new");
     } else {
       loaded = true;
       Serial.println("Loaded profiles.json");
