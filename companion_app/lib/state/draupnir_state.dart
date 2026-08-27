@@ -492,11 +492,50 @@ class DraupnirState extends ChangeNotifier {
     await saveProfiles();
   }
 
+  // Must match MAX_MACROS in both firmwares (macro_engine.h, M5_M6_config.ino). pos is a stable
+  // identifier and ring-ordering key, NOT a grid slot -- see docs/Draupnir_Spec.md section 6.
+  static const int maxMacros = 32;
+
   List<dynamic> get currentMacros {
     if (profilesData == null) return [];
     final profiles = profilesData!['profiles'] as List;
     if (profiles.isEmpty || activeProfileIdx >= profiles.length) return [];
     return profiles[activeProfileIdx]['macros'] ?? [];
+  }
+
+  /// Macros in ascending `pos` order -- the order the device's ring draws them in.
+  ///
+  /// The stored array is in whatever order edits left it; `pos` is the ordering key, so anything
+  /// presenting macros to the user must sort. The firmware sorts for exactly the same reason (see
+  /// scan_active_positions()).
+  List<dynamic> get sortedMacros {
+    final list = List<dynamic>.from(currentMacros);
+    list.sort((a, b) => ((a['pos'] ?? 0) as int).compareTo((b['pos'] ?? 0) as int));
+    return list;
+  }
+
+  /// Lowest `pos` not currently in use, or -1 when the profile is full.
+  ///
+  /// Lowest-free rather than highest-plus-one so that gaps left by deletion get reused before the
+  /// ceiling is approached -- otherwise a long edit session of add/delete walks pos upward and
+  /// hits maxMacros with a mostly-empty profile.
+  int get lowestFreePos {
+    final used = currentMacros.map((m) => m['pos'] as int?).whereType<int>().toSet();
+    for (int p = 0; p < maxMacros; p++) {
+      if (!used.contains(p)) return p;
+    }
+    return -1;
+  }
+
+  Future<void> deleteMacro(int pos) async {
+    if (profilesData == null) return;
+    List profiles = profilesData!['profiles'] as List;
+    if (activeProfileIdx >= profiles.length) return;
+
+    List macros = profiles[activeProfileIdx]['macros'] ?? [];
+    macros.removeWhere((m) => m['pos'] == pos);
+    profiles[activeProfileIdx]['macros'] = macros;
+    await saveProfiles();
   }
 
   Future<void> updateMacro(int pos, Map<String, dynamic> macroData) async {

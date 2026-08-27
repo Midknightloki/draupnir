@@ -567,38 +567,78 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ),
           const SizedBox(height: 16),
           Expanded(
-            child: GridView.builder(
+            child: Builder(builder: (context) {
+              final macros = state.sortedMacros;
+              final canAdd = macros.length < DraupnirState.maxMacros;
+              return GridView.builder(
               gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
                 crossAxisCount: MediaQuery.of(context).orientation == Orientation.landscape ? 8 : 4,
                 crossAxisSpacing: 12,
                 mainAxisSpacing: 12,
               ),
-              itemCount: 16,
+              // The deck renders WHAT EXISTS, plus one trailing "+" tile.
+              //
+              // It used to be a fixed 16 cells where the grid index WAS the pos, and empty cells
+              // doubled as the creation affordance. That cannot survive an uncapped pos, and it
+              // already misrepresented the device: the ring draws one wedge per existing macro
+              // and skips gaps entirely, so macros at pos 0 and 9 are two ADJACENT wedges on the
+              // knob but were two distant cells here.
+              itemCount: macros.length + (canAdd ? 1 : 0),
               itemBuilder: (context, index) {
-                final macro = state.currentMacros.firstWhere(
-                  (m) => m['pos'] == index,
-                  orElse: () => null,
-                );
+                // The trailing "+" tile.
+                if (index >= macros.length) {
+                  return Material(
+                    color: AppTheme.surfaceHighlight.withOpacity(0.3),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      side: BorderSide(color: Colors.grey.shade700, width: 2),
+                    ),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(12),
+                      onTap: () async {
+                        final pos = state.lowestFreePos;
+                        if (pos < 0) return;
+                        await state.updateMacro(pos, {
+                          'name': 'New Macro',
+                          'color': '#30C060',
+                          'mode': 'play_once',
+                          'actions': [],
+                        });
+                        // Drop straight into the editor for the macro just created -- an empty
+                        // macro the user has to go find and open is not a useful outcome.
+                        if (context.mounted) {
+                          setState(() => _editingKeyIdx = pos);
+                        }
+                      },
+                      child: const Center(
+                        child: Icon(Icons.add, color: Colors.grey, size: 32),
+                      ),
+                    ),
+                  );
+                }
 
-                final hasMacro = macro != null;
-                final name = hasMacro ? (macro['name'] ?? 'Macro') : '';
-                
+                final macro = macros[index];
+                // pos is the IDENTITY. It is no longer the grid index, and conflating the two
+                // edits the wrong macro in any profile with a gap.
+                final pos = (macro['pos'] ?? 0) as int;
+                final name = macro['name'] ?? 'Macro';
+
                 Color keyColor = AppTheme.surfaceHighlight;
-                if (hasMacro && macro['color'] != null) {
+                if (macro['color'] != null) {
                   try {
                     String hex = macro['color'].toString().replaceAll('#', '');
                     keyColor = Color(int.parse('FF$hex', radix: 16));
                   } catch (_) {}
                 }
 
-                final isEditingThis = state.isEditorMode && _editingKeyIdx == index;
+                final isEditingThis = state.isEditorMode && _editingKeyIdx == pos;
 
                 return Material(
-                  color: keyColor.withOpacity(hasMacro ? 0.8 : 0.3),
+                  color: keyColor.withOpacity(0.8),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(12),
                     side: BorderSide(
-                      color: isEditingThis ? Colors.white : (hasMacro ? keyColor : Colors.transparent),
+                      color: isEditingThis ? Colors.white : keyColor,
                       width: isEditingThis ? 4 : 2,
                     ),
                   ),
@@ -606,11 +646,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     borderRadius: BorderRadius.circular(12),
                     onTap: () {
                       if (state.isEditorMode) {
-                        setState(() => _editingKeyIdx = index);
-                      } else if (hasMacro) {
-                        state.triggerMacro(index);
+                        setState(() => _editingKeyIdx = pos);
+                      } else {
+                        state.triggerMacro(pos);
                       }
                     },
+                    onLongPress: () => _confirmDeleteMacro(state, pos, name.toString()),
                     child: Center(
                       child: Text(
                         name,
@@ -625,10 +666,40 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   ),
                 );
               },
-            ),
+              );
+            }),
           ),
         ],
       ),
     );
+  }
+
+  Future<void> _confirmDeleteMacro(DraupnirState state, int pos, String name) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppTheme.surface,
+        title: Text('Delete "$name"?', style: GoogleFonts.orbitron(fontSize: 16)),
+        content: Text(
+          'This removes the macro from this profile. The device reflows its ring to close the gap.',
+          style: GoogleFonts.orbitron(fontSize: 12, color: Colors.grey),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Delete', style: TextStyle(color: Colors.redAccent)),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    // Close the editor if it was open on the macro just deleted, or it would sit there editing
+    // something that no longer exists.
+    if (_editingKeyIdx == pos) setState(() => _editingKeyIdx = null);
+    await state.deleteMacro(pos);
   }
 }
