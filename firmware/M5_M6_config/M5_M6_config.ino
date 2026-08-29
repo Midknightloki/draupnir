@@ -1394,7 +1394,13 @@ void setup() {
   // Initialize BLE
   bleRxQueue = xQueueCreate(4, sizeof(char*));
   bleAckQueue = xQueueCreate(1, sizeof(uint8_t));
-  BLEDevice::init("Draupnir");
+  // Advertised name. Deliberately NOT "Draupnir" — that is the Waveshare knob's name, and when
+  // both boards were on the air the companion app connected to whichever answered the scan
+  // first, with no way to tell them apart or to pick. The app matches any name containing
+  // "draupnir" (case-insensitive) so this still discovers normally; it just gives the picker
+  // something to distinguish. Changing this string breaks nothing else — the app never matches
+  // on the exact name, and the service UUID is unchanged.
+  BLEDevice::init("Draupnir_Mini");
   bleRxBuf = (char*)malloc(BLE_RX_BUFFER_SIZE);
   if (bleRxBuf == nullptr) {
     Serial.println("FATAL: failed to allocate BLE RX buffer");

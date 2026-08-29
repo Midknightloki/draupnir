@@ -436,6 +436,21 @@ number and the app echoes a 2-byte `[0xFE, seq]` ack; the device resends on time
 
 Commands: `get_profiles`, `save_profiles`, `trigger`.
 
+### Advertised names *(2026-08-29)*
+Each board advertises a distinct name — Waveshare = **`Draupnir`**, M5Dial = **`Draupnir_Mini`** —
+because both were previously `Draupnir` and the app connected to whichever answered the scan
+first, with no way to tell them apart or to choose. The app still **matches loosely** (any name
+containing `draupnir`, case-insensitive, or the NUS service UUID), so the name is a label for
+humans, not a protocol constant: a new board picks a new name without an app change. When the scan
+finds more than one, the app asks which to connect to; with one, it connects straight through.
+
+### Config Mode gate (M5Dial only)
+The M5Dial serves **no config command outside `CONFIG_MODE`** (entered by swiping down on the
+dial) and answers everything else with `{"status":"error","message":"Not in Config Mode"}`. The
+link is healthy in that case — the device answered, it just refused — so the app surfaces it as
+its own state with the gesture to make, not as a connection failure. The Waveshare has no such
+mode; it gates on the encrypted link instead.
+
 ### Security — standard BLE pairing
 - **Pairing:** the device displays a passkey on screen (IO capability = DisplayOnly); the user
   enters it in the phone's pairing dialog. Bonding is stored so subsequent connects are silent.
@@ -448,6 +463,14 @@ Commands: `get_profiles`, `save_profiles`, `trigger`.
 
 Why this matters more than it sounds: the device is a **keyboard**. An unauthenticated write path
 is arbitrary keystroke injection into the attached host, plus profile exfiltration.
+
+**Enforced on the Waveshare only, as of 2026-08-29.** `ble_engine.cpp` sets
+`ESP_LE_AUTH_REQ_SC_MITM_BOND` with `ESP_IO_CAP_OUT` and carries `_ENC`/`_AUTHEN` permission flags
+on the characteristics. The **M5Dial does none of this** — no `BLESecurity` block, no passkey, no
+permission flags — so its config channel has no cryptographic access control at all; the only gate
+is Config Mode, a physical gesture, which is not a security control. Closing this is the next
+milestone after M8b. Note the practical consequence for anyone testing: **there is nothing to pair
+with on the M5Dial**, and attempting to bond it from the phone's Bluetooth settings will fail.
 
 ### Editing flow
 Edit profiles and macros; assign name, color, icon, mode, and action sequence; reorder; set

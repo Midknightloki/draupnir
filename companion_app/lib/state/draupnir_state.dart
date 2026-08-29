@@ -23,6 +23,15 @@ class DraupnirState extends ChangeNotifier {
   // already does correctly.
   bool needsPairing = false;
 
+  // Set when the device answered but refused because it is not in Config Mode. Only the M5Dial
+  // has this gate: it serves no config command outside CONFIG_MODE, which is entered by a
+  // physical gesture on the dial (swipe down). The link is up and healthy in this case — the
+  // request was answered, just with a refusal — so reporting it as a connection failure, which
+  // is what the generic error path did, sent the user off diagnosing Bluetooth instead of
+  // swiping the screen in front of them. Like needsPairing, there is no in-app action that can
+  // fix it; the app's job is to say which gesture to make.
+  bool needsConfigMode = false;
+
   // True once connected over BLE. BLE is now the only transport (the Wi-Fi/HTTP client half of
   // the cut web UI is gone), so this doubles as "connected".
   bool isBluetooth = false;
@@ -219,10 +228,29 @@ class DraupnirState extends ChangeNotifier {
     );
   }
 
-  Future<void> connectBluetooth() async {
+  // Nordic UART Service — the one Draupnir speaks. Matched as a fallback for boards whose
+  // advertised name does not survive the scan (Android sometimes reports an empty platformName
+  // until a name request completes).
+  static final Guid nusServiceUuid = Guid('6E400001-B5A3-F393-E0A9-E50E24DCCA9E');
+
+  // The boards advertise different names now ("Draupnir" = Waveshare knob, "Draupnir_Mini" =
+  // M5Dial), but both match the scan filter — as any future board should. Whoever answers the
+  // scan first is not necessarily the one the user meant, so instead of taking the first hit we
+  // keep listening for a grace period after it to see whether a second board is on the air. One
+  // match connects straight through; more than one asks. The grace window is what keeps the
+  // common single-board case from paying the full 10s scan.
+  static const Duration _scanGrace = Duration(seconds: 2);
+
+  /// [chooseDevice] is called only when the scan turns up more than one Draupnir. Returning null
+  /// (the user dismissed the picker) cancels the connect quietly — not an error. Omitting it
+  /// falls back to the strongest signal, so callers without a UI to show still work.
+  Future<void> connectBluetooth({
+    Future<BluetoothDevice?> Function(List<ScanResult>)? chooseDevice,
+  }) async {
     isLoading = true;
     isScanningBle = true;
     error = null;
+    needsConfigMode = false;
     clearDebugLog();
     notifyListeners();
 
@@ -246,9 +274,13 @@ class DraupnirState extends ChangeNotifier {
       }
 
       _log('[SCAN] Starting (10s timeout)');
-      BluetoothDevice? targetDevice;
-      List<String> foundNames = [];
-      final foundCompleter = Completer<void>();
+      final List<String> foundNames = [];
+      // Keyed by remoteId so a board re-advertising during the scan updates its entry instead of
+      // appearing twice in the picker.
+      final Map<DeviceIdentifier, ScanResult> matches = {};
+      final settled = Completer<void>();
+      Timer? graceTimer;
+
       final subscription = FlutterBluePlus.scanResults.listen((results) {
         for (final r in results) {
           final name = r.device.platformName;
@@ -256,38 +288,65 @@ class DraupnirState extends ChangeNotifier {
             foundNames.add(name);
             _log('[SCAN] Found: "$name" rssi=${r.rssi}');
           }
-          if (name.toLowerCase().contains('draupnir') ||
-              r.advertisementData.serviceUuids.contains(Guid('6E400001-B5A3-F393-E0A9-E50E24DCCA9E'))) {
-            if (targetDevice == null) {
-              targetDevice = r.device;
-              _log('[SCAN] Targeting: ${r.device.platformName} (${r.device.remoteId})');
-              FlutterBluePlus.stopScan();
-              if (!foundCompleter.isCompleted) foundCompleter.complete();
-            }
+          if (!name.toLowerCase().contains('draupnir') &&
+              !r.advertisementData.serviceUuids.contains(nusServiceUuid)) {
+            continue;
           }
+          final isNew = !matches.containsKey(r.device.remoteId);
+          matches[r.device.remoteId] = r;
+          if (!isNew) continue;
+          _log('[SCAN] Draupnir: "$name" (${r.device.remoteId}) rssi=${r.rssi}');
+          // Restart the grace window on every NEW board, so a third one still gets counted.
+          graceTimer?.cancel();
+          graceTimer = Timer(_scanGrace, () {
+            if (!settled.isCompleted) settled.complete();
+          });
         }
       });
 
       // startScan's future resolves as soon as the platform scan call is issued, not when
       // scanning actually finishes — awaiting it alone races the results stream and only "works"
-      // when the OS scan cache returns a hit instantly. Wait for a real match or for scanning to
-      // actually stop (device found, 10s timeout elapsed, or manually stopped) instead.
+      // when the OS scan cache returns a hit instantly. Wait for the grace window to close after
+      // a match, or for scanning to actually stop (10s timeout elapsed, or manually stopped).
       await FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
       await Future.any([
-        foundCompleter.future,
+        settled.future,
         FlutterBluePlus.isScanning.where((scanning) => !scanning).first,
       ]);
+      graceTimer?.cancel();
       await subscription.cancel();
+      await FlutterBluePlus.stopScan();
       isScanningBle = false;
+      notifyListeners();
 
-      if (targetDevice == null) {
+      if (matches.isEmpty) {
         final listStr = foundNames.isEmpty ? 'none' : foundNames.take(8).join(', ');
         _log('[ERR] No Draupnir found. Seen: $listStr');
         throw Exception('No Draupnir device found. Nearby: $listStr');
       }
 
-      _log('[CONN] Connecting…');
-      await targetDevice!.connect(license: License.nonprofit);
+      // Strongest signal first: it is the best guess when nobody is choosing, and the most
+      // useful order to show a human who is.
+      final candidates = matches.values.toList()
+        ..sort((a, b) => b.rssi.compareTo(a.rssi));
+
+      BluetoothDevice? targetDevice;
+      if (candidates.length == 1 || chooseDevice == null) {
+        targetDevice = candidates.first.device;
+        if (candidates.length > 1) {
+          _log('[SCAN] ${candidates.length} Draupnirs, no picker — taking strongest signal');
+        }
+      } else {
+        _log('[SCAN] ${candidates.length} Draupnirs found — asking');
+        targetDevice = await chooseDevice(candidates);
+        if (targetDevice == null) {
+          _log('[SCAN] Cancelled at the picker');
+          return;
+        }
+      }
+
+      _log('[CONN] Connecting to "${targetDevice.platformName}" (${targetDevice.remoteId})…');
+      await targetDevice.connect(license: License.nonprofit);
       connectedDevice = targetDevice;
       isBluetooth = true;
       _log('[CONN] Connected');
@@ -301,13 +360,13 @@ class DraupnirState extends ChangeNotifier {
       }
 
       _log('[SVC] Discovering services…');
-      List<BluetoothService> services = await targetDevice!.discoverServices();
+      List<BluetoothService> services = await targetDevice.discoverServices();
       _log('[SVC] Found ${services.length} services');
 
       BluetoothService? uartService;
       for (var s in services) {
         _log('[SVC] Service: ${s.uuid}');
-        if (s.uuid == Guid('6E400001-B5A3-F393-E0A9-E50E24DCCA9E')) {
+        if (s.uuid == nusServiceUuid) {
           uartService = s;
         }
       }
@@ -377,6 +436,7 @@ class DraupnirState extends ChangeNotifier {
 
   Future<void> disconnectBluetooth() async {
     isBluetooth = false;
+    needsConfigMode = false;
     if (connectedDevice != null) {
       try {
         await connectedDevice!.disconnect();
@@ -397,6 +457,20 @@ class DraupnirState extends ChangeNotifier {
       'Open your phone\'s Bluetooth settings, pair with "Draupnir", and enter the PIN shown on '
       'the knob\'s screen. Then come back and connect again.';
 
+  // Shown when the device answers with "Not in Config Mode". The gesture named here is the
+  // M5Dial's, because it is the only board with the gate — and note it is the OPPOSITE
+  // direction from that board's kill-all (swipe up), so naming the wrong one would be worse
+  // than saying nothing.
+  static const String configModeRequiredMessage =
+      'Draupnir_Mini is in Run Mode and will not serve config requests.\n\n'
+      'Swipe down on the dial\'s screen to enter Config Mode, then try again.';
+
+  // The firmware reports this as a plain message string, not a status code, so match on the
+  // text. Kept loose deliberately: the exact wording ("Not in Config Mode") lives in the M5Dial
+  // sketch and is not a contract either side promises to keep.
+  bool _looksLikeConfigModeRefusal(Object? message) =>
+      message != null && message.toString().toLowerCase().contains('config mode');
+
   Future<void> fetchProfiles() async {
     isLoading = true;
     error = null;
@@ -407,6 +481,10 @@ class DraupnirState extends ChangeNotifier {
       if (response['status'] == 'ok') {
         profilesData = response['profiles'];
         needsPairing = false;
+        needsConfigMode = false;
+      } else if (_looksLikeConfigModeRefusal(response['message'])) {
+        needsConfigMode = true;
+        error = configModeRequiredMessage;
       } else {
         error = 'Failed to load profiles: ${response['message']}';
       }
@@ -451,7 +529,12 @@ class DraupnirState extends ChangeNotifier {
         'profiles': profilesData,
       });
       if (response['status'] != 'ok') {
-        error = 'Failed to save profiles: ${response['message']}';
+        if (_looksLikeConfigModeRefusal(response['message'])) {
+          needsConfigMode = true;
+          error = configModeRequiredMessage;
+        } else {
+          error = 'Failed to save profiles: ${response['message']}';
+        }
       }
     } catch (e) {
       if (_looksLikeAuthFailure(e)) {

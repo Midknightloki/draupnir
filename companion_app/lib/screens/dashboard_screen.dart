@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
 import '../state/draupnir_state.dart';
 import '../theme.dart';
@@ -16,6 +17,49 @@ class DashboardScreen extends StatefulWidget {
 
 class _DashboardScreenState extends State<DashboardScreen> {
   int? _editingKeyIdx;
+
+  // Every connect goes through here so the picker is always attached. The state layer only asks
+  // when the scan finds more than one board — with a single Draupnir on the air this is exactly
+  // the old behaviour, no extra tap.
+  Future<void> _connect(DraupnirState state) =>
+      state.connectBluetooth(chooseDevice: _pickDevice);
+
+  // Two boards, two names ("Draupnir" = Waveshare knob, "Draupnir_Mini" = M5Dial), but the app
+  // matches on the name loosely and must not care which is which — so this shows what was
+  // actually advertised rather than mapping names to board models. Dismissing returns null,
+  // which cancels the connect quietly.
+  Future<BluetoothDevice?> _pickDevice(List<ScanResult> candidates) {
+    return showDialog<BluetoothDevice>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        backgroundColor: AppTheme.surface,
+        title: const Text('Which Draupnir?',
+            style: TextStyle(color: Colors.white, fontSize: 18)),
+        children: [
+          for (final r in candidates)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(ctx, r.device),
+              child: ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.bluetooth, color: AppTheme.accent),
+                title: Text(
+                  r.device.platformName.isEmpty ? '(unnamed)' : r.device.platformName,
+                  style: const TextStyle(color: Colors.white),
+                ),
+                subtitle: Text(
+                  '${r.device.remoteId}  ·  ${r.rssi} dBm',
+                  style: const TextStyle(color: Colors.white54, fontSize: 12),
+                ),
+              ),
+            ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, null),
+            child: const Text('CANCEL', style: TextStyle(color: Colors.white54)),
+          ),
+        ],
+      ),
+    );
+  }
 
   // No auto-connect on launch: BLE is the only transport now (the Wi-Fi/HTTP path is gone with
   // the web UI), and a BLE scan is an explicit user action, not something to fire off in
@@ -131,7 +175,51 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           backgroundColor: Colors.orange,
                           foregroundColor: Colors.white,
                         ),
-                        onPressed: state.isLoading ? null : () => state.connectBluetooth(),
+                        onPressed: state.isLoading ? null : () => _connect(state),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            )
+          // The link is fine here -- the device answered, it just refused. Distinguishing this
+          // from a connection failure matters: the fix is a gesture on the dial, not anything
+          // to do with Bluetooth.
+          else if (state.needsConfigMode)
+            Expanded(
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 32),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Icon(Icons.swipe_down, color: Colors.amber, size: 64),
+                      const SizedBox(height: 16),
+                      const Text(
+                        'CONFIG MODE REQUIRED',
+                        style: TextStyle(color: Colors.amber, fontSize: 16, fontWeight: FontWeight.bold),
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 12),
+                      Text(
+                        state.error ?? DraupnirState.configModeRequiredMessage,
+                        style: const TextStyle(color: Colors.white70, fontSize: 14),
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 24),
+                      // Retry the request, not the connection -- the BLE link is still up, so
+                      // there is nothing to rescan or rediscover.
+                      ElevatedButton.icon(
+                        icon: const Icon(Icons.refresh),
+                        label: const Text('TRY AGAIN'),
+                        style: ElevatedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+                          backgroundColor: Colors.amber,
+                          foregroundColor: Colors.black,
+                        ),
+                        onPressed: state.isLoading
+                            ? null
+                            : () => state.isBluetooth ? state.fetchProfiles() : _connect(state),
                       ),
                     ],
                   ),
@@ -166,7 +254,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         style: ElevatedButton.styleFrom(
                           padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
                         ),
-                        onPressed: state.isLoading ? null : () => state.connectBluetooth(),
+                        onPressed: state.isLoading ? null : () => _connect(state),
                       ),
                     ],
                   ),
@@ -480,9 +568,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
       // on-device web UI, which is cut permanently (spec v3 §1, §7).
       child: Column(
         children: [
+          // Pairing applies to the Waveshare knob ("Draupnir"), which enforces bonding. The
+          // M5Dial ("Draupnir_Mini") has no BLE security yet and needs no pairing — it needs
+          // Config Mode instead, which is what the CONFIG MODE REQUIRED panel says when it
+          // refuses. Both are named here so the first-run screen matches either board.
           const Text(
-            'Pair "Draupnir" in your phone\'s Bluetooth settings first — the knob shows the PIN '
-            'on its screen.',
+            'Waveshare knob ("Draupnir"): pair it in your phone\'s Bluetooth settings first — '
+            'it shows the PIN on its screen.\n'
+            'M5Dial ("Draupnir_Mini"): no pairing; swipe down on the dial to enter Config Mode.',
             style: TextStyle(color: Colors.white54, fontSize: 12),
             textAlign: TextAlign.center,
           ),
@@ -510,7 +603,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               ),
               onPressed: state.isScanningBle || state.isLoading
                   ? null
-                  : () => state.connectBluetooth(),
+                  : () => _connect(state),
             ),
           ),
         ],
