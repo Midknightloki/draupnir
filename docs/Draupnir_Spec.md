@@ -524,7 +524,7 @@ Honest status, not aspiration.
 | M6 | **Config hardening** — pairing enforcement, atomic writes, RX bounds, reload safety | **Done (2026-08-07)** — see note below |
 | M7 | **Persistence** — write `activeProfile` + brightness to NVS and honor them at boot | **Done (2026-08-08)**, verified on hardware |
 | M8 | **On-device profile switching** with directional indicators | **Done (2026-08-13)**, verified on hardware — grew beyond its original scope, see note below |
-| M8b | **Uncap `pos`** — key running-macro state by identity, not slot; bump the default to `version: 3` and actually check it | **Done (2026-08-26)** — pending hardware verification |
+| M8b | **Uncap `pos`** — key running-macro state by identity, not slot; bump the default to `version: 3` and actually check it | **Done (2026-08-26)**, verified on hardware 2026-08-29 — both boards, full criteria list |
 | M9 | **Icons on the ring** + dial orientation + rotary macro mode — encoder detent alignment dropped, see note below | **Done (2026-08-22)**, verified on hardware — Waveshare 2026-08-22, M5Dial icon-merge 2026-08-25 |
 | M10 | Polish — buzzer/haptic feedback, export/import | **Open** — brightness UI, originally listed here, was delivered as part of M7/M8 |
 

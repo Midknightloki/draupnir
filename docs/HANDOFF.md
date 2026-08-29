@@ -1,6 +1,6 @@
 # Draupnir — Session Handoff
 
-*Written 2026-08-22. Pick up here.*
+*Written 2026-08-22, updated 2026-08-29 for M8b. Pick up here.*
 
 This is a continuation brief for whoever works on Draupnir next — another agent, a fresh session,
 or the owner. It assumes **no prior context**.
@@ -13,9 +13,11 @@ or the owner. It assumes **no prior context**.
 |---|---|
 | `CLAUDE.md` / `AGENTS.md` | Persona, locked decisions, threading rules, FQBNs. Identical copies — **edit both together.** |
 | `docs/Draupnir_Spec.md` (v3) | The brief. Concept, hardware, data model, BLE protocol, milestones (§10 has the current state). |
-| `docs/superpowers/specs/2026-08-20-m9-icons-orientation-rotary-design.md` | The design this milestone was built against. |
-| `docs/superpowers/plans/2026-08-20-m9-icons-orientation-rotary.md` | The task-by-task implementation plan. |
-| `.superpowers/sdd/2026-08-20-m9-icons-orientation-rotary/progress.md` | The full execution ledger for this milestone — every task, review finding, hardware round, and owner decision, in order. This document is a summary of it; the ledger is the source of truth. |
+| `docs/superpowers/specs/2026-08-26-m8b-uncap-pos-design.md` | The design the **most recent** milestone (M8b) was built against. |
+| `.superpowers/sdd/2026-08-26-m8b-uncap-pos/progress.md` | M8b's execution ledger, including its hardware verification and the BLE-naming follow-on. |
+| `docs/superpowers/specs/2026-08-20-m9-icons-orientation-rotary-design.md` | The design M9 was built against. |
+| `docs/superpowers/plans/2026-08-20-m9-icons-orientation-rotary.md` | M9's task-by-task implementation plan. |
+| `.superpowers/sdd/2026-08-20-m9-icons-orientation-rotary/progress.md` | The full execution ledger for M9 — every task, review finding, hardware round, and owner decision, in order. §3–§4 below summarise it; the ledger is the source of truth. |
 | `.superpowers/sdd/2026-08-07-m7-m8-persistence/progress.md` | The equivalent ledger for the previous milestone (M7/M8), still relevant background. |
 | `docs/Toolchain_arduino-cli.md` | **Read before touching hardware.** Board quirks below will otherwise cost you hours. |
 
@@ -27,18 +29,40 @@ Draupnir is a **USB-HID macro controller in a knob** — round touch screen plus
 driverless over USB HID, configured from a Flutter phone app over BLE. Macros show as a ring of
 colored wedges; rotate to select, tap center or tap a wedge to fire.
 
-**M6 (config hardening), M7 (NVS persistence), M8 (on-device profile switching) and M9 (icons,
-dial orientation, rotary macro mode) are done**, verified on hardware. M9's Waveshare work was
-signed off 2026-08-22 after three feedback rounds; the M5Dial's `icon_xbm` save-merge — a fix for
-live data loss on that board — was flashed and verified 2026-08-25. Editing one macro no longer
-wipes the icons on the others. See §4.
+**M6 (config hardening), M7 (NVS persistence), M8 (on-device profile switching), M9 (icons,
+dial orientation, rotary macro mode) and M8b (uncap `pos`) are done**, verified on hardware. M9's
+Waveshare work was signed off 2026-08-22 after three feedback rounds; the M5Dial's `icon_xbm`
+save-merge — a fix for live data loss on that board — was flashed and verified 2026-08-25. Editing
+one macro no longer wipes the icons on the others. M8b was verified on both boards 2026-08-29
+against the full criteria list, closing the last gap between the schema and what the spec has
+claimed since v3. See §4.
 
 ---
 
 ## 3. Where things stand
 
-Branch `feat/m9-icons-orientation-rotary`, 13 commits ahead of `feat/m7-m8-persistence` (which it
-branches from — that branch has an open PR #2 and M9 merges/rebases naturally once it lands).
+Branch **`feat/m8b-uncap-pos`**, 8 commits ahead of `feat/m9-icons-orientation-rotary`, which it
+branches from. The stack is `feat/m7-m8-persistence` (PR #2) -> `feat/m9-...` (PR #4) ->
+`feat/m8b-...`; each merges naturally once the one below it lands.
+
+```
+295dc5a  docs: M8b design — uncap pos, schema v3
+ed13255  docs: M8b implementation plan — six tasks
+9ba1750  feat(m8b): key running-macro state by identity, not by pos
+2cffbcc  feat(m8b): check the schema version instead of just declaring it
+59fc5f3  feat(m8b): uncap the M5Dial macro engine, keep its 16-dot ring
+17a98b0  feat(m8b): deck renders what exists, plus a trailing + tile
+60ee198  docs: M8b — replace the NOT YET IMPLEMENTED box with what shipped
+b4d7583  feat: distinct board names, a picker, and a real Config Mode message   <- HEAD
+```
+
+The cap was never `NUM_MACRO_SLOTS`; it was that `runningMacros[]` was indexed **by `pos`**, so
+raising the constant would have compiled and been the wrong fix. The pool is now keyed by macro
+identity: `MAX_MACROS` 32 addressable, `RUNNING_SLOTS` 16 concurrent, and firing a 17th concurrent
+macro is refused and logged rather than corrupting a slot. `b4d7583` is an unplanned follow-on —
+see §4 and the M8b ledger.
+
+Below is the M9 branch state, still accurate for the branch under it:
 
 ```
 7a29c90  refactor(ui): dispatch input through a mode table
@@ -81,6 +105,32 @@ default.
 
 **This is the most important section in this document.** Do not build on anything listed as "not
 verified" as though it were confirmed.
+
+### Verified on hardware during M8b — both boards, 2026-08-29
+
+Flashed Waveshare COM10 and M5Dial COM5 on 2026-08-28, both hashes verified, then walked the full
+criteria list in `docs/Draupnir_Spec.md` §7 in the mandated order:
+
+- **No regression, run first and on both boards** — existing profiles load, render, fire and stop,
+  toggles included. This was the gate: the pool rewrite touches every fire, stop and query path in
+  the product, so a regression here would have invalidated everything after it.
+- **Wedge ordering unchanged**, including across a save — `scan_active_positions()` now sorts
+  ascending by `pos` explicitly rather than inheriting JSON array order.
+- **A macro above `pos` 15** renders, selects and fires on the Waveshare; **deleting a middle
+  macro** reflows the ring with the remainder still in ascending order.
+- **A 17th concurrent macro is refused and logged**, with the 16 already running unharmed, and
+  **kill-all stops a macro above `pos` 15**.
+- **A `"version": 4` file is refused** without booting to an empty ring.
+- **The M5Dial divergence behaves as documented** — a macro above `pos` 15 fires but does not
+  appear on that board's 16-dot ring. Expected, not a bug; see spec §6.
+
+### NOT verified from the M8b follow-on (`b4d7583`)
+
+Distinct board names, the multi-device picker, and the Config Mode panel were **flashed to the
+M5Dial 2026-08-29 but never exercised.** The firmware half is one string; the two halves that
+matter — the picker and the Config Mode state — are app-side, and the APK was not installed. Build
+evidence only: M5Dial compile clean at 1,643,251 bytes (49%), `flutter analyze` 0 errors, debug APK
+built. Treat all of it as unverified.
 
 ### Verified on hardware during M9 (Waveshare)
 
@@ -226,17 +276,15 @@ proposed Visual Studio reinstall that would have fixed nothing.
 
 ## 6. What to do next, in order
 
-### Step 1 — M8b
+### Step 0 — verify the M8b follow-on, or explicitly drop it
 
-Uncap `pos`, key running-macro state by macro identity rather than slot, then bump the on-device
-default to `version: 3`. The full detail and the reason it must precede the version bump is in
-`docs/Draupnir_Spec.md` §6's "NOT YET IMPLEMENTED" box — still accurate, unchanged by M9.
+`b4d7583` shipped unverified (§4). Install the debug APK, power both boards, and confirm three
+things: the picker appears and both boards are distinguishable in it, picking `Draupnir_Mini` in
+Run Mode produces the CONFIG MODE REQUIRED panel rather than a connection error, and TRY AGAIN
+after swiping down loads profiles over the existing link without a rescan. Cheap, and it is the
+only unverified thing on the branch.
 
-This is the last thing standing between the schema and what the spec has claimed since v3. It is
-also cheap relative to its blast radius: the cap is a leftover from when `pos` addressed a physical
-key on a 16-key grid, and that grid no longer exists.
-
-### Step 2 — The M5Dial security gate
+### Step 1 — The M5Dial security gate
 
 The M5Dial firmware still has no cryptographic gate at all (§8). This has been the top follow-up
 since M6 closed the equivalent hole on the Waveshare, and per the locked work order (`CLAUDE.md`),
@@ -248,7 +296,7 @@ Fold the non-atomic `profiles.json` write (§6 gaps) into the same pass. Both ar
 debt — hardening the Waveshare already received and the M5Dial never did — and both touch that
 sketch's config path, so doing them together costs one review cycle instead of two.
 
-### Step 3 — M10, polish
+### Step 2 — M10, polish
 
 Buzzer/haptic feedback and export/import. Note that haptics are currently blocked by a hardware
 interaction, not by effort: `haptics_init()` breaks the CST816 touch controller (§6 gaps). That
@@ -297,7 +345,7 @@ to live in this section are not lost — they're in this file's git history, in 
 - **M5Dial firmware has no cryptographic gate.** That sketch has no `BLESecurity` setup and no
   GATT permission flags at all — config access is gated solely on `CONFIG_MODE`. The second
   supported board still carries the vulnerability M6 exists to close. **Top follow-up**, sequenced
-  ahead of M10 (see §6 Step 3). Deferred by the board sequencing (spec §3), not by tooling — the
+  ahead of M10 (see §6 Step 1). Deferred by the board sequencing (spec §3), not by tooling — the
   hardware is on hand.
   > **Do not close this by restoring the `pairingToken`.** An external audit (2026-08) called the
   > removal a blocking regression; it was not. The token was checked *only outside* `CONFIG_MODE`,
