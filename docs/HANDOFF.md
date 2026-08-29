@@ -126,13 +126,16 @@ criteria list in `docs/Draupnir_Spec.md` §7 in the mandated order:
 - **The M5Dial divergence behaves as documented** — a macro above `pos` 15 fires but does not
   appear on that board's 16-dot ring. Expected, not a bug; see spec §6.
 
-### NOT verified from the M8b follow-on (`b4d7583`)
+### Verified from the M8b follow-on (`b4d7583`) — 2026-08-29
 
-Distinct board names, the multi-device picker, and the Config Mode panel were **flashed to the
-M5Dial 2026-08-29 but never exercised.** The firmware half is one string; the two halves that
-matter — the picker and the Config Mode state — are app-side, and the APK was not installed. Build
-evidence only: M5Dial compile clean at 1,643,251 bytes (49%), `flutter analyze` 0 errors, debug APK
-built. Treat all of it as unverified.
+Distinct board names, the multi-device picker, and the Config Mode panel: flashed to the M5Dial,
+APK installed, and exercised end to end. The app distinguishes the two boards, connects to the one
+you pick, and functionality was validated on the **Draupnir_Mini** specifically.
+
+One word of care in how this gets recorded: what was exercised was a **connect**, not a pair. The
+M5Dial has no BLE security, so there is nothing to pair with on it — any PIN dialog seen during
+testing came from the Waveshare. This does not weaken the result; it is the hole the next milestone
+closes.
 
 ### Verified on hardware during M9 (Waveshare)
 
@@ -277,14 +280,6 @@ proposed Visual Studio reinstall that would have fixed nothing.
 ---
 
 ## 6. What to do next, in order
-
-### Step 0 — verify the M8b follow-on, or explicitly drop it
-
-`b4d7583` shipped unverified (§4). Install the debug APK, power both boards, and confirm three
-things: the picker appears and both boards are distinguishable in it, picking `Draupnir_Mini` in
-Run Mode produces the CONFIG MODE REQUIRED panel rather than a connection error, and TRY AGAIN
-after swiping down loads profiles over the existing link without a rescan. Cheap, and it is the
-only unverified thing on the branch.
 
 ### Step 1 — The M5Dial security gate
 
