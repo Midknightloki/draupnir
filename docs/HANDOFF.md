@@ -41,9 +41,10 @@ claimed since v3. See §4.
 
 ## 3. Where things stand
 
-Branch **`feat/m8b-uncap-pos`**, 8 commits ahead of `feat/m9-icons-orientation-rotary`, which it
-branches from. The stack is `feat/m7-m8-persistence` (PR #2) -> `feat/m9-...` (PR #4) ->
-`feat/m8b-...`; each merges naturally once the one below it lands.
+Branch **`feat/m8b-uncap-pos`**, 9 commits ahead of `feat/m9-icons-orientation-rotary`, which it
+branches from. `review/waveshare-m6-foundation` is the integration branch every milestone PRs
+into: PR #2 (M7/M8) and PR #3 (M9) are merged there, PR #4 (M9's M5Dial verification docs) is
+still open, and M8b stacks on top of it.
 
 ```
 295dc5a  docs: M8b design — uncap pos, schema v3
@@ -53,7 +54,8 @@ ed13255  docs: M8b implementation plan — six tasks
 59fc5f3  feat(m8b): uncap the M5Dial macro engine, keep its 16-dot ring
 17a98b0  feat(m8b): deck renders what exists, plus a trailing + tile
 60ee198  docs: M8b — replace the NOT YET IMPLEMENTED box with what shipped
-b4d7583  feat: distinct board names, a picker, and a real Config Mode message   <- HEAD
+b4d7583  feat: distinct board names, a picker, and a real Config Mode message
+e559c21  docs: M8b verified on hardware — promote it, re-point the handoff   <- HEAD
 ```
 
 The cap was never `NUM_MACRO_SLOTS`; it was that `runningMacros[]` was indexed **by `pos`**, so
