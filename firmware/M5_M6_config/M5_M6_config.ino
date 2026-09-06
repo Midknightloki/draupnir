@@ -1222,8 +1222,17 @@ class MyServerCallbacks: public BLEServerCallbacks {
     }
 };
 
+// Window for the duplicate-write guard below. The app paces its chunks with an explicit 20ms
+// delay AND waits for each write's ATT response, so two genuinely distinct chunks cannot arrive
+// closer together than tens of milliseconds. That pacing is app-side, so it bounds the gap here
+// regardless of this board's connection interval (unlike the Waveshare, this firmware does not
+// call updateConnParams). A stack-level duplicate of a single write arrives within a millisecond
+// or two, so 10ms separates the two cases with a wide margin.
+static const uint32_t BLE_RX_DUP_WINDOW_MS = 10;
+
 class MyCallbacks: public BLECharacteristicCallbacks {
     String lastRxValue;
+    uint32_t lastRxValueMs = 0;
     void onWrite(BLECharacteristic *pCharacteristic) {
       String rxValue = pCharacteristic->getValue();
       if (rxValue.length() == 2 && (uint8_t)rxValue[0] == BLE_CHUNK_ACK_MARKER) {
@@ -1236,11 +1245,30 @@ class MyCallbacks: public BLECharacteristicCallbacks {
       // Harmless there (just a log line); here it used to double-append into the RX buffer and,
       // combined with heap fragmentation, corrupt the reassembled save_profiles command down to
       // a garbage tail. Skip an exact repeat of the immediately-previous write.
-      if (rxValue == lastRxValue) {
-        Serial.println("BLE RX: duplicate write ignored");
+      //
+      // THE WINDOW IS LOAD-BEARING, and its absence was a real, shipped bug. Without it this
+      // guard never expires, so it compares against the previous write forever -- and the app's
+      // first command after reconnecting is byte-identical to its first command last session
+      // ({"cmd":"get_profiles"}). The result was that the device bonded and reconnected perfectly
+      // and then silently swallowed every command, which presented as "cannot reconnect, and
+      // restarting the app does not help" (the stale state is here, on the device, so only a
+      // reboot cleared it). Captured on hardware 2026-09-06: connect, encrypted=1 authenticated=1
+      // bonded=1, then "duplicate write ignored" and handleBleCommand never ran.
+      //
+      // Note the trap for anyone porting between the boards: ble_engine.cpp's onDisconnect says
+      // lastRxValue "needs no reset ... so it self-expires". That is true THERE because the
+      // Waveshare has this window. It was not true here, because this board did not.
+      //
+      // With the window, no reset on disconnect is needed: a reconnect takes seconds, thousands
+      // of times longer than 10ms, so the guard has long since expired.
+      uint32_t nowMs = millis();
+      if (rxValue == lastRxValue && (nowMs - lastRxValueMs) < BLE_RX_DUP_WINDOW_MS) {
+        Serial.printf("BLE RX: duplicate write ignored (%u bytes, %ums apart)\n",
+                      (unsigned)rxValue.length(), (unsigned)(nowMs - lastRxValueMs));
         return;
       }
       lastRxValue = rxValue;
+      lastRxValueMs = nowMs;
 
       Serial.print("BLE RX bytes: ");
       Serial.println(rxValue.length());
