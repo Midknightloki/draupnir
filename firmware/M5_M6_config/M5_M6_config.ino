@@ -1057,26 +1057,80 @@ void handleBleCommand(char *cmdStr) {
       }
     }
 
-    File f = LittleFS.open("/profiles.json", "w");
-    if (f) {
-      serializeJson(profilesObj, f);
-      f.close();
-      
-      killAllMacros();
-      loadProfiles();
-      
-      int brightness = profilesDoc["settings"]["brightness"] | 160;
-      M5Dial.Display.setBrightness(brightness);
-      
-      int orientation = profilesDoc["settings"]["orientation"] | 0;
-      M5Dial.Display.setRotation(orientation);
+    // Write-temp-then-rename. Opening /profiles.json with "w" directly truncated the only good
+    // copy before a single byte of the new one was written, and the serializeJson() byte count
+    // was never checked -- a power loss, a full filesystem, or a short write left a truncated,
+    // unparseable config with no way back short of a reflash. Nothing here touches
+    // /profiles.json until the temp file has been written, closed, and verified on disk.
+    static const char *PROFILES_PATH = "/profiles.json";
+    static const char *PROFILES_TMP_PATH = "/profiles.json.tmp";
 
-      requestRedraw();
-      sendBleMessage("{\"status\":\"ok\"}");
-    } else {
-      sendBleMessage("{\"status\":\"error\",\"message\":\"Failed to write file\"}");
+    LittleFS.remove(PROFILES_TMP_PATH); // clear any leftover from a previous failed save
+    File f = LittleFS.open(PROFILES_TMP_PATH, "w");
+    if (!f) {
+      sendBleMessage("{\"status\":\"error\",\"message\":\"Failed to open temp file\"}");
+      return;
     }
-  } 
+    size_t expected = measureJson(profilesObj);
+    size_t written = serializeJson(profilesObj, f);
+    f.close();
+
+    // Re-open to confirm close() actually flushed the full document to flash, rather than
+    // trusting the writer's own byte count.
+    size_t onDisk = 0;
+    File verify = LittleFS.open(PROFILES_TMP_PATH, "r");
+    if (verify) {
+      onDisk = verify.size();
+      verify.close();
+    }
+
+    if (expected == 0 || written != expected || onDisk != expected) {
+      Serial.printf("[ble] save_profiles: write failed (expected=%u written=%u onDisk=%u)\n",
+                    (unsigned)expected, (unsigned)written, (unsigned)onDisk);
+      LittleFS.remove(PROFILES_TMP_PATH);
+      // The original /profiles.json is untouched, so do NOT reload -- the in-memory document
+      // still matches what is on flash.
+      sendBleMessage("{\"status\":\"error\",\"message\":\"Failed to write file\"}");
+      return;
+    }
+
+    if (!LittleFS.rename(PROFILES_TMP_PATH, PROFILES_PATH)) {
+      // Some LittleFS/VFS builds refuse to rename onto an existing file. Only now, with a
+      // verified-good temp file in hand, is it safe to drop the original.
+      LittleFS.remove(PROFILES_PATH);
+      if (!LittleFS.rename(PROFILES_TMP_PATH, PROFILES_PATH)) {
+        Serial.println("[ble] save_profiles: rename into place failed");
+        LittleFS.remove(PROFILES_TMP_PATH);
+        // The device now has no config file. loadProfiles() finds none and regenerates defaults
+        // -- the correct recovery, though still a failure from the caller's point of view.
+        killAllMacros();
+        loadProfiles();
+        sendBleMessage("{\"status\":\"error\",\"message\":\"Failed to commit file\"}");
+        return;
+      }
+    }
+
+    Serial.printf("[ble] save_profiles: committed %u bytes\n", (unsigned)onDisk);
+
+    // killAllMacros() BEFORE loadProfiles() is not optional. The macro engine holds JsonObject
+    // references into profilesDoc, and deserializeJson() clears and reallocates that document's
+    // pool -- reloading with a macro mid-sequence is a use-after-free.
+    //
+    // Unlike the Waveshare (which defers this via a profilesDirty flag), the M5Dial reloads
+    // immediately and correctly: nothing but loop() ever touches profilesDoc on this board,
+    // because it draws from loop() rather than from a separate LVGL task.
+    killAllMacros();
+    loadProfiles();
+
+    int brightness = profilesDoc["settings"]["brightness"] | 160;
+    M5Dial.Display.setBrightness(brightness);
+
+    int orientation = profilesDoc["settings"]["orientation"] | 0;
+    M5Dial.Display.setRotation(orientation);
+
+    requestRedraw();
+    sendBleMessage("{\"status\":\"ok\"}");
+  }
   else if (cmd == "trigger") {
     int pIdx = req["profile"] | activeProfileIdx;
     int mIdx = req["macro"] | -1;
