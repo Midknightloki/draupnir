@@ -11,9 +11,22 @@
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
-#include <BLE2902.h>
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+
+// These guards exist because this API's signature failure mode is compiling cleanly and
+// enforcing nothing. BLECharacteristic.h:162-194 defines PROPERTY_WRITE_ENC / _AUTHEN as
+// literally 0 under #if defined(CONFIG_BLUEDROID_ENABLED), and as the real BLE_GATT_CHR_F_*
+// bits only under #if defined(CONFIG_NIMBLE_ENABLED). Build against the wrong one and the
+// permission flags in setup() become a no-op that no test short of a hostile central would
+// catch. Fail the build instead.
+#if !defined(CONFIG_NIMBLE_ENABLED) && !defined(CONFIG_BT_NIMBLE_ENABLED)
+#error "Expected a NimBLE-backed core. Under Bluedroid the GATT permission flags in setup() are 0 and enforce nothing."
+#endif
+static_assert(BLECharacteristic::PROPERTY_WRITE_ENC != 0,
+              "PROPERTY_WRITE_ENC is 0 -- the RX permission flags would be a silent no-op.");
+static_assert(BLECharacteristic::PROPERTY_WRITE_AUTHEN != 0,
+              "PROPERTY_WRITE_AUTHEN is 0 -- the RX permission flags would be a silent no-op.");
 
 #define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -61,6 +74,14 @@ BLEServer *pServer = nullptr;
 BLECharacteristic *pTxCharacteristic = nullptr;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
+// Set on the BLE host task, read from loop(). volatile, and never touched by anything that
+// draws -- the display belongs to the loop() task (see the pairing screen dispatch in loop()).
+static volatile bool pairingActive = false;
+static volatile uint32_t currentPasskey = 0;
+// BLE_HS_CONN_HANDLE_NONE (0xffff, host/ble_hs.h) when nothing is connected.
+static volatile uint16_t bleConnHandle = BLE_HS_CONN_HANDLE_NONE;
+
+void drawPairingScreen(); // defined further down, next to enterConfigMode()
 // RX reassembly buffer for chunked BLE commands — a save_profiles command can be ~12KB+.
 // Growing a String one byte at a time via += to that size repeatedly hit failed reallocations
 // once the heap fragmented (largestBlock measured as low as ~9KB mid-session), silently
@@ -924,12 +945,26 @@ void handleBleCommand(char *cmdStr) {
   }
   
   String cmd = req["cmd"] | "";
-  // The `pair` command and the per-request `token` check are removed (spec v3 §7, M6/H1) --
-  // see the note at the top of this file. Config access is gated on CONFIG_MODE.
-  if (currentMode != CONFIG_MODE) {
-    sendBleMessage("{\"status\":\"error\",\"message\":\"Not in Config Mode\"}");
+  // The `pair` command and the per-request `token` check are removed (spec v3 §7, M6/H1) -- see
+  // the note at the top of this file. The CONFIG_MODE check that stood here is removed too: it
+  // was a physical-presence gate, not authentication, and it stopped nothing once the user
+  // swiped down. An encrypted, MITM-authenticated link is the authorization now. CONFIG_MODE
+  // survives as an informational screen.
+  //
+  // Belt-and-braces behind the GATT permission flags on RX (see setup()). If those ever fail to
+  // enforce -- the documented failure mode of this API -- this refuses the command anyway and
+  // says so on Serial, rather than executing it quietly. Runs on the loop task, reading a handle
+  // the BLE task published: the hand-off-via-flag pattern the threading rules require.
+  ble_gap_conn_desc desc;
+  if (bleConnHandle == BLE_HS_CONN_HANDLE_NONE ||
+      ble_gap_conn_find(bleConnHandle, &desc) != 0 ||
+      !desc.sec_state.encrypted || !desc.sec_state.authenticated) {
+    Serial.println("[ble] cmd REFUSED: link not encrypted+authenticated");
+    sendBleMessage("{\"status\":\"error\",\"message\":\"Not paired\"}");
     return;
   }
+  Serial.printf("[ble] cmd '%s' accepted (enc=%d auth=%d bond=%d)\n", cmd.c_str(),
+                desc.sec_state.encrypted, desc.sec_state.authenticated, desc.sec_state.bonded);
 
   if (cmd == "get_profiles") {
     // Stream the response straight from the already-loaded global profilesDoc into the chunked
@@ -1073,23 +1108,57 @@ void handleBleCommand(char *cmdStr) {
   }
 }
 
+// IO_CAP_OUT: this device can only DISPLAY a passkey, not accept input -- the phone/app side
+// enters what we show here. Regenerated per-connection (regenPassKeyOnConnect) so it's a fresh
+// random code each pairing, not a fixed shared secret.
+class SecurityCallbacks : public BLESecurityCallbacks {
+  uint32_t onPassKeyRequest() override { return 0; } // we never have input capability
+  void onPassKeyNotify(uint32_t pass_key) override {
+    // Runs on the BLE host task. Sets flags ONLY -- drawing to M5Dial.Display from here would
+    // race the loop() task that owns the panel. loop() watches pairingActive and paints.
+    currentPasskey = pass_key;
+    pairingActive = true;
+    Serial.printf("[ble] show passkey: %06u\n", (unsigned)pass_key);
+  }
+  bool onSecurityRequest() override { return true; }
+  bool onConfirmPIN(uint32_t pin) override { return true; }
+  // This core (m5stack:esp32 3.3.8) is NimBLE-backed despite the Bluedroid-styled class names,
+  // confirmed in its sdkconfig.h. BLESecurity.h declares BOTH overloads -- esp_ble_auth_cmpl_t
+  // (line 228) and ble_gap_conn_desc* (line 238). Override the latter; the former is never
+  // called here, so overriding it would look correct and never fire.
+  void onAuthenticationComplete(ble_gap_conn_desc *desc) override {
+    pairingActive = false;
+    Serial.printf("[ble] authentication complete, encrypted=%d authenticated=%d bonded=%d\n",
+                  desc->sec_state.encrypted, desc->sec_state.authenticated, desc->sec_state.bonded);
+  }
+};
+
 class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
+    // NimBLE overload (BLEServer.h:306) -- gives us the connection handle, so we can request
+    // security immediately and so handleBleCommand() can look the link's security state up later.
+    void onConnect(BLEServer* pServer, ble_gap_conn_desc* desc) override {
       deviceConnected = true;
+      bleConnHandle = desc->conn_handle;
+      int rc = 0;
+      bool started = BLESecurity::startSecurity(desc->conn_handle, &rc);
+      // startSecurity is only a REQUEST, which a hostile central is free to ignore. The GATT
+      // permission flags on RX/TX are what actually enforce; this just gets a well-behaved
+      // client prompted promptly instead of on its first rejected write.
+      //
       // Keep this callback cheap. It runs on the BLE stack's own task, and the last time real
       // work was done here -- reconfiguring the WiFi driver, back when WiFi existed -- it
       // corrupted the get_profiles response the main loop was concurrently building (verified:
       // a reproducible empty-JSON response appeared the moment this callback called WiFi.mode()
       // directly, and moving the work to a loop-driven toggle fixed it). WiFi is gone, but the
       // rule it taught is not: hand work off to loop(), don't do it here.
-      Serial.print("BLE Client Connected, connectedCount=");
-      Serial.print(pServer->getConnectedCount());
-      Serial.print(" peerDevices=");
-      Serial.println(pServer->getPeerDevices(false).size());
+      Serial.printf("BLE Client Connected, conn_handle=%d startSecurity ok=%d rc=%d connectedCount=%d\n",
+                    desc->conn_handle, started, rc, pServer->getConnectedCount());
     };
 
-    void onDisconnect(BLEServer* pServer) {
+    void onDisconnect(BLEServer* pServer, ble_gap_conn_desc* desc) override {
       deviceConnected = false;
+      pairingActive = false;
+      bleConnHandle = BLE_HS_CONN_HANDLE_NONE;
       // A half-received command from a dropped connection must not poison the next one.
       bleRxLen = 0;
       Serial.print("BLE Client Disconnected, connectedCount=");
@@ -1261,21 +1330,74 @@ void setup() {
     Serial.println("FATAL: failed to allocate BLE RX buffer");
   }
   BLEDevice::setMTU(512);
+
+  BLESecurity::setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
+  BLESecurity::setCapability(ESP_IO_CAP_OUT);
+  BLESecurity::setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+  BLESecurity::setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+  BLESecurity::setPassKey(false, 0); // false = randomly generated, not this fixed value
+  // A passkey fixed for the board's uptime is a weaker secret than a per-pairing one, and with
+  // bonding working the user only ever types it once anyway.
+  //
+  // ROLLBACK LADDER, in order, if unexplained resets into the ROM bootloader appear (this
+  // happened on the Waveshare during M6/H1 -- see docs/M6_Hardening_WorkOrder.md):
+  //   1. flip this to false,
+  //   2. drop PROPERTY_WRITE_AUTHEN from the RX characteristic below,
+  //   3. drop the ENC flags entirely -- which is this board's pre-M6 behaviour and is INSECURE.
+  //      Do NOT stop at step 3 and call it done; report the boot reason instead.
+  BLESecurity::regenPassKeyOnConnect(true);
+  BLEDevice::setSecurityCallbacks(new SecurityCallbacks());
+
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 
   BLEService *pService = pServer->createService(SERVICE_UUID);
+  // ---------------------------------------------------------------------------------------
+  // GATT permission enforcement. This is what the stack actually enforces; the
+  // BLESecurity::startSecurity() call in MyServerCallbacks::onConnect() is only a request a
+  // hostile central can ignore. Without these bits any central in radio range could write
+  // save_profiles or trigger -- i.e. inject keystrokes into the attached host.
+  //
+  // READ THIS BEFORE CHANGING IT. The permission API here differs from every Bluedroid example
+  // online. BLECharacteristic::setAccessPermissions() is a NO-OP on this core: its body is
+  // wrapped in #ifdef CONFIG_BLUEDROID_ENABLED, and BLEService::start() builds
+  // ble_gatt_chr_def.flags from m_properties, never from m_permissions. The enforcement bits
+  // live in the PROPERTIES bitmask instead. ENC = "encrypted link"; AUTHEN additionally means
+  // the key came from an MITM-protected pairing (our passkey display).
+  //
+  // CCCD: NimBLE creates the 0x2902 descriptor itself for any characteristic with NOTIFY, and
+  // BLECharacteristic::addDescriptor() explicitly discards a manually-added BLE2902 on this core
+  // (see its #ifdef CONFIG_NIMBLE_ENABLED early-return) -- so the old addDescriptor(new
+  // BLE2902()) was dead code and is removed. The auto-created CCCD is protected via
+  // BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC instead, which is what makes "subscribe to TX" require
+  // an encrypted link.
+  //
+  // KNOWN GAP: BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN (0x10000) cannot be applied through this
+  // wrapper -- BLECharacteristic.h:245 stores properties in esp_gatt_char_prop_t, a uint16_t,
+  // so the bit is silently truncated. The CCCD is therefore gated on encryption but not
+  // explicitly on authentication. That should not be exploitable here, because
+  // setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND) means this device will not complete a
+  // Just Works pairing at all, so any encrypted link is necessarily an authenticated one.
+  //
+  // On the Waveshare that last sentence was upgraded from inference to observation by a
+  // hostile-central hardware test (nRF Connect, 2026-08-07). On THIS board it remains an
+  // inference -- the negative test has NOT been run here. Do not copy the Waveshare's
+  // "VERIFIED" wording across until someone actually runs it.
+  //
+  // It reopens the moment setAuthenticationMode() is relaxed away from *_MITM_*.
   pTxCharacteristic = pService->createCharacteristic(
                         CHARACTERISTIC_UUID_TX,
-                        BLECharacteristic::PROPERTY_NOTIFY
+                        BLECharacteristic::PROPERTY_NOTIFY |
+                        BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC
                       );
-  pTxCharacteristic->addDescriptor(new BLE2902());
   pTxCharacteristic->setCallbacks(new TxLogCallbacks());
 
   BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
                                            CHARACTERISTIC_UUID_RX,
                                            BLECharacteristic::PROPERTY_WRITE |
-                                           BLECharacteristic::PROPERTY_WRITE_NR
+                                           BLECharacteristic::PROPERTY_WRITE_NR |
+                                           BLECharacteristic::PROPERTY_WRITE_ENC |
+                                           BLECharacteristic::PROPERTY_WRITE_AUTHEN
                                          );
   pRxCharacteristic->setCallbacks(new MyCallbacks());
 
