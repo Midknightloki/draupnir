@@ -2,15 +2,10 @@
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
-#include <WiFi.h>
-#include <WiFiManager.h>
-#include <ESPmDNS.h>
-#include <WebServer.h>
 #include "USB.h"
 #include "USBHIDKeyboard.h"
 #include "USBHIDConsumerControl.h"
 #include "USBHIDMouse.h"
-#include "index_html.h"
 #include <Adafruit_NeoTrellis.h>
 #include "icons.h"
 #include <BLEDevice.h>
@@ -29,7 +24,10 @@
 // current one. 0xFE can't collide with a real JSON command chunk (those are ASCII/UTF-8, <0x80).
 #define BLE_CHUNK_ACK_MARKER 0xFE
 
-enum AppMode { RUN_MODE, CONFIG_MODE, WIFI_SETUP_MODE };
+// WIFI_SETUP_MODE is gone with the rest of the Wi-Fi surface (spec v3 §1 cuts the web config
+// path permanently). CONFIG_MODE survives as an informational screen, not a gate -- see the
+// note above handleBleCommand.
+enum AppMode { RUN_MODE, CONFIG_MODE };
 AppMode currentMode = RUN_MODE;
 // The bespoke `pairingToken` / `pair` scheme is removed (spec v3 §7, M6/H1). It reimplemented —
 // badly — what BLE bonding already does correctly, and the companion app no longer sends a
@@ -98,13 +96,11 @@ USBHIDKeyboard Keyboard;
 USBHIDConsumerControl ConsumerControl;
 USBHIDMouse Mouse;
 Preferences prefs;
-WebServer server(80);
 
 JsonDocument profilesDoc;
 int activeProfileIdx = 0;
 int selectedMacroIdx = 0;
 long oldPosition = -999;
-bool mdnsStarted = false;
 bool uiNeedsRedraw = false;
 unsigned long lastRedrawTime = 0;
 
@@ -698,11 +694,11 @@ TrellisCallback trellisEvent(keyEvent evt) {
 // Per-chunk payload size (excluding our 1-byte sequence prefix). Verified directly by testing:
 // full 500B chunks reliably got SUCCESS_NOTIFY from the stack but never reached the app (0/5
 // retries acked over 4s), while a ~20B size (hit by accident via an earlier MTU-lookup bug)
-// delivered 160+ consecutive chunks with zero retries. WiFi/BLE coexistence — this firmware runs
-// WiFi STA + a WebServer alongside BLE — was the leading suspect, so WiFi is now paused for the
-// duration of any BLE connection (see MyServerCallbacks). 100B is a middle ground between that
-// proven-reliable size and full throughput now that the radio isn't shared; re-measure if drops
-// come back.
+// delivered 160+ consecutive chunks with zero retries. WiFi/BLE coexistence was the leading
+// suspect: this firmware used to run WiFi STA + a WebServer alongside BLE, and WiFi was paused
+// for the duration of every BLE connection to work around it. WiFi is now deleted outright, so
+// the radio is never shared and the contention cannot recur. 100B is a middle ground between
+// that proven-reliable size and full throughput; re-measure if drops come back.
 const int BLE_CHUNK_PAYLOAD_SIZE = 100;
 
 // Sends one chunk, prefixed with a sequence byte, via notify() and blocks until the app echoes
@@ -1080,12 +1076,12 @@ void handleBleCommand(char *cmdStr) {
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
       deviceConnected = true;
-      // The actual WiFi pause happens on the main loop (see the deviceConnected/oldDeviceConnected
-      // transition handling below), not here — this callback runs on the BLE stack's own task, and
-      // driving a WiFi driver reconfiguration from that foreign task while the main loop is
-      // concurrently building the get_profiles response corrupted it (verified: reverting this to
-      // a loop-driven toggle fixed a reproducible empty-JSON response that appeared as soon as this
-      // callback called WiFi.mode() directly).
+      // Keep this callback cheap. It runs on the BLE stack's own task, and the last time real
+      // work was done here -- reconfiguring the WiFi driver, back when WiFi existed -- it
+      // corrupted the get_profiles response the main loop was concurrently building (verified:
+      // a reproducible empty-JSON response appeared the moment this callback called WiFi.mode()
+      // directly, and moving the work to a loop-driven toggle fixed it). WiFi is gone, but the
+      // rule it taught is not: hand work off to loop(), don't do it here.
       Serial.print("BLE Client Connected, connectedCount=");
       Serial.print(pServer->getConnectedCount());
       Serial.print(" peerDevices=");
@@ -1181,116 +1177,6 @@ class TxLogCallbacks: public BLECharacteristicCallbacks {
     }
 };
 
-// The Bearer-token branch is removed along with the rest of the pairingToken scheme (M6/H1).
-// The legacy web UI on this board is gated on CONFIG_MODE only. The whole web server is slated
-// for removal (spec v3 §1 cuts the web config path permanently); that removal is out of scope
-// for M6 and is not attempted here.
-bool isAuthorized() {
-  return currentMode == CONFIG_MODE;
-}
-
-void setupWebServer() {
-  server.enableCORS(true);
-
-  server.on("/", HTTP_GET, [](){
-    if (currentMode != CONFIG_MODE) {
-      server.send(403, "text/plain", "Forbidden. Swipe down on Draupnir to enter Config Mode.");
-      return;
-    }
-    server.send(200, "text/html", INDEX_HTML);
-  });
-  
-  // /api/pair removed with the pairingToken scheme (M6/H1).
-
-  server.on("/api/profiles", HTTP_GET, [](){
-    if (!isAuthorized()) {
-      server.send(401, "application/json", "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
-      return;
-    }
-    File file = LittleFS.open("/profiles.json", "r");
-    if(!file){
-      server.send(500, "text/plain", "Failed to open file");
-      return;
-    }
-    server.streamFile(file, "application/json");
-    file.close();
-  });
-  
-  server.on("/api/profiles", HTTP_POST, [](){
-    if (!isAuthorized()) {
-      server.send(401, "application/json", "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
-      return;
-    }
-    if(server.hasArg("plain")) {
-      String body = server.arg("plain");
-      File f = LittleFS.open("/profiles.json", "w");
-      if(f) {
-        f.print(body);
-        f.close();
-        server.send(200, "text/plain", "OK");
-        killAllMacros();
-        loadProfiles();
-        
-        int brightness = profilesDoc["settings"]["brightness"] | 160;
-        M5Dial.Display.setBrightness(brightness);
-        
-        int orientation = profilesDoc["settings"]["orientation"] | 0;
-        M5Dial.Display.setRotation(orientation);
-
-        requestRedraw();
-      } else {
-        server.send(500, "text/plain", "Failed to write");
-      }
-    } else {
-      server.send(400, "text/plain", "No body");
-    }
-  });
-  
-  server.on("/api/trigger", HTTP_POST, [](){
-    if (!isAuthorized()) {
-      server.send(401, "application/json", "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
-      return;
-    }
-    if(server.hasArg("plain")) {
-      String body = server.arg("plain");
-      JsonDocument req;
-      DeserializationError err = deserializeJson(req, body);
-      if(!err) {
-        int pIdx = req["profile"] | activeProfileIdx;
-        int mIdx = req["macro"] | -1;
-        
-        JsonArray profiles = profilesDoc["profiles"];
-        if (pIdx >= 0 && pIdx < profiles.size()) {
-          JsonObject prof = profiles[pIdx];
-          JsonArray macros = prof["macros"];
-          bool fired = false;
-          for (JsonObject m : macros) {
-            int pos = m["pos"] | -1;
-            if (pos == mIdx) {
-              fireMacro(m, mIdx);
-              fired = true;
-              break;
-            }
-          }
-          if (fired) {
-            server.send(200, "application/json", "{\"status\":\"ok\"}");
-          } else {
-            server.send(404, "application/json", "{\"status\":\"error\",\"message\":\"Macro not found\"}");
-          }
-        } else {
-          server.send(404, "application/json", "{\"status\":\"error\",\"message\":\"Profile not found\"}");
-        }
-      } else {
-        server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid JSON\"}");
-      }
-    } else {
-      server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"No body\"}");
-    }
-  });
-
-  server.begin();
-}
-
 void enterConfigMode() {
   currentMode = CONFIG_MODE;
   killAllMacros();
@@ -1303,43 +1189,17 @@ void enterConfigMode() {
   d.drawString("CONFIG MODE", 120, 60);
   
   d.setFont(&fonts::Orbitron_Light_24);
+  // Was the Wi-Fi IP address, back when this screen told you where to point a browser. BLE is
+  // the only transport now, so the useful facts are which board this is and whether the app is
+  // actually attached.
   d.setTextColor(TFT_WHITE, TFT_BLACK);
-  d.drawString("IP Address:", 120, 110);
-  d.drawString(WiFi.localIP().toString(), 120, 140);
-  
+  d.drawString("BLE", 120, 100);
+  d.drawString("Draupnir_Mini", 120, 130);
+  d.setTextColor(deviceConnected ? TFT_GREEN : TFT_DARKGRAY, TFT_BLACK);
+  d.drawString(deviceConnected ? "app connected" : "waiting for app", 120, 160);
+
   d.setTextColor(TFT_DARKGRAY, TFT_BLACK);
   d.drawString("TAP TO EXIT", 120, 190);
-}
-
-void enterWiFiSetupMode() {
-  currentMode = WIFI_SETUP_MODE;
-  
-  killAllMacros();
-  
-  auto& d = M5Dial.Display;
-  d.fillScreen(TFT_BLACK);
-  d.setTextDatum(middle_center);
-  d.setFont(&fonts::Orbitron_Light_24);
-  d.setTextColor(TFT_ORANGE, TFT_BLACK);
-  d.drawString("Wi-Fi SETUP", 120, 60);
-  
-  d.setFont(&fonts::Orbitron_Light_24);
-  d.setTextColor(TFT_WHITE, TFT_BLACK);
-  d.drawString("Connect to hotspot:", 120, 120);
-  d.drawString("Draupnir-Setup", 120, 150);
-  
-  server.stop(); 
-  
-  WiFiManager wm;
-  bool res = wm.startConfigPortal("Draupnir-Setup");
-  
-  if (!res) {
-    Serial.println("Failed to connect or hit timeout");
-  } else {
-    Serial.println("Connected to Wi-Fi!");
-  }
-  
-  ESP.restart();
 }
 
 void setup() {
@@ -1379,11 +1239,6 @@ void setup() {
   int orientation = profilesDoc["settings"]["orientation"] | 0;
   M5Dial.Display.setRotation(orientation);
   
-  WiFi.mode(WIFI_STA);
-  WiFi.begin();
-
-  setupWebServer();
-
   // USB must start before BLE on ESP32-S3 — USB.begin() disrupts BLE if it runs after
   Keyboard.begin();
   ConsumerControl.begin();
@@ -1437,8 +1292,6 @@ void setup() {
   Serial.println("Draupnir M5/M6 Ready");
 }
 
-bool waitRelease = false;
-
 void loop() {
   M5Dial.update();
   
@@ -1447,19 +1300,8 @@ void loop() {
   }
   
   if (currentMode == RUN_MODE) {
-    server.handleClient();
     updateMacros();
-    
-    if (WiFi.status() == WL_CONNECTED && !mdnsStarted) {
-      if (MDNS.begin("draupnir")) {
-        Serial.println("MDNS started: draupnir.local");
-        MDNS.addService("http", "tcp", 80);
-      }
-      Serial.print("Wi-Fi connected! IP: ");
-      Serial.println(WiFi.localIP());
-      mdnsStarted = true;
-    }
-    
+
     long newPosRaw = M5Dial.Encoder.read();
     long newPos = newPosRaw / 4;
     if (newPos != oldPosition) {
@@ -1507,12 +1349,6 @@ void loop() {
           }
         }
       }
-    }
-    
-    if (M5Dial.BtnA.wasHold()) {
-      M5Dial.Speaker.tone(2000, 100);
-      waitRelease = true;
-      enterWiFiSetupMode();
     }
     
     auto touch = M5Dial.Touch.getDetail();
@@ -1574,22 +1410,11 @@ void loop() {
       }
     }
   } else if (currentMode == CONFIG_MODE) {
-    server.handleClient();
     auto touch = M5Dial.Touch.getDetail();
     if (touch.wasReleased() || M5Dial.BtnA.wasReleased()) {
       currentMode = RUN_MODE;
       M5Dial.Speaker.tone(2000, 30);
       requestRedraw();
-    }
-  } else if (currentMode == WIFI_SETUP_MODE) {
-    server.handleClient();
-    
-    if (waitRelease && M5Dial.BtnA.isReleased()) {
-      waitRelease = false;
-    }
-    
-    if (!waitRelease && M5Dial.BtnA.wasPressed()) {
-      ESP.restart();
     }
   }
   
@@ -1605,25 +1430,18 @@ void loop() {
 
   // BLE reconnection handling
   if (!deviceConnected && oldDeviceConnected) {
-    // Restore WiFi/web access for Config Mode now that BLE no longer needs exclusive radio time.
-    // Routes are already registered from setup()'s setupWebServer() call — just restart the
-    // listener, don't re-register them.
-    WiFi.mode(WIFI_STA);
-    WiFi.begin();
-    server.begin();
     delay(500); // give the bluetooth stack the chance to get ready
     BLEDevice::startAdvertising(); // restart advertising (pServer->startAdvertising silently fails on ESP32)
     Serial.println("Restart BLE advertising");
     oldDeviceConnected = deviceConnected;
   }
   if (deviceConnected && !oldDeviceConnected) {
-    // WiFi STA + the web server aren't needed at the same time as a BLE session in practice — and
-    // WiFi/BLE radio coexistence was the leading suspect for large BLE notify chunks being
-    // silently dropped (verified: tiny ~20B chunks were reliable, 500B chunks weren't). Freeing
-    // the radio for BLE's exclusive use while a client is connected removes that contention.
-    server.stop();
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
+    // Was: server.stop(); WiFi.disconnect(true); WiFi.mode(WIFI_OFF). WiFi/BLE radio coexistence
+    // was the leading suspect for large BLE notify chunks being silently dropped (verified: ~20B
+    // chunks were reliable, 500B chunks weren't), so WiFi was paused for the duration of every
+    // BLE session. Deleting WiFi outright subsumes that fix -- contention cannot recur on a radio
+    // that is never brought up. Kept as an explicit branch because the transition pair is a
+    // recognisable idiom and the disconnect side above still does real work.
     oldDeviceConnected = deviceConnected;
   }
   
