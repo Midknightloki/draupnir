@@ -1300,10 +1300,29 @@ class TxLogCallbacks: public BLECharacteristicCallbacks {
     }
 };
 
-void enterConfigMode() {
-  currentMode = CONFIG_MODE;
-  killAllMacros();
-  
+// Painted from loop() on the pairingActive false->true edge. Never called from a BLE callback:
+// SecurityCallbacks::onPassKeyNotify runs on the BLE host task and only sets flags, because the
+// display belongs to the loop() task.
+void drawPairingScreen() {
+  auto& d = M5Dial.Display;
+  d.fillScreen(TFT_BLACK);
+  d.setTextDatum(middle_center);
+  d.setFont(&fonts::Orbitron_Light_24);
+  d.setTextColor(TFT_CYAN, TFT_BLACK);
+  d.drawString("PAIRING", 120, 60);
+
+  d.setTextColor(TFT_WHITE, TFT_BLACK);
+  d.drawString("Enter PIN:", 120, 110);
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%06u", (unsigned)currentPasskey);
+  d.drawString(buf, 120, 150);
+}
+
+// Split out from enterConfigMode() so the pairing screen can repaint over itself when pairing
+// ends while the dial is sitting in Config Mode. requestRedraw() is only honoured by the
+// RUN_MODE branch of loop(), so without this the PAIRING screen stayed up until the next tap.
+// Drawing only -- no mode change, and crucially no killAllMacros().
+void drawConfigModeScreen() {
   auto& d = M5Dial.Display;
   d.fillScreen(TFT_BLACK);
   d.setTextDatum(middle_center);
@@ -1323,6 +1342,12 @@ void enterConfigMode() {
 
   d.setTextColor(TFT_DARKGRAY, TFT_BLACK);
   d.drawString("TAP TO EXIT", 120, 190);
+}
+
+void enterConfigMode() {
+  currentMode = CONFIG_MODE;
+  killAllMacros();
+  drawConfigModeScreen();
 }
 
 void setup() {
@@ -1470,124 +1495,147 @@ void setup() {
 
 void loop() {
   M5Dial.update();
-  
-  if (trellisFound) {
+
+  // Edge-triggered, not level-triggered: this display is painted imperatively, so repainting
+  // every tick would flicker and never repainting would leave the passkey up forever.
+  static bool wasPairing = false;
+  bool isPairing = pairingActive;
+  if (isPairing != wasPairing) {
+    if (isPairing) {
+      drawPairingScreen();
+    } else if (currentMode == CONFIG_MODE) {
+      // requestRedraw() would be ignored -- only the RUN_MODE branch below dispatches it.
+      drawConfigModeScreen();
+    } else {
+      requestRedraw();
+    }
+    wasPairing = isPairing;
+  }
+
+  // Not while the passkey is up: trellis.read() dispatches trellisEvent(), which fires macros.
+  if (trellisFound && !isPairing) {
     trellis.read();
   }
-  
+
   if (currentMode == RUN_MODE) {
     updateMacros();
 
-    long newPosRaw = M5Dial.Encoder.read();
-    long newPos = newPosRaw / 4;
-    if (newPos != oldPosition) {
-      if (inRotaryMode) {
-        JsonArray actions = activeRotaryMacro["actions"];
-        if (newPos > oldPosition) {
-          if (actions.size() > 0) executeAction(actions[0]);
-          oldPosition++;
-        } else {
-          if (actions.size() > 1) executeAction(actions[1]);
-          oldPosition--;
-        }
-      } else {
-        M5Dial.Speaker.tone(1000, 10);
-        selectedMacroIdx = (newPos % 16);
-        if (selectedMacroIdx < 0) selectedMacroIdx += 16;
-        oldPosition = newPos;
-        requestRedraw();
-      }
-    }
-    
-    if (uiNeedsRedraw && millis() - lastRedrawTime > 50) {
-      drawRunUI();
-      uiNeedsRedraw = false;
-      lastRedrawTime = millis();
-    }
-    
-    if (M5Dial.BtnA.wasReleased()) {
-      if (inRotaryMode) {
-        inRotaryMode = false;
-        M5Dial.Speaker.tone(2000, 30);
-        requestRedraw();
-      } else {
-        Serial.println("Knob pressed. Firing macro...");
-        M5Dial.Speaker.tone(4000, 30);
-        
-        JsonArray profiles = profilesDoc["profiles"];
-        JsonObject prof = profiles[activeProfileIdx];
-        JsonArray macros = prof["macros"];
-        
-        for (JsonObject m : macros) {
-          if (m["pos"] == selectedMacroIdx) {
-            fireMacro(m, selectedMacroIdx);
-            break;
+    // The pairing screen owns the display and the inputs while it is up. Someone reading a PIN
+    // off the glass must not fire a macro into their host by brushing it. Macros already running
+    // are still serviced above; the queued redraw is deliberately NOT dispatched in here either,
+    // because drawRunUI() would paint straight over the passkey.
+    if (!isPairing) {
+      long newPosRaw = M5Dial.Encoder.read();
+      long newPos = newPosRaw / 4;
+      if (newPos != oldPosition) {
+        if (inRotaryMode) {
+          JsonArray actions = activeRotaryMacro["actions"];
+          if (newPos > oldPosition) {
+            if (actions.size() > 0) executeAction(actions[0]);
+            oldPosition++;
+          } else {
+            if (actions.size() > 1) executeAction(actions[1]);
+            oldPosition--;
           }
+        } else {
+          M5Dial.Speaker.tone(1000, 10);
+          selectedMacroIdx = (newPos % 16);
+          if (selectedMacroIdx < 0) selectedMacroIdx += 16;
+          oldPosition = newPos;
+          requestRedraw();
         }
       }
-    }
-    
-    auto touch = M5Dial.Touch.getDetail();
-    if (touch.wasReleased()) {
-      bool changed = false;
-      JsonArray profiles = profilesDoc["profiles"];
-      int numProfiles = profiles.size();
       
-      if (touch.distanceY() < -40 && abs(touch.distanceX()) < 30) {
-        // Swipe Up -> Kill All
-        M5Dial.Speaker.tone(1000, 50);
-        delay(50);
-        M5Dial.Speaker.tone(800, 50);
-        killAllMacros();
-      } else if (touch.distanceY() > 40 && abs(touch.distanceX()) < 30) {
-        // Swipe Down -> Enter Config Mode
-        M5Dial.Speaker.tone(1500, 50);
-        enterConfigMode();
-      } else if (abs(touch.distanceX()) < 10 && touch.y > 60 && touch.y < 180) { 
-        if (inRotaryMode && touch.x >= 80 && touch.x <= 160 && touch.y >= 80 && touch.y <= 160) {
+      if (uiNeedsRedraw && millis() - lastRedrawTime > 50) {
+        drawRunUI();
+        uiNeedsRedraw = false;
+        lastRedrawTime = millis();
+      }
+      
+      if (M5Dial.BtnA.wasReleased()) {
+        if (inRotaryMode) {
           inRotaryMode = false;
           M5Dial.Speaker.tone(2000, 30);
           requestRedraw();
-        } else if (!inRotaryMode) {
-          if (touch.x < 80 && activeProfileIdx > 0) {
-            activeProfileIdx--;
-            changed = true;
-          } else if (touch.x > 160 && activeProfileIdx < numProfiles - 1) {
-            activeProfileIdx++;
-            changed = true;
-          } else if (touch.x >= 80 && touch.x <= 160 && touch.y >= 80 && touch.y <= 160) {
-            Serial.println("Screen tapped. Firing macro...");
-            M5Dial.Speaker.tone(4000, 30);
-            
-            JsonObject prof = profiles[activeProfileIdx];
-            JsonArray macros = prof["macros"];
-            
-            for (JsonObject m : macros) {
-              if (m["pos"] == selectedMacroIdx) {
-                fireMacro(m, selectedMacroIdx);
-                break;
-              }
+        } else {
+          Serial.println("Knob pressed. Firing macro...");
+          M5Dial.Speaker.tone(4000, 30);
+          
+          JsonArray profiles = profilesDoc["profiles"];
+          JsonObject prof = profiles[activeProfileIdx];
+          JsonArray macros = prof["macros"];
+          
+          for (JsonObject m : macros) {
+            if (m["pos"] == selectedMacroIdx) {
+              fireMacro(m, selectedMacroIdx);
+              break;
             }
           }
         }
-      } else if (touch.distanceX() > 40 && activeProfileIdx > 0 && !inRotaryMode) { 
-        activeProfileIdx--;
-        changed = true;
-      } else if (touch.distanceX() < -40 && activeProfileIdx < numProfiles - 1 && !inRotaryMode) { 
-        activeProfileIdx++;
-        changed = true;
       }
       
-      if (changed) {
-        prefs.putInt("activeProfile", activeProfileIdx);
-        M5Dial.Speaker.tone(3000, 30);
-        killAllMacros(); // Kill macros on profile change just to be safe
-        requestRedraw();
+      auto touch = M5Dial.Touch.getDetail();
+      if (touch.wasReleased()) {
+        bool changed = false;
+        JsonArray profiles = profilesDoc["profiles"];
+        int numProfiles = profiles.size();
+        
+        if (touch.distanceY() < -40 && abs(touch.distanceX()) < 30) {
+          // Swipe Up -> Kill All
+          M5Dial.Speaker.tone(1000, 50);
+          delay(50);
+          M5Dial.Speaker.tone(800, 50);
+          killAllMacros();
+        } else if (touch.distanceY() > 40 && abs(touch.distanceX()) < 30) {
+          // Swipe Down -> Enter Config Mode
+          M5Dial.Speaker.tone(1500, 50);
+          enterConfigMode();
+        } else if (abs(touch.distanceX()) < 10 && touch.y > 60 && touch.y < 180) { 
+          if (inRotaryMode && touch.x >= 80 && touch.x <= 160 && touch.y >= 80 && touch.y <= 160) {
+            inRotaryMode = false;
+            M5Dial.Speaker.tone(2000, 30);
+            requestRedraw();
+          } else if (!inRotaryMode) {
+            if (touch.x < 80 && activeProfileIdx > 0) {
+              activeProfileIdx--;
+              changed = true;
+            } else if (touch.x > 160 && activeProfileIdx < numProfiles - 1) {
+              activeProfileIdx++;
+              changed = true;
+            } else if (touch.x >= 80 && touch.x <= 160 && touch.y >= 80 && touch.y <= 160) {
+              Serial.println("Screen tapped. Firing macro...");
+              M5Dial.Speaker.tone(4000, 30);
+              
+              JsonObject prof = profiles[activeProfileIdx];
+              JsonArray macros = prof["macros"];
+              
+              for (JsonObject m : macros) {
+                if (m["pos"] == selectedMacroIdx) {
+                  fireMacro(m, selectedMacroIdx);
+                  break;
+                }
+              }
+            }
+          }
+        } else if (touch.distanceX() > 40 && activeProfileIdx > 0 && !inRotaryMode) { 
+          activeProfileIdx--;
+          changed = true;
+        } else if (touch.distanceX() < -40 && activeProfileIdx < numProfiles - 1 && !inRotaryMode) { 
+          activeProfileIdx++;
+          changed = true;
+        }
+        
+        if (changed) {
+          prefs.putInt("activeProfile", activeProfileIdx);
+          M5Dial.Speaker.tone(3000, 30);
+          killAllMacros(); // Kill macros on profile change just to be safe
+          requestRedraw();
+        }
       }
-    }
+    } // end !isPairing
   } else if (currentMode == CONFIG_MODE) {
     auto touch = M5Dial.Touch.getDetail();
-    if (touch.wasReleased() || M5Dial.BtnA.wasReleased()) {
+    if (!isPairing && (touch.wasReleased() || M5Dial.BtnA.wasReleased())) {
       currentMode = RUN_MODE;
       M5Dial.Speaker.tone(2000, 30);
       requestRedraw();
