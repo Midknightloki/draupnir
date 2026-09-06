@@ -107,10 +107,15 @@ that turns the catch-up from a port into a rewrite. See `docs/Draupnir_Spec.md` 
 Working on hardware: USB HID, macro engine (combos/text/consumer/mouse/delays), ring UI with
 dynamic wedges and tap-to-fire, LittleFS profile store, BLE transport + Companion App.
 
-**Next = M6 config hardening (blocking):** enforce BLE pairing on the config characteristics,
-atomic profile writes with parse-failure fallback, bound the BLE RX reassembly buffer, and stop
-macros before reload. Then M7 NVS persistence · M8 on-device profile switching · M9 icons on the
-ring + encoder detent alignment · M10 polish.
+**Done and hardware-verified:** M6 config hardening · M7 NVS persistence · M8 on-device profile
+switching · M9 icons + dial orientation + rotary mode · M8b uncapped `pos` (schema v3) · the
+**M5Dial security gate** (2026-09-06 — BLE pairing/bonding and GATT permission flags on that board
+too, atomic writes, and Wi-Fi plus the LAN-reachable web API deleted outright).
+
+**Next = M10 polish.** One small open item first: the M5Dial's **negative** (hostile-central) test
+has never been run, so its enforcement claim rests on positive-path evidence plus build guards
+rather than on proof of refusal. See `docs/HANDOFF.md` §6 Step 1 — it is about fifteen minutes with
+nRF Connect. Haptics are blocked by `haptics_init()` breaking the CST816 touch controller.
 
 ## Working style
 Incremental milestones, each verified **on hardware** before advancing. You compile/upload
