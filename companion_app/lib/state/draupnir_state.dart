@@ -451,16 +451,20 @@ class DraupnirState extends ChangeNotifier {
 
   // Shown whenever the device rejects a request for lack of an encrypted, bonded link. There is
   // no in-app action that can fix this — the OS owns pairing — so the message points at the
-  // system Bluetooth settings and the PIN on the knob's screen.
+  // system Bluetooth settings and the PIN on the device's screen. Both boards enforce bonding
+  // now, and this is shown without knowing which one refused, so it names both.
   static const String pairingRequiredMessage =
       'This Draupnir is not paired with your phone yet.\n\n'
-      'Open your phone\'s Bluetooth settings, pair with "Draupnir", and enter the PIN shown on '
-      'the knob\'s screen. Then come back and connect again.';
+      'Open your phone\'s Bluetooth settings, pair with it ("Draupnir" for the Waveshare knob, '
+      '"Draupnir_Mini" for the M5Dial), and enter the PIN shown on the device\'s screen. '
+      'Then come back and connect again.';
 
-  // Shown when the device answers with "Not in Config Mode". The gesture named here is the
-  // M5Dial's, because it is the only board with the gate — and note it is the OPPOSITE
-  // direction from that board's kill-all (swipe up), so naming the wrong one would be worse
-  // than saying nothing.
+  // LEGACY FALLBACK — do not delete, and do not "restore" the firmware gate to match it.
+  // The M5Dial's CONFIG_MODE check was removed when it gained real BLE pairing; an encrypted,
+  // authenticated link is the authorization now. This message can therefore only come from an
+  // M5Dial still running pre-gate firmware, which is exactly why it stays: on that board it is
+  // still the correct instruction. Note the gesture named here is the OPPOSITE direction from
+  // that board's kill-all (swipe up), so naming the wrong one would be worse than saying nothing.
   static const String configModeRequiredMessage =
       'Draupnir_Mini is in Run Mode and will not serve config requests.\n\n'
       'Swipe down on the dial\'s screen to enter Config Mode, then try again.';
