@@ -112,10 +112,13 @@ switching · M9 icons + dial orientation + rotary mode · M8b uncapped `pos` (sc
 **M5Dial security gate** (2026-09-06 — BLE pairing/bonding and GATT permission flags on that board
 too, atomic writes, and Wi-Fi plus the LAN-reachable web API deleted outright).
 
-**Next = M10 polish.** One small open item first: the M5Dial's **negative** (hostile-central) test
-has never been run, so its enforcement claim rests on positive-path evidence plus build guards
-rather than on proof of refusal. See `docs/HANDOFF.md` §6 Step 1 — it is about fifteen minutes with
-nRF Connect. Haptics are blocked by `haptics_init()` breaking the CST816 touch controller.
+Both boards' gates are proven by **refusal**, not just acceptance — hostile-central tests passed on
+the Waveshare 2026-08-07 and the M5Dial 2026-09-07. Nothing security-related is outstanding.
+
+**Next = M10 polish** (buzzer/haptic feedback, export/import). Diagnose the haptics blocker before
+scoping it: `haptics_init()` breaks the CST816 touch controller, and both sit on the same I²C bus.
+Until that is understood, haptics cannot be honestly estimated; export/import is the half that is
+merely work, and it touches the shared schema rather than either board's display layer.
 
 ## Working style
 Incremental milestones, each verified **on hardware** before advancing. You compile/upload

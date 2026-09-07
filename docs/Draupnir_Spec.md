@@ -475,13 +475,17 @@ handler, anything arriving on a link whose `sec_state` is not `encrypted && auth
 logs that state on every accepted command — a backstop in case the permission flags ever silently
 stop enforcing, which is this API's known failure mode.
 
-**One caveat, deliberately recorded.** On the Waveshare the enforcement was proven by a
-hostile-central test (nRF Connect, pairing declined; writes never reached the handler). **That
-negative test has not been run on the M5Dial.** Its evidence is positive-path only: every accepted
-command logs `enc=1 auth=1 bond=1`, and a build guard (`#error` plus two `static_assert`s, the
-latter verified to actually fire by inverting it) makes a silently-zero permission flag a compile
-error. Those are compensating controls, not the same proof. Running nRF Connect against the
-M5Dial is cheap and closes the gap.
+**Proven by refusal, not just by acceptance, on both boards.** Each gate was tested with a hostile
+central that declined pairing and then attempted to write: the Waveshare on 2026-08-07, the M5Dial
+on 2026-09-07. In both cases the command handler never saw the bytes. This is the criterion that
+matters — a gate that accepts authorized traffic proves nothing about what it refuses — and it is
+why the M5Dial's claim was held as explicitly *unverified* for a day after its positive-path round
+passed, rather than being folded in.
+
+Belt-and-braces behind the flags, on the M5Dial: a `#error` plus two `static_assert`s make a
+silently-zero permission flag a compile error (the assert was confirmed to actually fire by
+inverting it), and the command handler independently refuses any link whose `sec_state` is not
+`encrypted && authenticated`, logging that state on every accepted command.
 
 Going from no security to bonding is a **breaking change** for existing M5Dial users: the old
 device entry must be removed from the phone's Bluetooth settings before the app will work again.
@@ -541,7 +545,7 @@ Honest status, not aspiration.
 | M8 | **On-device profile switching** with directional indicators | **Done (2026-08-13)**, verified on hardware — grew beyond its original scope, see note below |
 | M8b | **Uncap `pos`** — key running-macro state by identity, not slot; bump the default to `version: 3` and actually check it | **Done (2026-08-26)**, verified on hardware 2026-08-29 — both boards, full criteria list |
 | M9 | **Icons on the ring** + dial orientation + rotary macro mode — encoder detent alignment dropped, see note below | **Done (2026-08-22)**, verified on hardware — Waveshare 2026-08-22, M5Dial icon-merge 2026-08-25 |
-| M5Dial security gate | **Close the second board's config channel** — BLE pairing/bonding + GATT permission flags, delete Wi-Fi and the LAN-reachable web API, atomic profile write, passkey screen | **Done (2026-09-06)**, verified on hardware — positive path only; the hostile-central test has **not** been run on this board (§7) |
+| M5Dial security gate | **Close the second board's config channel** — BLE pairing/bonding + GATT permission flags, delete Wi-Fi and the LAN-reachable web API, atomic profile write, passkey screen | **Done (2026-09-06)**, verified on hardware — positive path 2026-09-06, hostile-central negative test 2026-09-07 (§7) |
 | M10 | Polish — buzzer/haptic feedback, export/import | **Open** — brightness UI, originally listed here, was delivered as part of M7/M8 |
 
 **M6:** done-criterion was the H1 negative test, which passed on hardware 2026-08-07 — an
@@ -579,10 +583,10 @@ rather than silently rewriting the milestone description:
   detent) was measured, traced to the physical switch rather than firmware, and deliberately
   accepted rather than fixed with a lockout window that would also cap deliberate fast turning.
 
-**Verified on the Waveshare only.** The M5Dial half of M9 — porting the icon-merge fix that closes
-a live data-loss bug (editing one macro was wiping every other macro's icon) — compiled cleanly
-against the M5Dial FQBN and was code-reviewed, but the board has not been flashed this milestone.
-Its acceptance criterion has not been run. See `docs/HANDOFF.md` for the full breakdown.
+**Verified on both boards.** The Waveshare half was signed off 2026-08-22. The M5Dial half —
+porting the icon-merge fix that closes a live data-loss bug (editing one macro was wiping every
+other macro's icon) — was flashed and its acceptance criterion run on **2026-08-25**: editing one
+macro no longer wipes the icons on the others. See `docs/HANDOFF.md` §4 for the full breakdown.
 
 ---
 

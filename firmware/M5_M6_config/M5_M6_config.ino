@@ -1486,12 +1486,13 @@ void setup() {
   // setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND) means this device will not complete a
   // Just Works pairing at all, so any encrypted link is necessarily an authenticated one.
   //
-  // On the Waveshare that last sentence was upgraded from inference to observation by a
-  // hostile-central hardware test (nRF Connect, 2026-08-07). On THIS board it remains an
-  // inference -- the negative test has NOT been run here. Do not copy the Waveshare's
-  // "VERIFIED" wording across until someone actually runs it.
+  // VERIFIED on this board by hostile-central test, 2026-09-07: an unbonded central is refused.
+  // (The Waveshare's equivalent test was 2026-08-07.) Until then this was an inference from the
+  // MITM auth mode rather than an observation, and was labelled as such -- the label is removed
+  // now because the test was actually run, not because the reasoning got more convincing.
   //
-  // It reopens the moment setAuthenticationMode() is relaxed away from *_MITM_*.
+  // It reopens the moment setAuthenticationMode() is relaxed away from *_MITM_*. If you change
+  // that line, this comment is void and the CCCD is genuinely unprotected against Just Works.
   pTxCharacteristic = pService->createCharacteristic(
                         CHARACTERISTIC_UUID_TX,
                         BLECharacteristic::PROPERTY_NOTIFY |

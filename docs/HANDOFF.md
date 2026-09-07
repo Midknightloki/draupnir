@@ -43,7 +43,8 @@ claimed since v3. See §4.
 bonds and enforces GATT permission flags like the Waveshare, its `profiles.json` write is atomic,
 and its Wi-Fi stack and LAN-reachable web API — a remote keystroke-injection path on a device that
 is a keyboard — are deleted outright. Both supported boards are now on the same security posture,
-with one caveat recorded in §4: the M5Dial's *negative* test has not been run.
+and both are proven by **refusal**, not merely by acceptance: the hostile-central test passed on
+the Waveshare 2026-08-07 and on the M5Dial 2026-09-07. Nothing security-related is outstanding.
 
 ---
 
@@ -216,6 +217,12 @@ direct `SerialPort` capture rather than by eye. All seven pass.
 - **The atomic write commits and reloads:** `save_profiles: committed 12597 bytes`, then 12650 on
   a second save, each followed by a clean `Loaded profiles.json`. No `write failed`, no
   `rename into place failed`. **The edit survived a power cycle.**
+- **The hostile-central (negative) test passes — confirmed 2026-09-07.** An unbonded central is
+  refused. This is the criterion that separates "the gate accepts authorized traffic" from "the
+  gate refuses unauthorized traffic", and until it was run the security-gate round proved only the
+  former. It was recorded as NOT verified for a day rather than folded into the positive results,
+  which is the right way round: the Waveshare's equivalent claim (2026-08-07) had always been
+  backed by a real session, and the two should never have read as equivalent before this.
 - **Pairing while sitting in Config Mode** returns to the Config Mode screen cleanly rather than
   stranding the passkey screen. This needed a fix found by reading rather than testing:
   `requestRedraw()` is only ever dispatched inside the `RUN_MODE` branch of `loop()`, so the
@@ -234,17 +241,6 @@ window (`1c7e3b8`).
 
 ### NOT verified — read this before assuming otherwise
 
-- **The M5Dial's hostile-central (negative) test.** No unbonded write was ever attempted against
-  the M5Dial. Every criterion in the security-gate round above is **positive-path only**: they show
-  the gate *accepting authorized* traffic, not *refusing unauthorized* traffic. Do not read
-  "verified" there as "we proved an unbonded central is refused" — that sentence is true of the
-  **Waveshare**, whose gate was tested with nRF Connect on 2026-08-07 (pairing declined; the
-  handler never saw the bytes across four unencrypted connections), and it is **not yet** true of
-  the M5Dial. The compensating controls are real but are not the same proof: a `#error` plus two
-  `static_assert`s make a silently-zero permission flag a compile error (the assert was confirmed
-  to actually fire by inverting it), and a runtime `sec_state` check refuses anything not
-  `encrypted && authenticated` even if the flags fail. Closing this is cheap — point nRF Connect
-  at `Draupnir_Mini`, decline the pairing, write to RX, and confirm no `[ble] cmd` line appears.
 - **Frame pacing at high macro counts.** Still unmeasured — all M9 hardware testing ran against
   small profiles. This is now a harder question than it was at the end of M7/M8: the ring draw
   callback issues up to 9 `lv_draw_label` calls per wedge per repaint (unchanged from before), and
@@ -371,23 +367,24 @@ proposed Visual Studio reinstall that would have fixed nothing.
 
 ## 6. What to do next, in order
 
-### Step 1 — Run the M5Dial's negative test *(small, and it closes an open claim)*
+**Security work is closed.** The M5Dial security gate landed on `feat/m5dial-security-gate` (PR #6)
+and is verified on hardware — positive path 2026-09-06, hostile-central negative test 2026-09-07.
+Both supported boards now enforce pairing, bonding and GATT permission flags, and both claims are
+backed by a real refusal test rather than by inference. Nothing security-related is outstanding.
 
-**The M5Dial security gate is done and verified** (§4) — pairing, bonding, GATT permission flags,
-the atomic write, and the passkey screen all landed on `feat/m5dial-security-gate` and passed on
-hardware 2026-09-06. Wi-Fi and the web server are gone from that board entirely.
+### Step 1 — M10, polish
 
-What remains is one cheap piece of evidence, not a build: **no hostile-central test was ever run
-against the M5Dial**, so the enforcement claim there rests on positive-path observation plus build
-guards rather than on proof of refusal. Point nRF Connect at `Draupnir_Mini`, decline the pairing,
-write to RX, and confirm no `[ble] cmd` line appears in the serial log. Fifteen minutes, and it
-turns the caveat in §4 into a verified statement matching the Waveshare's.
+Buzzer/haptic feedback and export/import.
 
-### Step 2 — M10, polish
+**Diagnose the haptics blocker before scoping the milestone.** `haptics_init()` breaks the CST816
+touch controller (§8) — a hardware interaction, not an effort problem, and it is the one item that
+could change M10's shape. Both sit on the same I²C bus, which makes address conflict, bus timing,
+or a shared-reset interaction the obvious first hypotheses; none has been tested. Until that is
+understood, "buzzer/haptic feedback" cannot be honestly estimated, and export/import is the part of
+M10 that is merely work.
 
-Buzzer/haptic feedback and export/import. Note that haptics are currently blocked by a hardware
-interaction, not by effort: `haptics_init()` breaks the CST816 touch controller (§6 gaps). That
-needs diagnosing before the milestone can be scoped honestly.
+Note that export/import touches the schema and the app rather than either board's display layer,
+so it is the half that stays shared — worth doing first if the haptics diagnosis drags.
 
 ### Also worth doing, not blocking
 
@@ -434,9 +431,10 @@ to live in this section are not lost — they're in this file's git history, in 
   `_ENC`/`_AUTHEN` permission flags on RX and `_ENC` on TX, and refuses at the handler anything
   whose link `sec_state` is not `encrypted && authenticated`. The `CONFIG_MODE` check is gone —
   it was physical presence, not authentication. Wi-Fi and the LAN-reachable web API were deleted
-  in the same pass, which was the larger hole of the two. Verified on hardware (§4). **The one
-  thing still open is the negative test** — see §6 Step 1. The rebuttal below is retained because
-  it remains the standing answer to anyone proposing the token.
+  in the same pass, which was the larger hole of the two. Verified on hardware (§4) on both the
+  positive path (2026-09-06) and by hostile-central negative test (2026-09-07) — an unbonded
+  central is refused. Nothing about this is outstanding. The rebuttal below is retained because it
+  remains the standing answer to anyone proposing the token.
   > **Do not close this by restoring the `pairingToken`.** An external audit (2026-08) called the
   > removal a blocking regression; it was not. The token was checked *only outside* `CONFIG_MODE`,
   > and `CONFIG_MODE` is the only mode serving config commands — so in the mode that mattered
