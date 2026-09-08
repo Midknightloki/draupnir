@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import '../services/profile_transfer.dart';
 
 class DraupnirState extends ChangeNotifier {
   bool isLoading = false;
@@ -240,6 +242,11 @@ class DraupnirState extends ChangeNotifier {
   // match connects straight through; more than one asks. The grace window is what keeps the
   // common single-board case from paying the full 10s scan.
   static const Duration _scanGrace = Duration(seconds: 2);
+
+  // One key, overwritten on every import. Survives an app restart, which an in-memory undo
+  // would not — and a wrong import is the only irreversible action in this app.
+  static const String _snapshotKey = 'pre_import_config';
+  static const String _snapshotAtKey = 'pre_import_config_at';
 
   /// [chooseDevice] is called only when the scan turns up more than one Draupnir. Returning null
   /// (the user dismissed the picker) cancels the connect quietly — not an error. Omitting it
@@ -545,6 +552,85 @@ class DraupnirState extends ChangeNotifier {
     isLoading = false;
     notifyListeners();
     return result;
+  }
+
+  bool _hasSnapshot = false;
+  DateTime? _snapshotAt;
+
+  bool get hasImportSnapshot => _hasSnapshot;
+  DateTime? get importSnapshotTakenAt => _snapshotAt;
+
+  /// Call once at startup so the Undo affordance survives an app restart.
+  Future<void> loadImportSnapshotState() async {
+    final prefs = await SharedPreferences.getInstance();
+    _hasSnapshot = prefs.getString(_snapshotKey) != null;
+    final at = prefs.getString(_snapshotAtKey);
+    _snapshotAt = at == null ? null : DateTime.tryParse(at);
+    notifyListeners();
+  }
+
+  Future<void> _takeImportSnapshot() async {
+    if (profilesData == null) return;
+    final prefs = await SharedPreferences.getInstance();
+    final now = DateTime.now().toUtc();
+    await prefs.setString(_snapshotKey, jsonEncode(profilesData));
+    await prefs.setString(_snapshotAtKey, now.toIso8601String());
+    _hasSnapshot = true;
+    _snapshotAt = now;
+  }
+
+  /// Applies a parsed transfer to the device.
+  ///
+  /// A snapshot is taken before EVERY import, not only the destructive one. An append is not
+  /// destructive, but undoing one is just as useful, and a rule that fires on every import
+  /// cannot be got wrong about which case it covers.
+  Future<bool> importTransfer(ParsedTransfer t) async {
+    if (profilesData == null) {
+      error = 'Connect to a Draupnir before importing.';
+      notifyListeners();
+      return false;
+    }
+
+    await _takeImportSnapshot();
+
+    if (t.isConfig) {
+      // Replaces everything. This is restore.
+      profilesData = Map<String, dynamic>.from(t.payload);
+    } else {
+      // Appends. Never overwrites, and never renumbers pos — pos is a stable identifier and the
+      // ring-order key, unique only WITHIN a profile, so an appended profile cannot collide.
+      final profiles = profilesData!['profiles'] as List;
+      final incoming = Map<String, dynamic>.from(t.payload);
+      incoming['name'] =
+          uniqueProfileName(incoming['name'].toString(), profiles);
+      profiles.add(incoming);
+    }
+
+    notifyListeners();
+    await saveProfiles();
+    if (error != null) return false;
+
+    // Re-read so the UI reflects what the device actually stored, including any icon merge it
+    // performed on the way in.
+    await fetchProfiles();
+    return error == null;
+  }
+
+  /// Re-sends the config captured immediately before the last import.
+  Future<bool> undoImport() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString(_snapshotKey);
+    if (saved == null) {
+      error = 'There is no pre-import snapshot to restore.';
+      notifyListeners();
+      return false;
+    }
+    profilesData = Map<String, dynamic>.from(jsonDecode(saved) as Map);
+    notifyListeners();
+    await saveProfiles();
+    if (error != null) return false;
+    await fetchProfiles();
+    return error == null;
   }
 
   // The firmware rejects unauthenticated access at the GATT layer, so there is no single
