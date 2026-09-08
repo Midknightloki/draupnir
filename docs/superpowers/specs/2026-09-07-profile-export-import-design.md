@@ -126,6 +126,18 @@ so a single profile object — `{"name":"Gaming","macros":[…],"color":"#00CED1
 field anywhere inside it. Without an envelope a profile export would be unvalidatable. Putting
 `schema` in the envelope makes both kinds validate the same way.
 
+**What export writes into `schema`.** The source document's own `version` field — *not* the app's
+maximum. If the fetched document declares `"version": 2`, the export says `"schema": 2`, because
+labelling a v2 document as v3 would be a lie the importer cannot detect. This is the live case, not
+a hypothetical: the owner's current `profiles.json` declares **version 2**, which predates the M8b
+bump and is perfectly legal — `schemaVersionOk()` accepts `ver <= SCHEMA_VERSION`, and v3 is a
+strict relaxation of v2 (`Draupnir_Spec.md` §7). If the source declares no `version` at all — also
+legal, the check returns true for a null — export writes `3`, matching the firmware's own treatment
+of a version-less document as current.
+
+For a single-profile export the profile object has no version of its own, so `schema` is taken from
+the `version` of the document it was fetched from, by the same rule.
+
 If a hand-edited file's envelope `schema` disagrees with a config payload's internal `version`, the
 **envelope wins**; export always writes them in agreement.
 
