@@ -376,15 +376,33 @@ backed by a real refusal test rather than by inference. Nothing security-related
 
 Buzzer/haptic feedback and export/import.
 
-**Diagnose the haptics blocker before scoping the milestone.** `haptics_init()` breaks the CST816
-touch controller (§8) — a hardware interaction, not an effort problem, and it is the one item that
-could change M10's shape. Both sit on the same I²C bus, which makes address conflict, bus timing,
-or a shared-reset interaction the obvious first hypotheses; none has been tested. Until that is
-understood, "buzzer/haptic feedback" cannot be honestly estimated, and export/import is the part of
-M10 that is merely work.
+M10 as originally written is **two independent subsystems** and should be decomposed: export/import
+(shared schema + app, no hardware dependency) and buzzer/haptic feedback (blocked). They get
+separate designs.
 
-Note that export/import touches the schema and the app rather than either board's display layer,
-so it is the half that stays shared — worth doing first if the haptics diagnosis drags.
+**Haptics is TABLED as of 2026-09-07** — the Waveshare is off-site — and the reason to revisit it
+is narrower than "debug an I²C conflict":
+
+> **Check first whether the DRV2605 exists at all.** `haptics.cpp:12` states the address is *"an
+> assumption from the datasheet, not from a verified schematic"*, and the §3 hardware table lists
+> no haptic driver and no buzzer for the Waveshare. That table is derived from the firmware, so it
+> is not proof of absence — but nobody has ever confirmed the chip is on the bus. The commit that
+> added haptics (`982946d`) describes it as restoring "feedback the M5Dial build had", and what
+> the M5Dial has is a **speaker**, which already beeps on every action. So the M5Dial half of
+> "buzzer feedback" is arguably already shipped, and the Waveshare half may be driving a chip that
+> is not there.
+>
+> **The diagnostic is already written.** `haptics_init()` opens with an `i2c_scan()` that probes
+> all 112 addresses and logs whatever answers. Uncomment the call, flash, read the serial log —
+> touch will break for that boot, which does not matter, because a broken touchscreen still prints
+> to serial. One flash, one log read, and it forks the work:
+>   - **Only `0x15` answers** → no DRV2605. Not a firmware task at all; it is a P2 hardware item.
+>     Park or delete `haptics.cpp`, and the CST816 bug becomes moot.
+>   - **`0x5A` answers too** → the motor is real and it is the I²C ordering bug. *Then* run the
+>     three-step single-variable bisect already written at `Waveshare_LVGL_Test.ino:1519`.
+>
+> Do the scan before the bisect. Debugging the conflict is only worth it if something is on the
+> other end.
 
 ### Also worth doing, not blocking
 
