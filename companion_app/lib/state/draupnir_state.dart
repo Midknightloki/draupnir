@@ -508,6 +508,45 @@ class DraupnirState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Fetches a document WITH icon bitmaps, for export only.
+  ///
+  /// Deliberately does not touch [profilesData]. The on-screen document was fetched without
+  /// icons and the UI has no use for them; more importantly, exporting from the in-memory copy
+  /// would silently produce an icon-less file, which is the exact failure this whole feature
+  /// exists to prevent. Export always asks the device fresh.
+  Future<Map<String, dynamic>?> fetchProfilesForExport() async {
+    isLoading = true;
+    error = null;
+    notifyListeners();
+
+    Map<String, dynamic>? result;
+    try {
+      final response =
+          await _sendBleRequest({'cmd': 'get_profiles', 'include_icons': true});
+      if (response['status'] == 'ok') {
+        result = Map<String, dynamic>.from(response['profiles'] as Map);
+        needsPairing = false;
+        needsConfigMode = false;
+      } else if (_looksLikeConfigModeRefusal(response['message'])) {
+        needsConfigMode = true;
+        error = configModeRequiredMessage;
+      } else {
+        error = 'Failed to read profiles for export: ${response['message']}';
+      }
+    } catch (e) {
+      if (_looksLikeAuthFailure(e)) {
+        needsPairing = true;
+        error = pairingRequiredMessage;
+      } else {
+        error = 'Bluetooth request failed: $e';
+      }
+    }
+
+    isLoading = false;
+    notifyListeners();
+    return result;
+  }
+
   // The firmware rejects unauthenticated access at the GATT layer, so there is no single
   // well-typed error to match on: Android surfaces ATT error 0x05/0x0F
   // (insufficient authentication / encryption) as a PlatformException whose text varies by
