@@ -1,8 +1,10 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:file_selector/file_selector.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:provider/provider.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -85,45 +87,67 @@ class _DashboardScreenState extends State<DashboardScreen> {
         buildProfileEnvelope(profile, doc), 'draupnir-profile-$safeName');
   }
 
+  /// Writes the envelope to a temp file and hands it to the OS share sheet.
+  ///
+  /// NOT a save dialog: file_selector's getSaveLocation is unimplemented on Android. The Android
+  /// plugin (file_selector_android 0.5.2+8) overrides only openFile, openFiles and
+  /// getDirectoryPath, so getSaveLocation falls through to the platform interface default, which
+  /// throws UnimplementedError. Import still uses openFile, which IS implemented -- that
+  /// asymmetry is why the import half worked while export silently did nothing.
+  ///
+  /// The share sheet is also the better fit: "share a profile with someone else" is one of the
+  /// three purposes this feature exists for, and it lets the user put the file in Drive, Files,
+  /// email or Nearby Share without us picking a directory for them.
+  ///
+  /// Directory.systemTemp is the app's own cache dir on Android, so no path_provider is needed
+  /// and the file is cleaned up by the OS. share_plus copies it out via a FileProvider.
   Future<void> _writeEnvelope(
       Map<String, dynamic> envelope, String suggestedName) async {
-    final location = await getSaveLocation(
-      suggestedName: '$suggestedName.json',
-      acceptedTypeGroups: const [
-        XTypeGroup(label: 'Draupnir export', extensions: ['json'])
-      ],
-    );
-    if (location == null) return; // user cancelled
+    try {
+      final bytes =
+          utf8.encode(const JsonEncoder.withIndent('  ').convert(envelope));
+      final file = File('${Directory.systemTemp.path}/$suggestedName.json');
+      await file.writeAsBytes(bytes, flush: true);
 
-    final bytes =
-        utf8.encode(const JsonEncoder.withIndent('  ').convert(envelope));
-    final file = XFile.fromData(
-      Uint8List.fromList(bytes),
-      mimeType: 'application/json',
-      name: '$suggestedName.json',
-    );
-    await file.saveTo(location.path);
+      final result = await SharePlus.instance.share(ShareParams(
+        files: [XFile(file.path, mimeType: 'application/json')],
+        subject: '$suggestedName.json',
+      ));
 
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Exported to ${location.path}')),
-    );
+      if (!mounted) return;
+      if (result.status == ShareResultStatus.success) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Export shared.')),
+        );
+      }
+      // dismissed/unavailable need no message -- the user backed out deliberately.
+    } catch (e) {
+      // Never fail silently. The first version of this threw UnimplementedError into an async
+      // gap with no UI at all, which presented as "I tapped Export and nothing happened".
+      if (!mounted) return;
+      await _alert('Export failed', '$e');
+    }
   }
 
   Future<void> _importFile(DraupnirState state) async {
-    final XFile? file = await openFile(
-      acceptedTypeGroups: const [
-        XTypeGroup(label: 'Draupnir export', extensions: ['json'])
-      ],
-    );
-    if (file == null) return;
-
     ParsedTransfer parsed;
     try {
+      final XFile? file = await openFile(
+        acceptedTypeGroups: const [
+          XTypeGroup(label: 'Draupnir export', extensions: ['json'])
+        ],
+      );
+      if (file == null) return; // user cancelled
       parsed = parseEnvelope(utf8.decode(await file.readAsBytes()));
     } on TransferException catch (e) {
       if (!mounted) return;
       await _alert('Can\'t import that file', e.message);
+      return;
+    } catch (e) {
+      // Picker or read failure, as opposed to a bad file. Same rule as export: never fail
+      // silently into an async gap.
+      if (!mounted) return;
+      await _alert('Couldn\'t open that file', '$e');
       return;
     }
 
