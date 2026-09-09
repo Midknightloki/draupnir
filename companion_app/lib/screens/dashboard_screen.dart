@@ -246,6 +246,22 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
     return Scaffold(
       appBar: AppBar(
+        // The GLYPH here, not the full logo. At ~40px the complete mark is unreadable — the
+        // raven's linework and the rune rim turn to mush, confirmed on device — so small
+        // placements get the centre bind-rune alone, which stays bold and legible. The full mark
+        // lives on the connection screen, where it has room.
+        //
+        // The title stays the MODE ("CONFIGURATOR" / "VIRTUAL DECK") rather than the product
+        // name: it is doing useful work telling you which mode you are in, and the glyph carries
+        // the branding without displacing it.
+        leading: Padding(
+          padding: const EdgeInsets.all(10),
+          child: Image.asset(
+            'assets/glyph.png',
+            fit: BoxFit.contain,
+            semanticLabel: 'Draupnir Forge',
+          ),
+        ),
         title: Text(
           state.isEditorMode ? 'CONFIGURATOR' : 'VIRTUAL DECK',
           style: GoogleFonts.orbitron(fontWeight: FontWeight.bold),
@@ -787,6 +803,25 @@ class _DashboardScreenState extends State<DashboardScreen> {
       // on-device web UI, which is cut permanently (spec v3 §1, §7).
       child: Column(
         children: [
+          // The front door of the app: before a connection there is nothing else on screen, so
+          // this is where the mark earns its place rather than competing with the ring.
+          Image.asset(
+            'assets/logo.png',
+            width: 180,
+            fit: BoxFit.contain,
+            semanticLabel: 'Draupnir Forge',
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'DRAUPNIR FORGE',
+            style: GoogleFonts.orbitron(
+              fontWeight: FontWeight.bold,
+              fontSize: 18,
+              letterSpacing: 2,
+              color: AppTheme.textPrimary,
+            ),
+          ),
+          const SizedBox(height: 16),
           // Both boards enforce BLE bonding now, so this is one instruction rather than two.
           // It used to say the M5Dial needed no pairing; that stopped being true when the
           // M5Dial security gate landed.

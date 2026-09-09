@@ -22,7 +22,7 @@ class DraupnirApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Draupnir Companion',
+      title: 'Draupnir Forge',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.darkTheme,
       home: const DashboardScreen(),
