@@ -568,14 +568,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
       // on-device web UI, which is cut permanently (spec v3 §1, §7).
       child: Column(
         children: [
-          // Pairing applies to the Waveshare knob ("Draupnir"), which enforces bonding. The
-          // M5Dial ("Draupnir_Mini") has no BLE security yet and needs no pairing — it needs
-          // Config Mode instead, which is what the CONFIG MODE REQUIRED panel says when it
-          // refuses. Both are named here so the first-run screen matches either board.
+          // Both boards enforce BLE bonding now, so this is one instruction rather than two.
+          // It used to say the M5Dial needed no pairing; that stopped being true when the
+          // M5Dial security gate landed.
           const Text(
-            'Waveshare knob ("Draupnir"): pair it in your phone\'s Bluetooth settings first — '
-            'it shows the PIN on its screen.\n'
-            'M5Dial ("Draupnir_Mini"): no pairing; swipe down on the dial to enter Config Mode.',
+            'Pair your Draupnir in your phone\'s Bluetooth settings first — "Draupnir" is the '
+            'Waveshare knob, "Draupnir_Mini" is the M5Dial. Each shows a PIN on its own screen '
+            'while pairing. Then come back and connect.',
             style: TextStyle(color: Colors.white54, fontSize: 12),
             textAlign: TextAlign.center,
           ),

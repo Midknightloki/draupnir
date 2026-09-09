@@ -107,10 +107,18 @@ that turns the catch-up from a port into a rewrite. See `docs/Draupnir_Spec.md` 
 Working on hardware: USB HID, macro engine (combos/text/consumer/mouse/delays), ring UI with
 dynamic wedges and tap-to-fire, LittleFS profile store, BLE transport + Companion App.
 
-**Next = M6 config hardening (blocking):** enforce BLE pairing on the config characteristics,
-atomic profile writes with parse-failure fallback, bound the BLE RX reassembly buffer, and stop
-macros before reload. Then M7 NVS persistence · M8 on-device profile switching · M9 icons on the
-ring + encoder detent alignment · M10 polish.
+**Done and hardware-verified:** M6 config hardening · M7 NVS persistence · M8 on-device profile
+switching · M9 icons + dial orientation + rotary mode · M8b uncapped `pos` (schema v3) · the
+**M5Dial security gate** (2026-09-06 — BLE pairing/bonding and GATT permission flags on that board
+too, atomic writes, and Wi-Fi plus the LAN-reachable web API deleted outright).
+
+Both boards' gates are proven by **refusal**, not just acceptance — hostile-central tests passed on
+the Waveshare 2026-08-07 and the M5Dial 2026-09-07. Nothing security-related is outstanding.
+
+**Next = M10 polish** (buzzer/haptic feedback, export/import). Diagnose the haptics blocker before
+scoping it: `haptics_init()` breaks the CST816 touch controller, and both sit on the same I²C bus.
+Until that is understood, haptics cannot be honestly estimated; export/import is the half that is
+merely work, and it touches the shared schema rather than either board's display layer.
 
 ## Working style
 Incremental milestones, each verified **on hardware** before advancing. You compile/upload

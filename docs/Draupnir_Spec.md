@@ -444,12 +444,16 @@ containing `draupnir`, case-insensitive, or the NUS service UUID), so the name i
 humans, not a protocol constant: a new board picks a new name without an app change. When the scan
 finds more than one, the app asks which to connect to; with one, it connects straight through.
 
-### Config Mode gate (M5Dial only)
-The M5Dial serves **no config command outside `CONFIG_MODE`** (entered by swiping down on the
-dial) and answers everything else with `{"status":"error","message":"Not in Config Mode"}`. The
-link is healthy in that case — the device answered, it just refused — so the app surfaces it as
-its own state with the gesture to make, not as a connection failure. The Waveshare has no such
-mode; it gates on the encrypted link instead.
+### Config Mode *(M5Dial only — no longer a gate, as of 2026-09-06)*
+The M5Dial used to serve **no config command outside `CONFIG_MODE`**, answering everything else
+with `{"status":"error","message":"Not in Config Mode"}`. That check is **removed**: it was a
+physical-presence gate, not authentication, and it stopped nothing once the user swiped down. Both
+boards now gate on the encrypted, authenticated link instead.
+
+`CONFIG_MODE` survives as an **informational screen** — swipe down to see the board's BLE name and
+whether the app is attached. It authorizes nothing. The app keeps its "Config Mode required" panel
+as a **fallback for an M5Dial still running pre-gate firmware**, where the message is still
+correct.
 
 ### Security — standard BLE pairing
 - **Pairing:** the device displays a passkey on screen (IO capability = DisplayOnly); the user
@@ -464,13 +468,28 @@ mode; it gates on the encrypted link instead.
 Why this matters more than it sounds: the device is a **keyboard**. An unauthenticated write path
 is arbitrary keystroke injection into the attached host, plus profile exfiltration.
 
-**Enforced on the Waveshare only, as of 2026-08-29.** `ble_engine.cpp` sets
-`ESP_LE_AUTH_REQ_SC_MITM_BOND` with `ESP_IO_CAP_OUT` and carries `_ENC`/`_AUTHEN` permission flags
-on the characteristics. The **M5Dial does none of this** — no `BLESecurity` block, no passkey, no
-permission flags — so its config channel has no cryptographic access control at all; the only gate
-is Config Mode, a physical gesture, which is not a security control. Closing this is the next
-milestone after M8b. Note the practical consequence for anyone testing: **there is nothing to pair
-with on the M5Dial**, and attempting to bond it from the phone's Bluetooth settings will fail.
+**Enforced on both boards, as of 2026-09-06.** Each sets `ESP_LE_AUTH_REQ_SC_MITM_BOND` with
+`ESP_IO_CAP_OUT`, displays a per-connection passkey, and carries `_ENC`/`_AUTHEN` permission flags
+on the RX characteristic plus `_ENC` on TX. The M5Dial additionally refuses, at the command
+handler, anything arriving on a link whose `sec_state` is not `encrypted && authenticated`, and
+logs that state on every accepted command — a backstop in case the permission flags ever silently
+stop enforcing, which is this API's known failure mode.
+
+**Proven by refusal, not just by acceptance, on both boards.** Each gate was tested with a hostile
+central that declined pairing and then attempted to write: the Waveshare on 2026-08-07, the M5Dial
+on 2026-09-07. In both cases the command handler never saw the bytes. This is the criterion that
+matters — a gate that accepts authorized traffic proves nothing about what it refuses — and it is
+why the M5Dial's claim was held as explicitly *unverified* for a day after its positive-path round
+passed, rather than being folded in.
+
+Belt-and-braces behind the flags, on the M5Dial: a `#error` plus two `static_assert`s make a
+silently-zero permission flag a compile error (the assert was confirmed to actually fire by
+inverting it), and the command handler independently refuses any link whose `sec_state` is not
+`encrypted && authenticated`, logging that state on every accepted command.
+
+Going from no security to bonding is a **breaking change** for existing M5Dial users: the old
+device entry must be removed from the phone's Bluetooth settings before the app will work again.
+Observed on hardware — after removing the stale entry, pairing proceeds normally.
 
 ### Editing flow
 Edit profiles and macros; assign name, color, icon, mode, and action sequence; reorder; set
@@ -526,6 +545,7 @@ Honest status, not aspiration.
 | M8 | **On-device profile switching** with directional indicators | **Done (2026-08-13)**, verified on hardware — grew beyond its original scope, see note below |
 | M8b | **Uncap `pos`** — key running-macro state by identity, not slot; bump the default to `version: 3` and actually check it | **Done (2026-08-26)**, verified on hardware 2026-08-29 — both boards, full criteria list |
 | M9 | **Icons on the ring** + dial orientation + rotary macro mode — encoder detent alignment dropped, see note below | **Done (2026-08-22)**, verified on hardware — Waveshare 2026-08-22, M5Dial icon-merge 2026-08-25 |
+| M5Dial security gate | **Close the second board's config channel** — BLE pairing/bonding + GATT permission flags, delete Wi-Fi and the LAN-reachable web API, atomic profile write, passkey screen | **Done (2026-09-06)**, verified on hardware — positive path 2026-09-06, hostile-central negative test 2026-09-07 (§7) |
 | M10 | Polish — buzzer/haptic feedback, export/import | **Open** — brightness UI, originally listed here, was delivered as part of M7/M8 |
 
 **M6:** done-criterion was the H1 negative test, which passed on hardware 2026-08-07 — an
@@ -563,10 +583,10 @@ rather than silently rewriting the milestone description:
   detent) was measured, traced to the physical switch rather than firmware, and deliberately
   accepted rather than fixed with a lockout window that would also cap deliberate fast turning.
 
-**Verified on the Waveshare only.** The M5Dial half of M9 — porting the icon-merge fix that closes
-a live data-loss bug (editing one macro was wiping every other macro's icon) — compiled cleanly
-against the M5Dial FQBN and was code-reviewed, but the board has not been flashed this milestone.
-Its acceptance criterion has not been run. See `docs/HANDOFF.md` for the full breakdown.
+**Verified on both boards.** The Waveshare half was signed off 2026-08-22. The M5Dial half —
+porting the icon-merge fix that closes a live data-loss bug (editing one macro was wiping every
+other macro's icon) — was flashed and its acceptance criterion run on **2026-08-25**: editing one
+macro no longer wipes the icons on the others. See `docs/HANDOFF.md` §4 for the full breakdown.
 
 ---
 
