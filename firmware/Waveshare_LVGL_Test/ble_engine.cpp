@@ -261,6 +261,25 @@ static void handleBleCommand(char *cmdStr) {
       return;
     }
 
+    // Refuse a document from a NEWER schema before anything touches flash. Placed here, ahead of
+    // the icon merge and the temp-write, so a refusal leaves the stored profiles completely
+    // untouched -- the atomic write's guarantee is about power loss, not about us choosing to
+    // commit a document we cannot interpret.
+    //
+    // Reported back to the app rather than dropped: a save that silently does nothing is the
+    // failure mode this whole check exists to remove.
+    if (!profiles_schema_version_ok(profilesObj)) {
+      int ver = profilesObj["version"] | 0;
+      Serial.printf("[ble] save_profiles: REFUSED, document declares version %d, firmware understands %d\n",
+                    ver, SCHEMA_VERSION);
+      char msg[128];
+      snprintf(msg, sizeof(msg),
+               "{\"status\":\"error\",\"message\":\"Schema version %d not supported (max %d) -- update the firmware\"}",
+               ver, SCHEMA_VERSION);
+      sendBleMessage(msg);
+      return;
+    }
+
     // The app sends its WHOLE in-memory document on save, and only ever writes icon_xbm for the
     // macro being edited (editor_panel.dart:106). Combined with stripping on read, that means
     // editing one macro would wipe every other macro's icon. This is a live bug on the M5Dial
