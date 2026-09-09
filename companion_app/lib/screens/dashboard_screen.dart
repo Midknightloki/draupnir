@@ -1,10 +1,16 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:file_selector/file_selector.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:provider/provider.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
 import '../state/draupnir_state.dart';
+import '../services/profile_transfer.dart';
 import '../theme.dart';
 import 'editor_panel.dart';
 
@@ -61,9 +67,178 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
+  Future<void> _exportConfig(DraupnirState state) async {
+    final doc = await state.fetchProfilesForExport();
+    if (doc == null) return; // state.error is set and already rendered
+    await _writeEnvelope(buildConfigEnvelope(doc), 'draupnir-config');
+  }
+
+  Future<void> _exportProfile(DraupnirState state, int profileIdx) async {
+    final doc = await state.fetchProfilesForExport();
+    if (doc == null) return;
+    final profiles = doc['profiles'] as List;
+    if (profileIdx < 0 || profileIdx >= profiles.length) return;
+    final profile = Map<String, dynamic>.from(profiles[profileIdx] as Map);
+    final safeName = profile['name']
+        .toString()
+        .replaceAll(RegExp(r'[^A-Za-z0-9._-]+'), '-')
+        .toLowerCase();
+    await _writeEnvelope(
+        buildProfileEnvelope(profile, doc), 'draupnir-profile-$safeName');
+  }
+
+  /// Writes the envelope to a temp file and hands it to the OS share sheet.
+  ///
+  /// NOT a save dialog: file_selector's getSaveLocation is unimplemented on Android. The Android
+  /// plugin (file_selector_android 0.5.2+8) overrides only openFile, openFiles and
+  /// getDirectoryPath, so getSaveLocation falls through to the platform interface default, which
+  /// throws UnimplementedError. Import still uses openFile, which IS implemented -- that
+  /// asymmetry is why the import half worked while export silently did nothing.
+  ///
+  /// The share sheet is also the better fit: "share a profile with someone else" is one of the
+  /// three purposes this feature exists for, and it lets the user put the file in Drive, Files,
+  /// email or Nearby Share without us picking a directory for them.
+  ///
+  /// Directory.systemTemp is the app's own cache dir on Android, so no path_provider is needed
+  /// and the file is cleaned up by the OS. share_plus copies it out via a FileProvider.
+  Future<void> _writeEnvelope(
+      Map<String, dynamic> envelope, String suggestedName) async {
+    try {
+      final bytes =
+          utf8.encode(const JsonEncoder.withIndent('  ').convert(envelope));
+      final file = File('${Directory.systemTemp.path}/$suggestedName.json');
+      await file.writeAsBytes(bytes, flush: true);
+
+      final result = await SharePlus.instance.share(ShareParams(
+        files: [XFile(file.path, mimeType: 'application/json')],
+        subject: '$suggestedName.json',
+      ));
+
+      if (!mounted) return;
+      if (result.status == ShareResultStatus.success) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Export shared.')),
+        );
+      }
+      // dismissed/unavailable need no message -- the user backed out deliberately.
+    } catch (e) {
+      // Never fail silently. The first version of this threw UnimplementedError into an async
+      // gap with no UI at all, which presented as "I tapped Export and nothing happened".
+      if (!mounted) return;
+      await _alert('Export failed', '$e');
+    }
+  }
+
+  Future<void> _importFile(DraupnirState state) async {
+    ParsedTransfer parsed;
+    try {
+      final XFile? file = await openFile(
+        acceptedTypeGroups: const [
+          XTypeGroup(label: 'Draupnir export', extensions: ['json'])
+        ],
+      );
+      if (file == null) return; // user cancelled
+      parsed = parseEnvelope(utf8.decode(await file.readAsBytes()));
+    } on TransferException catch (e) {
+      if (!mounted) return;
+      await _alert('Can\'t import that file', e.message);
+      return;
+    } catch (e) {
+      // Picker or read failure, as opposed to a bad file. Same rule as export: never fail
+      // silently into an async gap.
+      if (!mounted) return;
+      await _alert('Couldn\'t open that file', '$e');
+      return;
+    }
+
+    final above = countMacrosAbovePos15(parsed);
+    final isConfig = parsed.isConfig;
+    final buffer = StringBuffer();
+    if (isConfig) {
+      final n = (parsed.payload['profiles'] as List).length;
+      buffer.writeln(
+          'This replaces everything on your Draupnir with $n profile(s) from this file.');
+    } else {
+      buffer.writeln(
+          'This adds "${parsed.payload['name']}" as a new profile. Nothing is overwritten.');
+    }
+    if (above > 0) {
+      buffer.writeln();
+      // Phrased as a property of the profile, not of the device: the app can only identify a
+      // board by its advertised name, and the spec is explicit that the name is a label for
+      // humans, not a protocol constant.
+      buffer.writeln(
+          '$above macro(s) sit above ring position 15. They transfer and fire normally, '
+          'but will not appear on the M5Dial\'s 16-dot ring.');
+    }
+    buffer.writeln();
+    buffer.write('You can undo this straight afterwards.');
+
+    if (!mounted) return;
+    final go = await _confirm(
+        isConfig ? 'Replace everything?' : 'Add this profile?',
+        buffer.toString());
+    if (go != true) return;
+
+    final ok = await state.importTransfer(parsed);
+    if (!mounted) return;
+    if (ok) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('Import complete.'),
+          action: SnackBarAction(
+            label: 'UNDO',
+            onPressed: () => state.undoImport(),
+          ),
+          duration: const Duration(seconds: 8),
+        ),
+      );
+    }
+  }
+
+  Future<void> _alert(String title, String body) => showDialog<void>(
+        context: context,
+        builder: (c) => AlertDialog(
+          title: Text(title),
+          content: Text(body),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(c), child: const Text('OK'))
+          ],
+        ),
+      );
+
+  Future<bool?> _confirm(String title, String body) => showDialog<bool>(
+        context: context,
+        builder: (c) => AlertDialog(
+          title: Text(title),
+          content: Text(body),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(c, false),
+                child: const Text('CANCEL')),
+            TextButton(
+                onPressed: () => Navigator.pop(c, true),
+                child: const Text('CONTINUE')),
+          ],
+        ),
+      );
+
   // No auto-connect on launch: BLE is the only transport now (the Wi-Fi/HTTP path is gone with
   // the web UI), and a BLE scan is an explicit user action, not something to fire off in
   // initState.
+
+  @override
+  void initState() {
+    super.initState();
+    // Local prefs read only — deliberately NOT a connection attempt. The comment above about
+    // not auto-connecting in initState still stands; this starts no scan and touches no radio.
+    // It only decides whether "Undo Last Import" appears in the menu after an app restart.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      context.read<DraupnirState>().loadImportSnapshotState();
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -99,6 +274,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 case 'debug':
                   _showDebugLog(state);
                   break;
+                case 'export_config':
+                  _exportConfig(state);
+                  break;
+                case 'export_profile':
+                  _exportProfile(state, state.activeProfileIdx);
+                  break;
+                case 'import':
+                  _importFile(state);
+                  break;
+                case 'undo_import':
+                  state.undoImport();
+                  break;
               }
             },
             itemBuilder: (context) => [
@@ -118,6 +305,38 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   title: Text('Debug Log (${state.debugLog.length})'),
                 ),
               ),
+              const PopupMenuDivider(),
+              // Export performs a fresh fetch and import ends in a save, so both are meaningless
+              // without a live link. Undo is gated only on a snapshot existing, so it survives a
+              // reconnect.
+              if (state.profilesData != null && state.isBluetooth)
+                const PopupMenuItem(
+                  value: 'export_config',
+                  child: ListTile(
+                      leading: Icon(Icons.backup_outlined),
+                      title: Text('Export All Profiles')),
+                ),
+              if (state.profilesData != null && state.isBluetooth)
+                const PopupMenuItem(
+                  value: 'export_profile',
+                  child: ListTile(
+                      leading: Icon(Icons.ios_share),
+                      title: Text('Export This Profile')),
+                ),
+              if (state.profilesData != null && state.isBluetooth)
+                const PopupMenuItem(
+                  value: 'import',
+                  child: ListTile(
+                      leading: Icon(Icons.file_open_outlined),
+                      title: Text('Import From File')),
+                ),
+              if (state.hasImportSnapshot)
+                const PopupMenuItem(
+                  value: 'undo_import',
+                  child: ListTile(
+                      leading: Icon(Icons.undo),
+                      title: Text('Undo Last Import')),
+                ),
             ],
           ),
           const SizedBox(width: 8),

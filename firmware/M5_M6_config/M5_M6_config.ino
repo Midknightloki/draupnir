@@ -812,11 +812,18 @@ static const char ICON_XBM_MARKER[] = ",\"icon_xbm\":\"";
 // message with the '\n' delimiter, then call flushRemainder() and check failed.
 class BleChunkSink : public Print {
 public:
+  // Stripping is the default because it is the common path: the app only needs icon *names*,
+  // and the 18x18 bitmaps are display-side data it never renders. Export is the exception --
+  // it needs the bitmaps to travel, or a profile shared to another device silently loses every
+  // custom icon. See the export/import design doc.
+  explicit BleChunkSink(bool stripIcons = true) : _stripIcons(stripIcons) {}
+
   bool failed = false;     // sticky: set when a chunk exhausts its ack retries
   size_t totalSent = 0;    // bytes emitted after icon_xbm stripping (for logging)
 
   size_t write(uint8_t c) override {
     if (failed) return 0;
+    if (!_stripIcons) return emit(c) ? 1 : 0; // export path: no marker matching at all
     if (_skipping) {
       // Swallowing an icon_xbm hex value: it contains no quotes or escapes, so it ends at the
       // next '"' (also swallowed — the marker's opening quote was never emitted).
@@ -878,6 +885,7 @@ private:
   uint8_t _seq = 0;      // same per-message sequence numbering the app already dedups on
   int _matched = 0;      // bytes of ICON_XBM_MARKER currently matched (withheld)
   bool _skipping = false; // inside an icon_xbm hex value
+  bool _stripIcons = true; // false => forward icon_xbm through untouched (export path)
 
   bool emit(uint8_t c) {
     _buf[_fill++] = c;
@@ -975,14 +983,15 @@ void handleBleCommand(char *cmdStr) {
     // (the {"status":"ok","profiles":} corruption). See BleChunkSink for details.
     Serial.printf("get_profiles: heap before: free=%u largestBlock=%u\n",
                   (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+    bool includeIcons = req["include_icons"] | false;
     bleSendPreamble();
-    BleChunkSink sink;
+    BleChunkSink sink(!includeIcons);
     sink.print("{\"status\":\"ok\",\"profiles\":");
-    serializeJson(profilesDoc, sink);           // icon_xbm stripped on the fly by the sink
+    serializeJson(profilesDoc, sink);           // icon_xbm stripped by the sink unless exporting
     sink.print("}\n");                           // '\n' = end-of-message delimiter for the app
     if (sink.flushRemainder()) {
-      Serial.print("get_profiles: streamed bytes = ");
-      Serial.println(sink.totalSent);
+      Serial.printf("get_profiles: streamed bytes = %u (icons=%d)\n",
+                    (unsigned)sink.totalSent, includeIcons ? 1 : 0);
       Serial.println("BLE TX: sent");
     } else {
       Serial.println("get_profiles: send aborted (chunk ack retries exhausted)");
