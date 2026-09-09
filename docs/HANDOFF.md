@@ -13,7 +13,9 @@ or the owner. It assumes **no prior context**.
 |---|---|
 | `CLAUDE.md` / `AGENTS.md` | Persona, locked decisions, threading rules, FQBNs. Identical copies — **edit both together.** |
 | `docs/Draupnir_Spec.md` (v3) | The brief. Concept, hardware, data model, BLE protocol, milestones (§10 has the current state). |
-| `docs/superpowers/specs/2026-09-03-m5dial-security-gate-design.md` | The design the **most recent** work (the M5Dial security gate) was built against. |
+| `docs/superpowers/specs/2026-09-07-profile-export-import-design.md` | The design the **most recent** work (profile export/import) was built against. |
+| `docs/superpowers/plans/2026-09-07-profile-export-import.md` | Its task-by-task implementation plan. |
+| `docs/superpowers/specs/2026-09-03-m5dial-security-gate-design.md` | The design the M5Dial security gate was built against. |
 | `docs/superpowers/plans/2026-09-03-m5dial-security-gate.md` | Its task-by-task implementation plan. |
 | `docs/superpowers/specs/2026-08-26-m8b-uncap-pos-design.md` | The design the previous milestone (M8b) was built against. |
 | `.superpowers/sdd/2026-08-26-m8b-uncap-pos/progress.md` | M8b's execution ledger, including its hardware verification and the BLE-naming follow-on. |
@@ -46,12 +48,33 @@ is a keyboard — are deleted outright. Both supported boards are now on the sam
 and both are proven by **refusal**, not merely by acceptance: the hostile-central test passed on
 the Waveshare 2026-08-07 and on the M5Dial 2026-09-07. Nothing security-related is outstanding.
 
+**Profile export/import is built and verified on the M5Dial** (2026-09-08) — an enveloped JSON
+file, whole-config restore, single-profile sharing via the OS share sheet, and an undo that
+survives an app restart. One criterion is deliberately still open: the **cross-device** transfer,
+which is the only test that can prove custom icons actually travel. See §4 and §6 Step 1.
+
 ---
 
 ## 3. Where things stand
 
-Branch **`feat/m5dial-security-gate`**, 6 commits ahead of `feat/m8b-uncap-pos`, which it branches
-from:
+Branch **`feat/profile-export-import`**, 8 commits ahead of `feat/m5dial-security-gate`:
+
+```
+555d378  feat: get_profiles include_icons on the Waveshare
+cab5bec  feat: get_profiles include_icons on the M5Dial
+37a42bb  feat: profile transfer envelope, with tests
+1575b8a  feat: fetch profiles with icons, for export only
+a5940b4  feat: import, pre-import snapshot, and undo
+02547d0  feat: export/import UI with cross-device warning and undo
+d214be2  fix: export via the OS share sheet — getSaveLocation is a no-op on Android
+```
+
+`d214be2` is a fix for a bug in this branch's own Task 6, not pre-existing — see §4. This branch
+adds the first real unit tests in the repo (`companion_app/test/profile_transfer_test.dart`, 16
+cases); `flutter test` is now a meaningful gate for Dart code, though the firmware still has none.
+
+Under it, branch **`feat/m5dial-security-gate`** is 8 commits ahead of `feat/m8b-uncap-pos`, which
+it branches from:
 
 ```
 7384294  feat: delete the M5Dial web server and all Wi-Fi
@@ -67,8 +90,9 @@ exposed, and it is the reason reconnect appeared broken. See §4 and finding 5.
 
 Under it, branch **`feat/m8b-uncap-pos`** is 9 commits ahead of `feat/m9-icons-orientation-rotary`,
 which it branches from. `review/waveshare-m6-foundation` is the integration branch every milestone
-PRs into: PR #2 (M7/M8) and PR #3 (M9) are merged there, PR #4 (M9's M5Dial verification docs) and
-PR #5 (M8b) are still open. **Merge order: #4, then #5, then this branch.**
+PRs into: PR #2 (M7/M8) and PR #3 (M9) are merged there, PR #4 (M9's M5Dial verification docs),
+PR #5 (M8b) and PR #6 (the security gate) are still open.
+**Merge order: #4, then #5, then #6, then this branch.**
 
 ```
 295dc5a  docs: M8b design — uncap pos, schema v3
@@ -239,7 +263,65 @@ reboot cleared it. Pre-existing, not introduced by the gate; it was simply unrea
 someone reconnected the M5Dial twice in one power cycle. Fixed by porting the Waveshare's 10 ms
 window (`1c7e3b8`).
 
+### Verified on hardware — profile export/import, 2026-09-08
+
+M5Dial flashed (hash verified) and the debug APK installed on a Pixel 10 Pro, with a direct
+`SerialPort` capture alongside. The exported files were validated by parsing them, not by eye.
+
+- **No regression on the path every fetch uses** — a normal `get_profiles` still strips icons:
+  `streamed bytes = 12420 (icons=0)`. This was the gate.
+- **`include_icons: true` works end to end** — `streamed bytes = 12678 (icons=1)`, and the
+  arithmetic reconciles exactly: 258 bytes more than the stripped fetch, which is two icons at 122
+  bytes (`,"icon_xbm":"` + 108 hex + `"`) plus one macro carrying an *empty* `icon_xbm` at 14. The
+  passthrough is byte-exact, not approximately right.
+- **The exported file is complete and correct.** 41,154 bytes, parses cleanly — so the bypass
+  path's single-flush is right and the tail is not truncated. Envelope carries
+  `draupnir: "config"`, `schema: 2`, `exported`, `payload`; 3 profiles, 4 settings keys, 24 macros,
+  **2 with real `icon_xbm` bitmaps**.
+- **`schema` carries the source document's own version.** The file says `schema: 2` and
+  `payload.version: 2`. Writing `3` (the app's maximum) would have mislabelled a v2 document in a
+  way the importer could not detect.
+- **Import restores**, with icons still rendering on the ring, and `save_profiles: committed 12650
+  bytes` on the device.
+- **Single-profile export** produces a valid `draupnir: "profile"` envelope (2,483 bytes).
+- **A bad `schema` is refused** by the app before anything is sent to the device.
+- **Undo works and survives an app restart** — the `shared_preferences` snapshot outlives the
+  process, which an in-memory undo would not.
+- **Abrupt client disappearance is handled.** Force-closing the app mid-transfer produced
+  `send aborted (chunk ack retries exhausted)` followed by a clean re-advertise and reconnect at
+  `encrypted=1 authenticated=1 bonded=1`. Correct recovery, not a fault.
+
+**A design call this round vindicated:** the owner's live config contains **6 macros with no `pos`
+field at all**. The spec deliberately forbade an app-side "every macro must have a `pos`" check
+because the firmware tolerates its absence. Had that seemingly obvious validation been added, the
+owner's own config would have been rejected on import.
+
+**The bug this round found, and what hid it.** Export silently did nothing at first:
+`file_selector_android 0.5.2+8` overrides only `openFile`, `openFiles` and `getDirectoryPath`, so
+`getSaveLocation()` falls through to the platform-interface default, which **throws
+`UnimplementedError`** — into an async gap with no UI. The asymmetry is the lesson: **import uses
+`openFile`, which IS implemented, so watching import work said nothing about export.** Fixed by
+writing to `Directory.systemTemp` and handing the file to the OS share sheet (`share_plus`), which
+also serves the "share a profile with someone else" purpose better than a save dialog would. Both
+export and import now surface failures in a dialog — the original defect was not merely the wrong
+API, it was the wrong API failing invisibly.
+
 ### NOT verified — read this before assuming otherwise
+
+- **The cross-device transfer — export from one board, import to the other.** This is *the*
+  criterion for this feature and it has not been run: the Waveshare was off-site. Everything above
+  was done on the M5Dial alone, and a same-device round trip **structurally cannot** prove icons
+  travelled: `save_profiles` merges stored bitmaps back in by `pos`, so the device commits an
+  identical document whether or not the file contained any. What *is* proven is that the export
+  half writes real `icon_xbm` bytes into the file. What is not proven is that the import half
+  delivers them to a device that does not already have them. Run it when the Waveshare returns:
+  export a profile with custom icons from the M5Dial, import it to the Waveshare, and look at the
+  ring.
+- **Importing a file with no `draupnir` key.** Not exercised on device. The rejection logic is
+  covered by a passing unit test (`parseEnvelope rejects a file with no draupnir key`), and the UI
+  path to it — `parseEnvelope` → `TransferException` → alert dialog — is the same one the
+  bad-`schema` test did exercise, so the wiring is proven and only that branch is untested. Cheap
+  to close: pick any unrelated `.json`.
 
 - **Frame pacing at high macro counts.** Still unmeasured — all M9 hardware testing ran against
   small profiles. This is now a harder question than it was at the end of M7/M8: the ring draw
@@ -372,19 +454,46 @@ and is verified on hardware — positive path 2026-09-06, hostile-central negati
 Both supported boards now enforce pairing, bonding and GATT permission flags, and both claims are
 backed by a real refusal test rather than by inference. Nothing security-related is outstanding.
 
-### Step 1 — M10, polish
+### Step 1 — Finish verifying export/import *(needs the Waveshare)*
 
-Buzzer/haptic feedback and export/import.
+Export/import is **built and verified on the M5Dial** (§4), on branch `feat/profile-export-import`.
+What remains is the criterion that actually proves it: **export a profile with custom icons from
+one board and import it to the other.** A same-device round trip cannot establish that icons
+travel, because `save_profiles` merges stored bitmaps back by `pos` regardless. Ten minutes once
+both boards are on the desk.
 
-**Diagnose the haptics blocker before scoping the milestone.** `haptics_init()` breaks the CST816
-touch controller (§8) — a hardware interaction, not an effort problem, and it is the one item that
-could change M10's shape. Both sit on the same I²C bus, which makes address conflict, bus timing,
-or a shared-reset interaction the obvious first hypotheses; none has been tested. Until that is
-understood, "buzzer/haptic feedback" cannot be honestly estimated, and export/import is the part of
-M10 that is merely work.
+### Step 2 — M10's remaining half, and polish
 
-Note that export/import touches the schema and the app rather than either board's display layer,
-so it is the half that stays shared — worth doing first if the haptics diagnosis drags.
+Buzzer/haptic feedback — **tabled**, see the DRV2605 note in §6 above: run the I²C scan before
+debugging the CST816 conflict.
+
+M10 as originally written is **two independent subsystems** and should be decomposed: export/import
+(shared schema + app, no hardware dependency) and buzzer/haptic feedback (blocked). They get
+separate designs.
+
+**Haptics is TABLED as of 2026-09-07** — the Waveshare is off-site — and the reason to revisit it
+is narrower than "debug an I²C conflict":
+
+> **Check first whether the DRV2605 exists at all.** `haptics.cpp:12` states the address is *"an
+> assumption from the datasheet, not from a verified schematic"*, and the §3 hardware table lists
+> no haptic driver and no buzzer for the Waveshare. That table is derived from the firmware, so it
+> is not proof of absence — but nobody has ever confirmed the chip is on the bus. The commit that
+> added haptics (`982946d`) describes it as restoring "feedback the M5Dial build had", and what
+> the M5Dial has is a **speaker**, which already beeps on every action. So the M5Dial half of
+> "buzzer feedback" is arguably already shipped, and the Waveshare half may be driving a chip that
+> is not there.
+>
+> **The diagnostic is already written.** `haptics_init()` opens with an `i2c_scan()` that probes
+> all 112 addresses and logs whatever answers. Uncomment the call, flash, read the serial log —
+> touch will break for that boot, which does not matter, because a broken touchscreen still prints
+> to serial. One flash, one log read, and it forks the work:
+>   - **Only `0x15` answers** → no DRV2605. Not a firmware task at all; it is a P2 hardware item.
+>     Park or delete `haptics.cpp`, and the CST816 bug becomes moot.
+>   - **`0x5A` answers too** → the motor is real and it is the I²C ordering bug. *Then* run the
+>     three-step single-variable bisect already written at `Waveshare_LVGL_Test.ino:1519`.
+>
+> Do the scan before the bisect. Debugging the conflict is only worth it if something is on the
+> other end.
 
 ### Also worth doing, not blocking
 

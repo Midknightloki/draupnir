@@ -436,6 +436,18 @@ number and the app echoes a 2-byte `[0xFE, seq]` ack; the device resends on time
 
 Commands: `get_profiles`, `save_profiles`, `trigger`.
 
+`get_profiles` takes one optional flag, `"include_icons": true`. Absent or false — the common path
+— strips every `,"icon_xbm":"<hex>"` pair from the response on the fly, because the app needs only
+the icon *name*; the 18×18 1bpp bitmap is display-side data it never renders. True passes them
+through, and exists so that **export** can put the bitmaps in a file. Without it a shared or
+transferred profile silently loses every custom icon.
+
+The two boards implement the flag differently, and this is worth knowing before editing either:
+the Waveshare *composes* `IconXbmFilterSink` around `BleChunkSink`, so the icon path **bypasses**
+the filter (and correspondingly performs only the sink's flush — the filtered path needs both, and
+getting that wrong truncates the response tail into what looks like malformed JSON); the M5Dial
+*folds* the stripping into `BleChunkSink` itself, so its sink takes a constructor flag instead.
+
 ### Advertised names *(2026-08-29)*
 Each board advertises a distinct name — Waveshare = **`Draupnir`**, M5Dial = **`Draupnir_Mini`** —
 because both were previously `Draupnir` and the app connected to whichever answered the scan
@@ -546,7 +558,8 @@ Honest status, not aspiration.
 | M8b | **Uncap `pos`** — key running-macro state by identity, not slot; bump the default to `version: 3` and actually check it | **Done (2026-08-26)**, verified on hardware 2026-08-29 — both boards, full criteria list |
 | M9 | **Icons on the ring** + dial orientation + rotary macro mode — encoder detent alignment dropped, see note below | **Done (2026-08-22)**, verified on hardware — Waveshare 2026-08-22, M5Dial icon-merge 2026-08-25 |
 | M5Dial security gate | **Close the second board's config channel** — BLE pairing/bonding + GATT permission flags, delete Wi-Fi and the LAN-reachable web API, atomic profile write, passkey screen | **Done (2026-09-06)**, verified on hardware — positive path 2026-09-06, hostile-central negative test 2026-09-07 (§7) |
-| M10 | Polish — buzzer/haptic feedback, export/import | **Open** — brightness UI, originally listed here, was delivered as part of M7/M8 |
+| M10 (export/import) | **Profile export/import** — `include_icons`, an enveloped JSON file, whole-config restore and single-profile share, pre-import snapshot with undo | **Done (2026-09-08)**, verified on hardware — M5Dial only; the cross-device transfer is **not** yet verified (§4 of HANDOFF) |
+| M10 (haptics) | Buzzer/haptic feedback | **Tabled** — check whether a DRV2605 is on the Waveshare bus at all before debugging the CST816 conflict; see `docs/HANDOFF.md` §6 |
 
 **M6:** done-criterion was the H1 negative test, which passed on hardware 2026-08-07 — an
 unbonded central wrote to the RX characteristic and the command handler never received the bytes,
