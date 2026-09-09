@@ -1,25 +1,37 @@
-# Kickoff prompt for the new chat
+# Kickoff — picking this project up in a fresh agent session
 
-Set up the new Claude Project first:
-1. Create a new Project, choose **Sonnet** as the model.
-2. Put the contents of `CLAUDE.md` into the Project's **custom instructions**.
-3. Attach the repo (or at least `docs/Draupnir_Spec.md`, `docs/M0_Setup_and_BringUp.md`,
-   and `firmware/M0_bringup/M0_bringup.ino`) as Project knowledge.
+The agent auto-reads **`AGENTS.md`** (Antigravity) or **`CLAUDE.md`** (Claude Code) for full
+context: persona = Eitri, locked decisions, board facts, threading rules, arduino-cli.
+Those two files are copies of each other — edit both together.
 
-Then paste this as your first message:
+Read `docs/Draupnir_Spec.md` (v3) before any design work. It supersedes the two-puck /
+Wi-Fi-web-UI design that earlier docs and commits describe.
+
+First message to the agent:
 
 ---
-You are Eitri, FORGE Master for the L0k1.Net homelab. We're building **Draupnir** —
-see the project context and `docs/Draupnir_Spec.md`. The M5Dial is in hand and I've been
-setting up the Arduino toolchain per `docs/M0_Setup_and_BringUp.md`.
+You are Eitri, FORGE Master for the L0k1.Net homelab. Read `AGENTS.md` and
+`docs/Draupnir_Spec.md`. You have terminal + git + arduino-cli, so drive the build/flash
+yourself — I'll plug in the board, press G0 if it's the M5Dial, and tell you what the screen
+and Serial show.
 
-Status: I've just completed **M0** — the bring-up sketch runs and the screen, encoder,
-knob button, and touch all respond. (If I say otherwise, help me finish M0 first.)
+Current state: USB HID, the macro engine, the ring UI, the LittleFS profile store, and BLE
+config all work on hardware. Next up is **M6 — config hardening**, which is blocking:
+enforce BLE pairing on the config characteristics, make profile writes atomic with a
+parse-failure fallback, bound the BLE RX reassembly buffer, and stop running macros before a
+profile reload.
 
-Let's proceed to **M1 — USB HID hello**:
-1. Tell me exactly which board settings to change (USB Mode → TinyUSB, USB CDC On Boot),
-   and why.
-2. Give me a sketch where pressing the knob types a fixed string as a USB HID keyboard,
-   with the round screen showing HID status.
-3. Keep it incremental with a clear "what success looks like" checkpoint before we move on.
+Start by reading `firmware/Waveshare_LVGL_Test/ble_engine.cpp` and `macro_engine.cpp`, then
+propose the M6 change set before touching code.
 ---
+
+## Notes for the first session
+
+- **Untracked work.** Chunks of the Waveshare firmware may still be untracked. Check
+  `git status` and commit before anything destructive.
+- **Primary board** is the Waveshare ESP32-S3 knob (`firmware/Waveshare_LVGL_Test/`). The
+  M5Dial (`firmware/M5_M6_config/`) is a supported second target and still contains the
+  legacy web server + token pairing that v3 removes.
+- **Repo bootstrap**, if starting from a bare copy:
+  `.\scripts\bootstrap_repo.ps1 -Remote "https://github.com/<you>/draupnir.git"`
+  (omit `-Remote` to just commit locally).
