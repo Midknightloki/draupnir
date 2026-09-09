@@ -304,30 +304,51 @@ It is no longer capped at 15 and no longer implies a physical position. If the o
 ever returns, `pos` 0-15 maps to keys exactly as before — which is precisely why it stays rather
 than being replaced by an array index.
 
-**`version` bumps to 3** *when the uncapping actually ships.* The schema is a strict relaxation, so
-v3 firmware reads v2 files fine; the bump exists so *v2 firmware refuses a v3 file* rather than
-silently dropping every macro with `pos > 15`.
+**`version` is 3** as of M8b (2026-08-26). The schema is a strict relaxation — every v2 file is a
+valid v3 file — so v3 firmware reads v2 fine, and a document with no `version` at all is treated
+as legacy rather than as an error.
 
-> ### ⚠️ NOT YET IMPLEMENTED — this section is the target, not current behaviour
->
-> **The firmware still enforces the 16 cap, and the on-device default still declares
-> `"version": 2`.** `NUM_MACRO_SLOTS` is 16 and is baked into `runningMacros[]`,
-> `macros_is_running()`, `macros_stop_all()`, and `active_positions[]`;
-> `scan_active_positions()` scans only 0-15 and `macros_fire()` rejects `pos >= 16`. The companion
-> app's deck is likewise a hardcoded 16 cells, so no normal user flow can currently produce a
-> macro above 15.
->
-> A macro with `pos > 15` written by any *other* client — nRF Connect, a hand-crafted
-> `save_profiles`, a future desktop client — is silently **invisible and unfireable**: present in
-> flash and in `profilesDoc`, but never added to `active_positions[]`, never drawn, never
-> selectable, and rejected by `macros_fire()`.
->
-> **The default file deliberately stays at `version: 2` until this is true.** Declaring 3 while
-> still capping at 16 would be worse than not bumping at all — it would assert the relaxation to
-> other clients while breaking exactly the silent-drop the bump exists to prevent.
->
-> Uncapping properly means keying running-macro state by macro identity rather than by `pos`,
-> which is M8+ work. Tracked in §10.
+**The bump is backed by an actual check.** Both firmwares now refuse a document declaring a version
+*above* what they understand, rather than loading it and silently dropping whatever they cannot
+interpret. On load a refused file falls back to the built-in defaults; on BLE save it is rejected
+before anything reaches flash, and the refusal is reported to the app.
+
+> Correcting this section's earlier rationale, which claimed the bump existed so "v2 firmware
+> refuses a v3 file": it never did. No firmware read the field — the only occurrences in the tree
+> were the two default-JSON literals — so a v2 build handed a v3 file loaded it and dropped the
+> macros, which is exactly what the bump was supposed to prevent. That cannot be fixed
+> retroactively in already-deployed v2 builds. What the check buys is forward-looking: from v3
+> onward, a version a device does not understand is refused rather than mangled.
+
+### Limits
+
+| Limit | Value | What it governs |
+|---|---|---|
+| `MAX_MACROS` | **32** | Highest legal `pos` is 31. A data-model ceiling. |
+| `RUNNING_SLOTS` | **16** | Macros playing simultaneously. A RAM limit. |
+
+These were one number only because a single array served both jobs — `runningMacros[]` was indexed
+*by* `pos`, which is what actually enforced the cap. It is now a pool keyed by macro identity, so
+the two limits are independent.
+
+32 is headroom, not a usable ring size: at 32 macros a wedge spans 11° and the 45×45 px icons stop
+fitting somewhere around 16–20. Legibility binds long before the cap does.
+
+A fire arriving when all 16 running slots are busy is **refused and logged**, never allowed to evict
+a running macro — eviction can strand held modifiers or mouse buttons, since the stop-all path is
+the only one that releases HID state.
+
+### Accepted divergence: the M5Dial ring
+
+On the **M5Dial**, a macro above `pos` 15 stores, loads, fires and stops correctly, and is
+triggerable from the Companion App and over BLE — but **does not appear on that board's ring**,
+which is 16 fixed dots (`angle = -PI/2 + (i * PI*2/16.0)`) rather than the Waveshare's
+N-wedges-sized-to-fill.
+
+This is deliberate. M8b uncapped that board's *engine*, not its ring. Closing the gap means porting
+the dynamic wedge ring onto M5GFX at 240×240 without LVGL — most of the deferred M5Dial catch-up,
+with its own hardware rounds — and belongs with the M5Dial security gate and its non-atomic write,
+not here. It is the one place the two supported boards genuinely differ in what the user can reach.
 
 ### `settings.orientation` — dial rotation (shipped in M9)
 
@@ -415,6 +436,25 @@ number and the app echoes a 2-byte `[0xFE, seq]` ack; the device resends on time
 
 Commands: `get_profiles`, `save_profiles`, `trigger`.
 
+### Advertised names *(2026-08-29)*
+Each board advertises a distinct name — Waveshare = **`Draupnir`**, M5Dial = **`Draupnir_Mini`** —
+because both were previously `Draupnir` and the app connected to whichever answered the scan
+first, with no way to tell them apart or to choose. The app still **matches loosely** (any name
+containing `draupnir`, case-insensitive, or the NUS service UUID), so the name is a label for
+humans, not a protocol constant: a new board picks a new name without an app change. When the scan
+finds more than one, the app asks which to connect to; with one, it connects straight through.
+
+### Config Mode *(M5Dial only — no longer a gate, as of 2026-09-06)*
+The M5Dial used to serve **no config command outside `CONFIG_MODE`**, answering everything else
+with `{"status":"error","message":"Not in Config Mode"}`. That check is **removed**: it was a
+physical-presence gate, not authentication, and it stopped nothing once the user swiped down. Both
+boards now gate on the encrypted, authenticated link instead.
+
+`CONFIG_MODE` survives as an **informational screen** — swipe down to see the board's BLE name and
+whether the app is attached. It authorizes nothing. The app keeps its "Config Mode required" panel
+as a **fallback for an M5Dial still running pre-gate firmware**, where the message is still
+correct.
+
 ### Security — standard BLE pairing
 - **Pairing:** the device displays a passkey on screen (IO capability = DisplayOnly); the user
   enters it in the phone's pairing dialog. Bonding is stored so subsequent connects are silent.
@@ -427,6 +467,29 @@ Commands: `get_profiles`, `save_profiles`, `trigger`.
 
 Why this matters more than it sounds: the device is a **keyboard**. An unauthenticated write path
 is arbitrary keystroke injection into the attached host, plus profile exfiltration.
+
+**Enforced on both boards, as of 2026-09-06.** Each sets `ESP_LE_AUTH_REQ_SC_MITM_BOND` with
+`ESP_IO_CAP_OUT`, displays a per-connection passkey, and carries `_ENC`/`_AUTHEN` permission flags
+on the RX characteristic plus `_ENC` on TX. The M5Dial additionally refuses, at the command
+handler, anything arriving on a link whose `sec_state` is not `encrypted && authenticated`, and
+logs that state on every accepted command — a backstop in case the permission flags ever silently
+stop enforcing, which is this API's known failure mode.
+
+**Proven by refusal, not just by acceptance, on both boards.** Each gate was tested with a hostile
+central that declined pairing and then attempted to write: the Waveshare on 2026-08-07, the M5Dial
+on 2026-09-07. In both cases the command handler never saw the bytes. This is the criterion that
+matters — a gate that accepts authorized traffic proves nothing about what it refuses — and it is
+why the M5Dial's claim was held as explicitly *unverified* for a day after its positive-path round
+passed, rather than being folded in.
+
+Belt-and-braces behind the flags, on the M5Dial: a `#error` plus two `static_assert`s make a
+silently-zero permission flag a compile error (the assert was confirmed to actually fire by
+inverting it), and the command handler independently refuses any link whose `sec_state` is not
+`encrypted && authenticated`, logging that state on every accepted command.
+
+Going from no security to bonding is a **breaking change** for existing M5Dial users: the old
+device entry must be removed from the phone's Bluetooth settings before the app will work again.
+Observed on hardware — after removing the stale entry, pairing proceeds normally.
 
 ### Editing flow
 Edit profiles and macros; assign name, color, icon, mode, and action sequence; reorder; set
@@ -480,8 +543,9 @@ Honest status, not aspiration.
 | M6 | **Config hardening** — pairing enforcement, atomic writes, RX bounds, reload safety | **Done (2026-08-07)** — see note below |
 | M7 | **Persistence** — write `activeProfile` + brightness to NVS and honor them at boot | **Done (2026-08-08)**, verified on hardware |
 | M8 | **On-device profile switching** with directional indicators | **Done (2026-08-13)**, verified on hardware — grew beyond its original scope, see note below |
-| M8b | **Uncap `pos`** — key running-macro state by identity, not slot; then bump the default to `version: 3` | **Open** (see §6 warning) |
+| M8b | **Uncap `pos`** — key running-macro state by identity, not slot; bump the default to `version: 3` and actually check it | **Done (2026-08-26)**, verified on hardware 2026-08-29 — both boards, full criteria list |
 | M9 | **Icons on the ring** + dial orientation + rotary macro mode — encoder detent alignment dropped, see note below | **Done (2026-08-22)**, verified on hardware — Waveshare 2026-08-22, M5Dial icon-merge 2026-08-25 |
+| M5Dial security gate | **Close the second board's config channel** — BLE pairing/bonding + GATT permission flags, delete Wi-Fi and the LAN-reachable web API, atomic profile write, passkey screen | **Done (2026-09-06)**, verified on hardware — positive path 2026-09-06, hostile-central negative test 2026-09-07 (§7) |
 | M10 | Polish — buzzer/haptic feedback, export/import | **Open** — brightness UI, originally listed here, was delivered as part of M7/M8 |
 
 **M6:** done-criterion was the H1 negative test, which passed on hardware 2026-08-07 — an
@@ -519,10 +583,10 @@ rather than silently rewriting the milestone description:
   detent) was measured, traced to the physical switch rather than firmware, and deliberately
   accepted rather than fixed with a lockout window that would also cap deliberate fast turning.
 
-**Verified on the Waveshare only.** The M5Dial half of M9 — porting the icon-merge fix that closes
-a live data-loss bug (editing one macro was wiping every other macro's icon) — compiled cleanly
-against the M5Dial FQBN and was code-reviewed, but the board has not been flashed this milestone.
-Its acceptance criterion has not been run. See `docs/HANDOFF.md` for the full breakdown.
+**Verified on both boards.** The Waveshare half was signed off 2026-08-22. The M5Dial half —
+porting the icon-merge fix that closes a live data-loss bug (editing one macro was wiping every
+other macro's icon) — was flashed and its acceptance criterion run on **2026-08-25**: editing one
+macro no longer wipes the icons on the others. See `docs/HANDOFF.md` §4 for the full breakdown.
 
 ---
 

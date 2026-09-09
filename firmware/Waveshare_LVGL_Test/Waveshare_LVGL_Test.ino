@@ -14,9 +14,13 @@
 #define ENCODER_ECA_PIN 8
 #define ENCODER_ECB_PIN 7
 
-// Torus (donut) ring, dynamically divided into one wedge per ACTIVE macro (up to
-// NUM_MACRO_SLOTS) instead of always reserving all 16 slots -- fewer macros means fewer,
-// bigger wedges instead of wasted screen space on empty ones.
+// Torus (donut) ring, dynamically divided into one wedge per ACTIVE macro (up to MAX_MACROS)
+// instead of reserving a fixed number of slots -- fewer macros means fewer, bigger wedges instead
+// of wasted screen space on empty ones.
+//
+// Note that MAX_MACROS (32) is a data-model ceiling, not a usable ring size: at 32 macros a wedge
+// spans 11 degrees and the 45px icons stop fitting somewhere around 16-20. Legibility binds long
+// before the cap does.
 #define RING_OUTER_R 172
 #define RING_INNER_R 92
 #define RING_MID_R ((RING_OUTER_R + RING_INNER_R) / 2)
@@ -33,10 +37,11 @@
 #define HOTZONE_MIN_DX    60
 #define HOTZONE_MAX_DY    40
 
-// active_positions[v] = the profiles.json "pos" (0-15) shown at wedge v. selected_idx and all
-// wedge/label indices below are in terms of v (0..active_count-1), not raw pos -- macros_fire()
-// and profiles_find_macro() still take a real pos, so callers go through active_positions[].
-static int active_positions[NUM_MACRO_SLOTS];
+// active_positions[v] = the profiles.json "pos" (0..MAX_MACROS-1) shown at wedge v. selected_idx
+// and all wedge/label indices below are in terms of v (0..active_count-1), not raw pos --
+// macros_fire() and profiles_find_macro() still take a real pos, so callers go through
+// active_positions[]. That indirection is what let pos uncap without touching the ring code.
+static int active_positions[MAX_MACROS];
 static int active_count = 0;
 
 // ---- Settings menu ----------------------------------------------------------------------
@@ -266,10 +271,46 @@ static lv_opa_t pulse_overlay(bool *lighten) {
   return (lv_opa_t)((tri * PULSE_PEAK_OPA) / quarter);
 }
 
+// Collect the positions that EXIST, rather than probing every pos in a fixed range.
+//
+// The old form counted upward through the 16 slots and asked "is there a macro here?". That loop
+// bound WAS the cap -- it could not extend to an uncapped pos -- so the scan inverts: walk the
+// profile's macro array and take the positions it declares.
+//
+// THE SORT IS LOAD-BEARING. The old upward loop produced active_positions[] in ascending pos
+// order as a side effect of counting. Walking the array yields DOCUMENT order, which is whatever
+// the app happened to serialize. Ring wedge order is active_positions[] order, so without an
+// explicit sort the wedges reorder themselves -- and reorder DIFFERENTLY after each save, which
+// would present as the ring randomly rearranging rather than as an obvious bug.
 static void scan_active_positions(void) {
   active_count = 0;
-  for (int i = 0; i < NUM_MACRO_SLOTS; i++) {
-    if (!profiles_find_macro(i).isNull()) active_positions[active_count++] = i;
+  int n = profiles_active_macro_count();
+  for (int i = 0; i < n && active_count < MAX_MACROS; i++) {
+    int p = profiles_macro_pos_at(i);
+    if (p < 0 || p >= MAX_MACROS) {
+      Serial.printf("[diag] scan_active_positions: skipping macro %d, pos=%d out of range\n", i, p);
+      continue;
+    }
+    bool dup = false;
+    for (int j = 0; j < active_count; j++) {
+      if (active_positions[j] == p) { dup = true; break; }
+    }
+    if (dup) {
+      Serial.printf("[diag] scan_active_positions: skipping macro %d, duplicate pos=%d\n", i, p);
+      continue;
+    }
+    active_positions[active_count++] = p;
+  }
+
+  // Insertion sort: active_count is at most 32 and this runs only on reload/profile switch.
+  for (int i = 1; i < active_count; i++) {
+    int key = active_positions[i];
+    int j = i - 1;
+    while (j >= 0 && active_positions[j] > key) {
+      active_positions[j + 1] = active_positions[j];
+      j--;
+    }
+    active_positions[j + 1] = key;
   }
 }
 

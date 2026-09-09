@@ -1,6 +1,6 @@
 # Draupnir — Session Handoff
 
-*Written 2026-08-22. Pick up here.*
+*Written 2026-08-22, updated 2026-09-06 for the M5Dial security gate. Pick up here.*
 
 This is a continuation brief for whoever works on Draupnir next — another agent, a fresh session,
 or the owner. It assumes **no prior context**.
@@ -13,9 +13,13 @@ or the owner. It assumes **no prior context**.
 |---|---|
 | `CLAUDE.md` / `AGENTS.md` | Persona, locked decisions, threading rules, FQBNs. Identical copies — **edit both together.** |
 | `docs/Draupnir_Spec.md` (v3) | The brief. Concept, hardware, data model, BLE protocol, milestones (§10 has the current state). |
-| `docs/superpowers/specs/2026-08-20-m9-icons-orientation-rotary-design.md` | The design this milestone was built against. |
-| `docs/superpowers/plans/2026-08-20-m9-icons-orientation-rotary.md` | The task-by-task implementation plan. |
-| `.superpowers/sdd/2026-08-20-m9-icons-orientation-rotary/progress.md` | The full execution ledger for this milestone — every task, review finding, hardware round, and owner decision, in order. This document is a summary of it; the ledger is the source of truth. |
+| `docs/superpowers/specs/2026-09-03-m5dial-security-gate-design.md` | The design the **most recent** work (the M5Dial security gate) was built against. |
+| `docs/superpowers/plans/2026-09-03-m5dial-security-gate.md` | Its task-by-task implementation plan. |
+| `docs/superpowers/specs/2026-08-26-m8b-uncap-pos-design.md` | The design the previous milestone (M8b) was built against. |
+| `.superpowers/sdd/2026-08-26-m8b-uncap-pos/progress.md` | M8b's execution ledger, including its hardware verification and the BLE-naming follow-on. |
+| `docs/superpowers/specs/2026-08-20-m9-icons-orientation-rotary-design.md` | The design M9 was built against. |
+| `docs/superpowers/plans/2026-08-20-m9-icons-orientation-rotary.md` | M9's task-by-task implementation plan. |
+| `.superpowers/sdd/2026-08-20-m9-icons-orientation-rotary/progress.md` | The full execution ledger for M9 — every task, review finding, hardware round, and owner decision, in order. §3–§4 below summarise it; the ledger is the source of truth. |
 | `.superpowers/sdd/2026-08-07-m7-m8-persistence/progress.md` | The equivalent ledger for the previous milestone (M7/M8), still relevant background. |
 | `docs/Toolchain_arduino-cli.md` | **Read before touching hardware.** Board quirks below will otherwise cost you hours. |
 
@@ -27,18 +31,64 @@ Draupnir is a **USB-HID macro controller in a knob** — round touch screen plus
 driverless over USB HID, configured from a Flutter phone app over BLE. Macros show as a ring of
 colored wedges; rotate to select, tap center or tap a wedge to fire.
 
-**M6 (config hardening), M7 (NVS persistence), M8 (on-device profile switching) and M9 (icons,
-dial orientation, rotary macro mode) are done**, verified on hardware. M9's Waveshare work was
-signed off 2026-08-22 after three feedback rounds; the M5Dial's `icon_xbm` save-merge — a fix for
-live data loss on that board — was flashed and verified 2026-08-25. Editing one macro no longer
-wipes the icons on the others. See §4.
+**M6 (config hardening), M7 (NVS persistence), M8 (on-device profile switching), M9 (icons,
+dial orientation, rotary macro mode) and M8b (uncap `pos`) are done**, verified on hardware. M9's
+Waveshare work was signed off 2026-08-22 after three feedback rounds; the M5Dial's `icon_xbm`
+save-merge — a fix for live data loss on that board — was flashed and verified 2026-08-25. Editing
+one macro no longer wipes the icons on the others. M8b was verified on both boards 2026-08-29
+against the full criteria list, closing the last gap between the schema and what the spec has
+claimed since v3. See §4.
+
+**The M5Dial security gate is also done**, verified on hardware 2026-09-06. That board now pairs,
+bonds and enforces GATT permission flags like the Waveshare, its `profiles.json` write is atomic,
+and its Wi-Fi stack and LAN-reachable web API — a remote keystroke-injection path on a device that
+is a keyboard — are deleted outright. Both supported boards are now on the same security posture,
+and both are proven by **refusal**, not merely by acceptance: the hostile-central test passed on
+the Waveshare 2026-08-07 and on the M5Dial 2026-09-07. Nothing security-related is outstanding.
 
 ---
 
 ## 3. Where things stand
 
-Branch `feat/m9-icons-orientation-rotary`, 13 commits ahead of `feat/m7-m8-persistence` (which it
-branches from — that branch has an open PR #2 and M9 merges/rebases naturally once it lands).
+Branch **`feat/m5dial-security-gate`**, 6 commits ahead of `feat/m8b-uncap-pos`, which it branches
+from:
+
+```
+7384294  feat: delete the M5Dial web server and all Wi-Fi
+e21a69d  feat: enforce BLE pairing on the M5Dial config channel
+3e68d03  fix: make M5Dial profile saves atomic
+6bbbacc  feat: show the BLE passkey on the M5Dial screen
+7e5a1f1  fix: app copy said the M5Dial needs no pairing
+1c7e3b8  fix: time-window the M5Dial RX duplicate guard          <- HEAD
+```
+
+The last one is not part of the planned work: it is a **pre-existing** bug the gate's testing
+exposed, and it is the reason reconnect appeared broken. See §4 and finding 5.
+
+Under it, branch **`feat/m8b-uncap-pos`** is 9 commits ahead of `feat/m9-icons-orientation-rotary`,
+which it branches from. `review/waveshare-m6-foundation` is the integration branch every milestone
+PRs into: PR #2 (M7/M8) and PR #3 (M9) are merged there, PR #4 (M9's M5Dial verification docs) and
+PR #5 (M8b) are still open. **Merge order: #4, then #5, then this branch.**
+
+```
+295dc5a  docs: M8b design — uncap pos, schema v3
+ed13255  docs: M8b implementation plan — six tasks
+9ba1750  feat(m8b): key running-macro state by identity, not by pos
+2cffbcc  feat(m8b): check the schema version instead of just declaring it
+59fc5f3  feat(m8b): uncap the M5Dial macro engine, keep its 16-dot ring
+17a98b0  feat(m8b): deck renders what exists, plus a trailing + tile
+60ee198  docs: M8b — replace the NOT YET IMPLEMENTED box with what shipped
+b4d7583  feat: distinct board names, a picker, and a real Config Mode message
+e559c21  docs: M8b verified on hardware — promote it, re-point the handoff   <- HEAD
+```
+
+The cap was never `NUM_MACRO_SLOTS`; it was that `runningMacros[]` was indexed **by `pos`**, so
+raising the constant would have compiled and been the wrong fix. The pool is now keyed by macro
+identity: `MAX_MACROS` 32 addressable, `RUNNING_SLOTS` 16 concurrent, and firing a 17th concurrent
+macro is refused and logged rather than corrupting a slot. `b4d7583` is an unplanned follow-on —
+see §4 and the M8b ledger.
+
+Below is the M9 branch state, still accurate for the branch under it:
 
 ```
 7a29c90  refactor(ui): dispatch input through a mode table
@@ -82,6 +132,38 @@ default.
 **This is the most important section in this document.** Do not build on anything listed as "not
 verified" as though it were confirmed.
 
+### Verified on hardware during M8b — both boards, 2026-08-29
+
+Flashed Waveshare COM10 and M5Dial COM5 on 2026-08-28, both hashes verified, then walked the full
+criteria list in `docs/Draupnir_Spec.md` §7 in the mandated order:
+
+- **No regression, run first and on both boards** — existing profiles load, render, fire and stop,
+  toggles included. This was the gate: the pool rewrite touches every fire, stop and query path in
+  the product, so a regression here would have invalidated everything after it.
+- **Wedge ordering unchanged**, including across a save — `scan_active_positions()` now sorts
+  ascending by `pos` explicitly rather than inheriting JSON array order.
+- **A macro above `pos` 15** renders, selects and fires on the Waveshare; **deleting a middle
+  macro** reflows the ring with the remainder still in ascending order.
+- **A 17th concurrent macro is refused and logged**, with the 16 already running unharmed, and
+  **kill-all stops a macro above `pos` 15**.
+- **A `"version": 4` file is refused** without booting to an empty ring.
+- **The M5Dial divergence behaves as documented** — a macro above `pos` 15 fires but does not
+  appear on that board's 16-dot ring. Expected, not a bug; see spec §6.
+
+### Verified from the M8b follow-on (`b4d7583`) — 2026-08-29
+
+Distinct board names, the multi-device picker, and the Config Mode panel: flashed to the M5Dial,
+APK installed, and exercised end to end. The app distinguishes the two boards, connects to the one
+you pick, and functionality was validated on the **Draupnir_Mini** specifically.
+
+One word of care in how this gets recorded: what was exercised was a **connect**, not a pair. The
+M5Dial has no BLE security, so there is nothing to pair with on it — any PIN dialog seen during
+testing came from the Waveshare. This does not weaken the result; it is the hole the next milestone
+closes.
+
+> *Historical, accurate as of 2026-08-29. That hole is now closed — see "M5Dial security gate"
+> below. The M5Dial pairs, bonds and enforces on its own as of 2026-09-06.*
+
 ### Verified on hardware during M9 (Waveshare)
 
 - **The mode-dispatch refactor** (`7a29c90`), behavior unchanged — confirmed across all the
@@ -114,6 +196,49 @@ verified" as though it were confirmed.
   edited. Note what a pass does *not* cover: that board's `profiles.json` write is still a direct
   truncate-and-write, so power loss mid-save still corrupts it (see §6).
 
+### Verified on hardware — M5Dial security gate, 2026-09-06
+
+Flashed the M5Dial (COM5 download / COM7 run), hash verified, and walked the criteria with a
+direct `SerialPort` capture rather than by eye. All seven pass.
+
+- **Wi-Fi and the web server are gone.** `draupnir.local` does not resolve. Flash dropped
+  1,643,251 → 966,811 bytes (−676 KB) on the deletion commit — you cannot leave `WebServer`
+  accidentally linked in and lose 660 KB, so the size is itself evidence the removal was complete.
+- **BLE re-advertises after a disconnect**, the trap in that deletion (`startAdvertising()` lived
+  inside the Wi-Fi restore block): `Disconnected` → `Restart BLE advertising` → `Connected`, all
+  within three seconds, no reboot.
+- **Pairing works.** Phone prompts, a 6-digit passkey appears on the dial, entering it completes:
+  `authentication complete, encrypted=1 authenticated=1 bonded=1`.
+- **Reconnect is silent** — bond reused, no second passkey.
+- **The gate authorizes, and Config Mode no longer does.** Read *and* save succeed with the dial
+  in **Run Mode**. Across the session: **5 commands accepted, every one logging
+  `enc=1 auth=1 bond=1`; zero refused**. `trigger` — the command that actually types into the host
+  — is among them.
+- **The atomic write commits and reloads:** `save_profiles: committed 12597 bytes`, then 12650 on
+  a second save, each followed by a clean `Loaded profiles.json`. No `write failed`, no
+  `rename into place failed`. **The edit survived a power cycle.**
+- **The hostile-central (negative) test passes — confirmed 2026-09-07.** An unbonded central is
+  refused. This is the criterion that separates "the gate accepts authorized traffic" from "the
+  gate refuses unauthorized traffic", and until it was run the security-gate round proved only the
+  former. It was recorded as NOT verified for a day rather than folded into the positive results,
+  which is the right way round: the Waveshare's equivalent claim (2026-08-07) had always been
+  backed by a real session, and the two should never have read as equivalent before this.
+- **Pairing while sitting in Config Mode** returns to the Config Mode screen cleanly rather than
+  stranding the passkey screen. This needed a fix found by reading rather than testing:
+  `requestRedraw()` is only ever dispatched inside the `RUN_MODE` branch of `loop()`, so the
+  end-of-pairing repaint was a no-op in Config Mode. `drawConfigModeScreen()` was split out of
+  `enterConfigMode()` so that path can repaint directly, without re-running the latter's
+  `killAllMacros()` side effect.
+
+**A bug this round found and fixed, worth knowing about:** the RX duplicate-write guard had no
+expiry, so it compared against the previous write *forever*. The app's first command after a
+reconnect is byte-identical to its first command last session, so the device bonded and
+reconnected perfectly and then **silently swallowed every command** — presenting as "cannot
+reconnect, and restarting the app doesn't help", since the stale state is on the device and only a
+reboot cleared it. Pre-existing, not introduced by the gate; it was simply unreachable until
+someone reconnected the M5Dial twice in one power cycle. Fixed by porting the Waveshare's 10 ms
+window (`1c7e3b8`).
+
 ### NOT verified — read this before assuming otherwise
 
 - **Frame pacing at high macro counts.** Still unmeasured — all M9 hardware testing ran against
@@ -128,10 +253,10 @@ verified" as though it were confirmed.
   showed display and touch can be right/wrong independently of each other, so a value-by-value
   breakdown was never isolated; only the aggregate "rotates for all four values" was confirmed.
 
-### Four findings — do not re-derive these on the next hardware round
+### Five findings — do not re-derive these on the next hardware round
 
 Each of these cost a full hardware round (flash → observe → diagnose → fix → reflash) to find. All
-four are instances of code that compiles cleanly and does nothing observable — treat that symptom
+five are instances of something that compiles cleanly and does nothing observable — treat that symptom
 as the first hypothesis, not a last resort (see the tally below).
 
 1. **The SH8601 is a QSPI panel; commands must carry the write opcode.** `lcd_set_orientation()`
@@ -160,10 +285,26 @@ as the first hypothesis, not a last resort (see the tally below).
    milestone for a different reason; the M9 font swap (`orbitron_12` → `orbitron_18`) had to
    re-satisfy the same four-site invariant, verified by grepping the old font down to 0 references
    afterward.
+5. **A dedup guard with no expiry is a delayed silent-drop bug.** The M5Dial's RX duplicate-write
+   guard existed to absorb a doubled `onWrite()` from the BLE stack, which arrives within a
+   millisecond or two — but it compared against the previous write with **no time window**, i.e.
+   forever. The app's first command after reconnecting is byte-identical to its first command last
+   session (`{"cmd":"get_profiles"}`), so the device bonded and reconnected flawlessly and then
+   silently swallowed every command. It presented as *"cannot reconnect, and restarting the app
+   doesn't help"* — the stale state is on the device, so only a reboot cleared it, which is why the
+   first pair after every flash worked and hid the bug for months.
+
+   **The port hazard is the real lesson.** `ble_engine.cpp`'s `onDisconnect` carries a comment
+   saying `lastRxValue` *"needs no reset … so it self-expires."* That is true on the Waveshare,
+   which has a 10 ms window, and false on the M5Dial, which had none — so the comment actively
+   reassures a reader porting between the boards. When copying reasoning across the two targets,
+   check that the premise holds on both. Fixed in `1c7e3b8` by porting the window.
 
 **Tally worth keeping in view:** seven LVGL/esp_lcd APIs have now compiled cleanly and done nothing
-in this project's history, two of them (findings 1 and 2 above) in M9 alone. When something "should
-work" and visibly doesn't, absence-not-error is the pattern to suspect first here.
+in this project's history, two of them (findings 1 and 2 above) in M9 alone. Finding 5 is the same
+shape one layer up — not an API that silently no-ops, but a *guard* that silently over-matches.
+When something "should work" and visibly doesn't, absence-not-error is the pattern to suspect first
+here.
 
 ---
 
@@ -226,33 +367,24 @@ proposed Visual Studio reinstall that would have fixed nothing.
 
 ## 6. What to do next, in order
 
-### Step 1 — M8b
+**Security work is closed.** The M5Dial security gate landed on `feat/m5dial-security-gate` (PR #6)
+and is verified on hardware — positive path 2026-09-06, hostile-central negative test 2026-09-07.
+Both supported boards now enforce pairing, bonding and GATT permission flags, and both claims are
+backed by a real refusal test rather than by inference. Nothing security-related is outstanding.
 
-Uncap `pos`, key running-macro state by macro identity rather than slot, then bump the on-device
-default to `version: 3`. The full detail and the reason it must precede the version bump is in
-`docs/Draupnir_Spec.md` §6's "NOT YET IMPLEMENTED" box — still accurate, unchanged by M9.
+### Step 1 — M10, polish
 
-This is the last thing standing between the schema and what the spec has claimed since v3. It is
-also cheap relative to its blast radius: the cap is a leftover from when `pos` addressed a physical
-key on a 16-key grid, and that grid no longer exists.
+Buzzer/haptic feedback and export/import.
 
-### Step 2 — The M5Dial security gate
+**Diagnose the haptics blocker before scoping the milestone.** `haptics_init()` breaks the CST816
+touch controller (§8) — a hardware interaction, not an effort problem, and it is the one item that
+could change M10's shape. Both sit on the same I²C bus, which makes address conflict, bus timing,
+or a shared-reset interaction the obvious first hypotheses; none has been tested. Until that is
+understood, "buzzer/haptic feedback" cannot be honestly estimated, and export/import is the part of
+M10 that is merely work.
 
-The M5Dial firmware still has no cryptographic gate at all (§8). This has been the top follow-up
-since M6 closed the equivalent hole on the Waveshare, and per the locked work order (`CLAUDE.md`),
-Waveshare polish should not keep displacing it — it goes ahead of M10's comfort items. It is an
-unauthenticated keystroke-injection path on a currently-supported board: any BLE central in range
-can write macros to it and have them typed into whatever host it is plugged into.
-
-Fold the non-atomic `profiles.json` write (§6 gaps) into the same pass. Both are the same shape of
-debt — hardening the Waveshare already received and the M5Dial never did — and both touch that
-sketch's config path, so doing them together costs one review cycle instead of two.
-
-### Step 3 — M10, polish
-
-Buzzer/haptic feedback and export/import. Note that haptics are currently blocked by a hardware
-interaction, not by effort: `haptics_init()` breaks the CST816 touch controller (§6 gaps). That
-needs diagnosing before the milestone can be scoped honestly.
+Note that export/import touches the schema and the app rather than either board's display layer,
+so it is the half that stays shared — worth doing first if the haptics diagnosis drags.
 
 ### Also worth doing, not blocking
 
@@ -294,11 +426,15 @@ needs diagnosing before the milestone can be scoped honestly.
 to live in this section are not lost — they're in this file's git history, in the version dated
 2026-07-25. This rewrite compresses them because M6 is done; go there for the raw serial evidence.*
 
-- **M5Dial firmware has no cryptographic gate.** That sketch has no `BLESecurity` setup and no
-  GATT permission flags at all — config access is gated solely on `CONFIG_MODE`. The second
-  supported board still carries the vulnerability M6 exists to close. **Top follow-up**, sequenced
-  ahead of M10 (see §6 Step 3). Deferred by the board sequencing (spec §3), not by tooling — the
-  hardware is on hand.
+- ~~**M5Dial firmware has no cryptographic gate.**~~ **CLOSED 2026-09-06.** That sketch now sets
+  `ESP_LE_AUTH_REQ_SC_MITM_BOND` with `ESP_IO_CAP_OUT`, shows a passkey on screen, carries
+  `_ENC`/`_AUTHEN` permission flags on RX and `_ENC` on TX, and refuses at the handler anything
+  whose link `sec_state` is not `encrypted && authenticated`. The `CONFIG_MODE` check is gone —
+  it was physical presence, not authentication. Wi-Fi and the LAN-reachable web API were deleted
+  in the same pass, which was the larger hole of the two. Verified on hardware (§4) on both the
+  positive path (2026-09-06) and by hostile-central negative test (2026-09-07) — an unbonded
+  central is refused. Nothing about this is outstanding. The rebuttal below is retained because it
+  remains the standing answer to anyone proposing the token.
   > **Do not close this by restoring the `pairingToken`.** An external audit (2026-08) called the
   > removal a blocking regression; it was not. The token was checked *only outside* `CONFIG_MODE`,
   > and `CONFIG_MODE` is the only mode serving config commands — so in the mode that mattered
@@ -382,11 +518,13 @@ to live in this section are not lost — they're in this file's git history, in 
   firmware drives it with SH8601 and works. Unresolved, low priority.
 - **`firmware/Waveshare_Knob_Config/`** is a superseded Adafruit_GFX port, still untracked, with
   leftover `refactor*.py` scripts. Safe to delete once nothing is owed to it.
-- **The M5Dial's `profiles.json` write is non-atomic.** Direct `LittleFS.open(..., "w")`
-  truncate-and-write, unlike the Waveshare's temp→verify→rename (the H4 hardening). A power loss
-  mid-save corrupts the config on the M5Dial and cannot on the Waveshare. Not user-visible in normal
-  operation, so not a parity break M9 needed to fix, but it's a real robustness divergence between
-  two supported boards — belongs in the M5Dial catch-up pass alongside the security gate.
+- ~~**The M5Dial's `profiles.json` write is non-atomic.**~~ **CLOSED 2026-09-06.** Ported the
+  Waveshare's temp→verify→rename, verifying the byte count three ways (`measureJson`,
+  `serializeJson`'s return, and the re-opened file's size) before the rename, with a
+  remove-then-retry fallback for builds that refuse to rename onto an existing file. Every failure
+  before the rename leaves the original untouched and deliberately does not reload. The M5Dial
+  keeps its **immediate** `killAllMacros()` → `loadProfiles()` rather than the Waveshare's deferred
+  reload, because nothing but `loop()` touches `profilesDoc` on this board.
 - **Two long-lived branches exist and they are unrelated histories.** `main` is the real trunk.
   `origin/master` is a bare "Initial commit" that holds almost none of the tree, yet it is the
   repo's *default* branch (`origin/HEAD -> origin/master`), so tooling and fresh clones land on the
