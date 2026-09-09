@@ -2,7 +2,25 @@
 #include <ArduinoJson.h>
 #include <Print.h>
 
-#define NUM_MACRO_SLOTS 16
+// TWO LIMITS, DELIBERATELY SEPARATE. They used to be one number only because a single array
+// served both jobs -- runningMacros[] was indexed BY pos, so "how many macros can exist" and "how
+// many can play at once" were forced to be equal. They are different questions:
+//
+//   MAX_MACROS    a data-model limit. The highest legal pos is MAX_MACROS-1. Sized well past what
+//                 the ring can render legibly (at 32 macros a wedge is 11 degrees and the 45px
+//                 icons stopped fitting around 16-20), so the cap is not what anyone hits first.
+//   RUNNING_SLOTS a RAM limit: concurrently-playing macros. 16 is unchanged from before.
+//
+// pos is a stable identifier and the ring-ordering key -- NOT an index into anything. See
+// docs/Draupnir_Spec.md section 6.
+#define MAX_MACROS     32
+#define RUNNING_SLOTS  16
+
+// The profiles.json schema version this firmware understands. A document declaring MORE than this
+// is refused rather than loaded-and-silently-mangled; see schema_version_ok() in macro_engine.cpp.
+// Reading older versions stays fine -- v3 is a strict relaxation of v2, so every v2 file is a
+// valid v3 file.
+#define SCHEMA_VERSION 3
 
 // Ported from firmware/M5_M6_config/M5_M6_config.ino's profile/macro engine, kept as close to
 // verbatim as the display-agnostic parts allow. Reuses the exact same profiles.json schema so
@@ -32,6 +50,24 @@ JsonObject profiles_find_macro(int pos);
 // not just whichever one happens to be on screen right now. Returns a null JsonObject (check
 // with .isNull()) if profileIdx or pos don't match anything.
 JsonObject profiles_find_macro_in(int profileIdx, int pos);
+
+// True if this firmware understands the document's declared schema version -- i.e. `version` is
+// absent (legacy) or <= SCHEMA_VERSION. Refuses only versions ABOVE what we know; older is always
+// fine, since v3 is a strict relaxation of v2 and every v2 file is a valid v3 file.
+//
+// Called on the load path with the whole document, and by ble_engine's save_profiles with the
+// incoming `profiles` object BEFORE anything reaches flash.
+bool profiles_schema_version_ok(JsonVariantConst doc);
+
+// How many macros the ACTIVE profile declares, and the `pos` of the idx'th one in DOCUMENT order
+// (not sorted -- the caller sorts, see scan_active_positions()). Together these let the ring
+// enumerate what exists instead of probing every pos in a fixed range, which is what the old
+// 16-slot scan did and what made the cap structural.
+//
+// These exist so the .ino never touches profilesDoc directly, matching how it already goes
+// through profiles_find_macro(). Returns 0 / -1 when there is no active profile.
+int profiles_active_macro_count();
+int profiles_macro_pos_at(int idx);
 
 // The active document's settings.brightness -- the SEED for NVS brightness, never a source of
 // truth once NVS has been written (see device_state.h). 160 if absent or out of range.

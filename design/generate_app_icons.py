@@ -28,6 +28,13 @@ BG = (17, 17, 17, 255)
 IN_APP_WIDTH = 512
 IN_APP_COLORS = 128
 
+# The AppBar mark. The full logo is unreadable at ~40px -- the raven's linework and the rune rim
+# turn to mush -- so small placements get the centre bind-rune alone, which is bold, high-contrast
+# and legible at that size. Bounding box measured from the master by isolating gold pixels
+# (high R, mid G, low B), not eyeballed: x 40-67%, y 31-73%, plus a small margin.
+GLYPH_BOX = (0.395, 0.305, 0.675, 0.735)
+GLYPH_PX = 192
+
 # Legacy launcher icons get an opaque dark ground; a transparent legacy icon renders
 # inconsistently across launchers, and the mark is drawn for a dark backdrop.
 LEGACY_DENSITIES = [("mdpi", 48), ("hdpi", 72), ("xhdpi", 96), ("xxhdpi", 144), ("xxxhdpi", 192)]
@@ -67,6 +74,15 @@ def main():
     out = os.path.join(assets_dir, "logo.png")
     logo.save(out, optimize=True)
     print("  assets/logo.png", logo.size, os.path.getsize(out), "bytes")
+
+    gx0, gy0, gx1, gy1 = GLYPH_BOX
+    glyph = src.crop((int(w * gx0), int(h * gy0), int(w * gx1), int(h * gy1)))
+    glyph = fit_square(glyph, GLYPH_PX, 1.0)
+    # The rune is one colour plus a gradient, so a small palette costs nothing visible.
+    glyph = glyph.quantize(colors=64, method=Image.FASTOCTREE)
+    out = os.path.join(assets_dir, "glyph.png")
+    glyph.save(out, optimize=True)
+    print("  assets/glyph.png", glyph.size, os.path.getsize(out), "bytes")
 
     for name, px in LEGACY_DENSITIES:
         out = os.path.join(RES, "mipmap-" + name, "ic_launcher.png")

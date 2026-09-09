@@ -20,7 +20,7 @@ static int activeProfileIdx = 0;
 // this board specifically.
 static const char *defaultProfilesJson = R"=====(
 {
-  "version": 2,
+  "version": 3,
   "activeProfile": 0,
   "settings": { "brightness": 160 },
   "profiles": [
@@ -58,12 +58,41 @@ static const char *defaultProfilesJson = R"=====(
 struct ActiveMacro {
   bool active = false;
   bool isToggle = false;
-  int slotIdx = -1;
+  int pos = -1;                 // WHICH macro this slot is playing -- the identity, not an index
   JsonObject macroDef;
   int currentActionIndex = 0;
   unsigned long nextActionTime = 0;
 };
-static ActiveMacro runningMacros[NUM_MACRO_SLOTS];
+
+// A POOL, not a lookup table. The array index carries NO meaning: slot 3 is not pos 3, it is
+// simply the fourth free slot something happened to claim. `.pos` is the identity, and every
+// query goes through find_running_slot().
+//
+// This is the whole of M8b. Before it, this array was indexed BY pos:
+//
+//     runningMacros[pos].active = true;
+//
+// which is what actually capped macros at 16 -- NUM_MACRO_SLOTS was just this array's size, so
+// raising the constant would have "worked" while permanently tying bytes of running-macro state
+// to the highest addressable pos, and the next uncapping would pay again.
+static ActiveMacro runningMacros[RUNNING_SLOTS];
+
+// Index of the slot currently playing `pos`, or -1. Linear over 16 entries -- trivial next to the
+// JSON walk profiles_find_macro() already does on every fire.
+static int find_running_slot(int pos) {
+  for (int i = 0; i < RUNNING_SLOTS; i++) {
+    if (runningMacros[i].active && runningMacros[i].pos == pos) return i;
+  }
+  return -1;
+}
+
+// Index of a free slot, or -1 when all RUNNING_SLOTS are playing.
+static int claim_free_slot(void) {
+  for (int i = 0; i < RUNNING_SLOTS; i++) {
+    if (!runningMacros[i].active) return i;
+  }
+  return -1;
+}
 static QueueHandle_t fireQueue = nullptr;
 
 void hid_init() {
@@ -131,7 +160,7 @@ void macros_rotary_stop(void) {
 }
 
 bool macros_any_running() {
-  for (int i = 0; i < NUM_MACRO_SLOTS; i++) {
+  for (int i = 0; i < RUNNING_SLOTS; i++) {
     if (runningMacros[i].active) return true;
   }
   return false;
@@ -179,10 +208,13 @@ void macros_stop_all() {
   Mouse.release(MOUSE_ALL);
   ConsumerControl.release();
 
-  for (int i = 0; i < NUM_MACRO_SLOTS; i++) {
+  for (int i = 0; i < RUNNING_SLOTS; i++) {
     runningMacros[i].active = false;
     runningMacros[i].isToggle = false;
-    runningMacros[i].slotIdx = -1;
+    runningMacros[i].pos = -1;                // release the identity, not just the active flag:
+                                              // a stale .pos on an inactive slot would make
+                                              // find_running_slot() match a slot that is not
+                                              // playing anything if `active` were ever missed.
     runningMacros[i].macroDef = JsonObject(); // drop the reference into the old document pool
     runningMacros[i].currentActionIndex = 0;
     runningMacros[i].nextActionTime = 0;
@@ -198,6 +230,27 @@ void macros_stop_all() {
 // profilesDoc in whatever state a failed deserialize left it and no way back to a working config
 // short of a reflash. The unguarded "w" open in that old path was also a real bug: it called
 // file.print() on an invalid File and carried on regardless.
+// True if this firmware understands the document's declared schema version.
+//
+// Refuses only versions ABOVE SCHEMA_VERSION. Older is always fine -- v3 is a strict relaxation
+// of v2 (pos uncapped from 16 to MAX_MACROS), so every v2 file is a valid v3 file, and a missing
+// `version` is treated as legacy rather than as an error.
+//
+// Without this the version number is decorative. docs/Draupnir_Spec.md section 6 justified the
+// v3 bump as making v2 firmware REFUSE a v3 file rather than silently dropping every macro above
+// pos 15 -- but no firmware ever read the field, so that refusal never happened. It cannot be
+// made to happen retroactively in already-deployed v2 builds; what this buys is that from v3
+// onward, a version a device does not understand is refused instead of silently mangled.
+// Takes JsonVariantConst rather than JsonDocument& so the same check serves both callers: the
+// load path passes the whole document, and ble_engine's save_profiles passes the incoming
+// `profiles` OBJECT out of a different document, before anything is written to flash.
+bool profiles_schema_version_ok(JsonVariantConst doc) {
+  JsonVariantConst v = doc["version"];
+  if (v.isNull()) return true;                 // legacy file, predates the field
+  int ver = v | 0;
+  return ver <= SCHEMA_VERSION;
+}
+
 static bool write_and_load_defaults(const char *reason) {
   Serial.printf("[diag] profiles: falling back to built-in defaults (%s)\n", reason);
 
@@ -240,6 +293,14 @@ void profiles_reload() {
     if (error) {
       Serial.printf("Failed to parse profiles.json (%s) -- config is corrupt, restoring defaults\n", error.c_str());
       loaded = write_and_load_defaults("profiles.json failed to parse");
+    } else if (!profiles_schema_version_ok(profilesDoc)) {
+      // A file from a NEWER firmware or client. Treated exactly like a parse failure: fall back
+      // to the built-in defaults rather than loading a document whose meaning we do not know.
+      // Booting to an empty ring because some future client wrote a v4 file is the worse failure
+      // -- the device is a keyboard, and a keyboard that does nothing is useless.
+      Serial.printf("profiles.json declares version %d, this firmware understands %d -- refusing\n",
+                    (int)(profilesDoc["version"] | 0), SCHEMA_VERSION);
+      loaded = write_and_load_defaults("profiles.json schema version too new");
     } else {
       loaded = true;
       Serial.println("Loaded profiles.json");
@@ -334,6 +395,25 @@ JsonObject profiles_find_macro(int pos) {
     if (p == pos) return m;
   }
   return JsonObject();
+}
+
+int profiles_active_macro_count() {
+  JsonArray profiles = profilesDoc["profiles"];
+  if (profiles.isNull() || activeProfileIdx >= (int)profiles.size()) return 0;
+  JsonObject prof = profiles[activeProfileIdx];
+  JsonArray macros = prof["macros"];
+  if (macros.isNull()) return 0;
+  return (int)macros.size();
+}
+
+int profiles_macro_pos_at(int idx) {
+  JsonArray profiles = profilesDoc["profiles"];
+  if (profiles.isNull() || activeProfileIdx >= (int)profiles.size()) return -1;
+  JsonObject prof = profiles[activeProfileIdx];
+  JsonArray macros = prof["macros"];
+  if (macros.isNull() || idx < 0 || idx >= (int)macros.size()) return -1;
+  JsonObject m = macros[idx];
+  return m["pos"] | -1;
 }
 
 JsonObject profiles_find_macro_in(int profileIdx, int pos) {
@@ -505,7 +585,7 @@ static void executeAction(JsonObject action) {
 void macros_fire(int pos) {
   // Distinguishes "never dequeued" from "dequeued but no macro at that pos" from "dequeued and
   // started". Gated by DRAUPNIR_TRACE_INPUT.
-  if (pos < 0 || pos >= NUM_MACRO_SLOTS) {
+  if (pos < 0 || pos >= MAX_MACROS) {
     TRACE("[fire] fire pos=%d REJECTED (out of range)\n", pos);
     return;
   }
@@ -523,25 +603,42 @@ void macros_fire(int pos) {
   }
   bool isToggle = (strcmp(mode, "toggle") == 0);
 
-  if (runningMacros[pos].active && runningMacros[pos].isToggle) {
-    TRACE("[fire] fire pos=%d -> stopping running toggle\n", pos);
-    runningMacros[pos].active = false;
+  int slot = find_running_slot(pos);
+  if (slot >= 0 && runningMacros[slot].isToggle) {
+    TRACE("[fire] fire pos=%d -> stopping running toggle (slot %d)\n", pos, slot);
+    runningMacros[slot].active = false;
+    runningMacros[slot].pos    = -1;
+    runningMacros[slot].macroDef = JsonObject();
     return;
   }
-  TRACE("[fire] fire pos=%d START mode=%s actions=%u\n", pos, mode,
+
+  // Re-firing a non-toggle macro that is already playing REUSES its slot (restarting it from
+  // action 0), rather than claiming a second one. Two slots playing the same pos would make
+  // find_running_slot() ambiguous and let one macro exhaust the pool by itself.
+  if (slot < 0) slot = claim_free_slot();
+  if (slot < 0) {
+    // Refuse rather than evict. Stealing a slot from a running macro can leave its modifiers or
+    // mouse buttons held down -- macros_stop_all() is the only path that releases HID state, and
+    // an eviction does not go through it.
+    Serial.printf("[diag] macros_fire: pos=%d REFUSED, all %d running slots busy\n",
+                  pos, RUNNING_SLOTS);
+    return;
+  }
+
+  TRACE("[fire] fire pos=%d START slot=%d mode=%s actions=%u\n", pos, slot, mode,
                 (unsigned)(macro["actions"].isNull() ? 0 : macro["actions"].size()));
 
-  runningMacros[pos].active = true;
-  runningMacros[pos].isToggle = isToggle;
-  runningMacros[pos].slotIdx = pos;
-  runningMacros[pos].macroDef = macro;
-  runningMacros[pos].currentActionIndex = 0;
-  runningMacros[pos].nextActionTime = millis();
+  runningMacros[slot].active = true;
+  runningMacros[slot].isToggle = isToggle;
+  runningMacros[slot].pos = pos;
+  runningMacros[slot].macroDef = macro;
+  runningMacros[slot].currentActionIndex = 0;
+  runningMacros[slot].nextActionTime = millis();
 }
 
 bool macros_is_running(int pos) {
-  if (pos < 0 || pos >= NUM_MACRO_SLOTS) return false;
-  return runningMacros[pos].active;
+  if (pos < 0 || pos >= MAX_MACROS) return false;
+  return find_running_slot(pos) >= 0;
 }
 
 void macros_update() {
@@ -562,7 +659,7 @@ void macros_update() {
   }
 
   unsigned long now = millis();
-  for (int i = 0; i < NUM_MACRO_SLOTS; i++) {
+  for (int i = 0; i < RUNNING_SLOTS; i++) {
     if (!runningMacros[i].active) continue;
     if (now < runningMacros[i].nextActionTime) continue;
 
@@ -571,7 +668,12 @@ void macros_update() {
       if (runningMacros[i].isToggle) {
         runningMacros[i].currentActionIndex = 0;
       } else {
+        // Release the slot back to the pool: clear the identity and drop the JsonObject, not just
+        // the active flag. Leaving them set would pin a reference into profilesDoc for a macro
+        // that finished, and hold the slot's identity against a later find_running_slot().
         runningMacros[i].active = false;
+        runningMacros[i].pos    = -1;
+        runningMacros[i].macroDef = JsonObject();
       }
       continue;
     }

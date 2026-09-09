@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import '../services/profile_transfer.dart';
 
 class DraupnirState extends ChangeNotifier {
   bool isLoading = false;
@@ -22,6 +24,15 @@ class DraupnirState extends ChangeNotifier {
   // dead code that always reported failure, and it reimplemented — badly — what BLE bonding
   // already does correctly.
   bool needsPairing = false;
+
+  // Set when the device answered but refused because it is not in Config Mode. Only the M5Dial
+  // has this gate: it serves no config command outside CONFIG_MODE, which is entered by a
+  // physical gesture on the dial (swipe down). The link is up and healthy in this case — the
+  // request was answered, just with a refusal — so reporting it as a connection failure, which
+  // is what the generic error path did, sent the user off diagnosing Bluetooth instead of
+  // swiping the screen in front of them. Like needsPairing, there is no in-app action that can
+  // fix it; the app's job is to say which gesture to make.
+  bool needsConfigMode = false;
 
   // True once connected over BLE. BLE is now the only transport (the Wi-Fi/HTTP client half of
   // the cut web UI is gone), so this doubles as "connected".
@@ -219,10 +230,34 @@ class DraupnirState extends ChangeNotifier {
     );
   }
 
-  Future<void> connectBluetooth() async {
+  // Nordic UART Service — the one Draupnir speaks. Matched as a fallback for boards whose
+  // advertised name does not survive the scan (Android sometimes reports an empty platformName
+  // until a name request completes).
+  static final Guid nusServiceUuid = Guid('6E400001-B5A3-F393-E0A9-E50E24DCCA9E');
+
+  // The boards advertise different names now ("Draupnir" = Waveshare knob, "Draupnir_Mini" =
+  // M5Dial), but both match the scan filter — as any future board should. Whoever answers the
+  // scan first is not necessarily the one the user meant, so instead of taking the first hit we
+  // keep listening for a grace period after it to see whether a second board is on the air. One
+  // match connects straight through; more than one asks. The grace window is what keeps the
+  // common single-board case from paying the full 10s scan.
+  static const Duration _scanGrace = Duration(seconds: 2);
+
+  // One key, overwritten on every import. Survives an app restart, which an in-memory undo
+  // would not — and a wrong import is the only irreversible action in this app.
+  static const String _snapshotKey = 'pre_import_config';
+  static const String _snapshotAtKey = 'pre_import_config_at';
+
+  /// [chooseDevice] is called only when the scan turns up more than one Draupnir. Returning null
+  /// (the user dismissed the picker) cancels the connect quietly — not an error. Omitting it
+  /// falls back to the strongest signal, so callers without a UI to show still work.
+  Future<void> connectBluetooth({
+    Future<BluetoothDevice?> Function(List<ScanResult>)? chooseDevice,
+  }) async {
     isLoading = true;
     isScanningBle = true;
     error = null;
+    needsConfigMode = false;
     clearDebugLog();
     notifyListeners();
 
@@ -246,9 +281,13 @@ class DraupnirState extends ChangeNotifier {
       }
 
       _log('[SCAN] Starting (10s timeout)');
-      BluetoothDevice? targetDevice;
-      List<String> foundNames = [];
-      final foundCompleter = Completer<void>();
+      final List<String> foundNames = [];
+      // Keyed by remoteId so a board re-advertising during the scan updates its entry instead of
+      // appearing twice in the picker.
+      final Map<DeviceIdentifier, ScanResult> matches = {};
+      final settled = Completer<void>();
+      Timer? graceTimer;
+
       final subscription = FlutterBluePlus.scanResults.listen((results) {
         for (final r in results) {
           final name = r.device.platformName;
@@ -256,38 +295,65 @@ class DraupnirState extends ChangeNotifier {
             foundNames.add(name);
             _log('[SCAN] Found: "$name" rssi=${r.rssi}');
           }
-          if (name.toLowerCase().contains('draupnir') ||
-              r.advertisementData.serviceUuids.contains(Guid('6E400001-B5A3-F393-E0A9-E50E24DCCA9E'))) {
-            if (targetDevice == null) {
-              targetDevice = r.device;
-              _log('[SCAN] Targeting: ${r.device.platformName} (${r.device.remoteId})');
-              FlutterBluePlus.stopScan();
-              if (!foundCompleter.isCompleted) foundCompleter.complete();
-            }
+          if (!name.toLowerCase().contains('draupnir') &&
+              !r.advertisementData.serviceUuids.contains(nusServiceUuid)) {
+            continue;
           }
+          final isNew = !matches.containsKey(r.device.remoteId);
+          matches[r.device.remoteId] = r;
+          if (!isNew) continue;
+          _log('[SCAN] Draupnir: "$name" (${r.device.remoteId}) rssi=${r.rssi}');
+          // Restart the grace window on every NEW board, so a third one still gets counted.
+          graceTimer?.cancel();
+          graceTimer = Timer(_scanGrace, () {
+            if (!settled.isCompleted) settled.complete();
+          });
         }
       });
 
       // startScan's future resolves as soon as the platform scan call is issued, not when
       // scanning actually finishes — awaiting it alone races the results stream and only "works"
-      // when the OS scan cache returns a hit instantly. Wait for a real match or for scanning to
-      // actually stop (device found, 10s timeout elapsed, or manually stopped) instead.
+      // when the OS scan cache returns a hit instantly. Wait for the grace window to close after
+      // a match, or for scanning to actually stop (10s timeout elapsed, or manually stopped).
       await FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
       await Future.any([
-        foundCompleter.future,
+        settled.future,
         FlutterBluePlus.isScanning.where((scanning) => !scanning).first,
       ]);
+      graceTimer?.cancel();
       await subscription.cancel();
+      await FlutterBluePlus.stopScan();
       isScanningBle = false;
+      notifyListeners();
 
-      if (targetDevice == null) {
+      if (matches.isEmpty) {
         final listStr = foundNames.isEmpty ? 'none' : foundNames.take(8).join(', ');
         _log('[ERR] No Draupnir found. Seen: $listStr');
         throw Exception('No Draupnir device found. Nearby: $listStr');
       }
 
-      _log('[CONN] Connecting…');
-      await targetDevice!.connect(license: License.nonprofit);
+      // Strongest signal first: it is the best guess when nobody is choosing, and the most
+      // useful order to show a human who is.
+      final candidates = matches.values.toList()
+        ..sort((a, b) => b.rssi.compareTo(a.rssi));
+
+      BluetoothDevice? targetDevice;
+      if (candidates.length == 1 || chooseDevice == null) {
+        targetDevice = candidates.first.device;
+        if (candidates.length > 1) {
+          _log('[SCAN] ${candidates.length} Draupnirs, no picker — taking strongest signal');
+        }
+      } else {
+        _log('[SCAN] ${candidates.length} Draupnirs found — asking');
+        targetDevice = await chooseDevice(candidates);
+        if (targetDevice == null) {
+          _log('[SCAN] Cancelled at the picker');
+          return;
+        }
+      }
+
+      _log('[CONN] Connecting to "${targetDevice.platformName}" (${targetDevice.remoteId})…');
+      await targetDevice.connect(license: License.nonprofit);
       connectedDevice = targetDevice;
       isBluetooth = true;
       _log('[CONN] Connected');
@@ -301,13 +367,13 @@ class DraupnirState extends ChangeNotifier {
       }
 
       _log('[SVC] Discovering services…');
-      List<BluetoothService> services = await targetDevice!.discoverServices();
+      List<BluetoothService> services = await targetDevice.discoverServices();
       _log('[SVC] Found ${services.length} services');
 
       BluetoothService? uartService;
       for (var s in services) {
         _log('[SVC] Service: ${s.uuid}');
-        if (s.uuid == Guid('6E400001-B5A3-F393-E0A9-E50E24DCCA9E')) {
+        if (s.uuid == nusServiceUuid) {
           uartService = s;
         }
       }
@@ -377,6 +443,7 @@ class DraupnirState extends ChangeNotifier {
 
   Future<void> disconnectBluetooth() async {
     isBluetooth = false;
+    needsConfigMode = false;
     if (connectedDevice != null) {
       try {
         await connectedDevice!.disconnect();
@@ -391,11 +458,29 @@ class DraupnirState extends ChangeNotifier {
 
   // Shown whenever the device rejects a request for lack of an encrypted, bonded link. There is
   // no in-app action that can fix this — the OS owns pairing — so the message points at the
-  // system Bluetooth settings and the PIN on the knob's screen.
+  // system Bluetooth settings and the PIN on the device's screen. Both boards enforce bonding
+  // now, and this is shown without knowing which one refused, so it names both.
   static const String pairingRequiredMessage =
       'This Draupnir is not paired with your phone yet.\n\n'
-      'Open your phone\'s Bluetooth settings, pair with "Draupnir", and enter the PIN shown on '
-      'the knob\'s screen. Then come back and connect again.';
+      'Open your phone\'s Bluetooth settings, pair with it ("Draupnir" for the Waveshare knob, '
+      '"Draupnir_Mini" for the M5Dial), and enter the PIN shown on the device\'s screen. '
+      'Then come back and connect again.';
+
+  // LEGACY FALLBACK — do not delete, and do not "restore" the firmware gate to match it.
+  // The M5Dial's CONFIG_MODE check was removed when it gained real BLE pairing; an encrypted,
+  // authenticated link is the authorization now. This message can therefore only come from an
+  // M5Dial still running pre-gate firmware, which is exactly why it stays: on that board it is
+  // still the correct instruction. Note the gesture named here is the OPPOSITE direction from
+  // that board's kill-all (swipe up), so naming the wrong one would be worse than saying nothing.
+  static const String configModeRequiredMessage =
+      'Draupnir_Mini is in Run Mode and will not serve config requests.\n\n'
+      'Swipe down on the dial\'s screen to enter Config Mode, then try again.';
+
+  // The firmware reports this as a plain message string, not a status code, so match on the
+  // text. Kept loose deliberately: the exact wording ("Not in Config Mode") lives in the M5Dial
+  // sketch and is not a contract either side promises to keep.
+  bool _looksLikeConfigModeRefusal(Object? message) =>
+      message != null && message.toString().toLowerCase().contains('config mode');
 
   Future<void> fetchProfiles() async {
     isLoading = true;
@@ -407,6 +492,10 @@ class DraupnirState extends ChangeNotifier {
       if (response['status'] == 'ok') {
         profilesData = response['profiles'];
         needsPairing = false;
+        needsConfigMode = false;
+      } else if (_looksLikeConfigModeRefusal(response['message'])) {
+        needsConfigMode = true;
+        error = configModeRequiredMessage;
       } else {
         error = 'Failed to load profiles: ${response['message']}';
       }
@@ -424,6 +513,124 @@ class DraupnirState extends ChangeNotifier {
 
     isLoading = false;
     notifyListeners();
+  }
+
+  /// Fetches a document WITH icon bitmaps, for export only.
+  ///
+  /// Deliberately does not touch [profilesData]. The on-screen document was fetched without
+  /// icons and the UI has no use for them; more importantly, exporting from the in-memory copy
+  /// would silently produce an icon-less file, which is the exact failure this whole feature
+  /// exists to prevent. Export always asks the device fresh.
+  Future<Map<String, dynamic>?> fetchProfilesForExport() async {
+    isLoading = true;
+    error = null;
+    notifyListeners();
+
+    Map<String, dynamic>? result;
+    try {
+      final response =
+          await _sendBleRequest({'cmd': 'get_profiles', 'include_icons': true});
+      if (response['status'] == 'ok') {
+        result = Map<String, dynamic>.from(response['profiles'] as Map);
+        needsPairing = false;
+        needsConfigMode = false;
+      } else if (_looksLikeConfigModeRefusal(response['message'])) {
+        needsConfigMode = true;
+        error = configModeRequiredMessage;
+      } else {
+        error = 'Failed to read profiles for export: ${response['message']}';
+      }
+    } catch (e) {
+      if (_looksLikeAuthFailure(e)) {
+        needsPairing = true;
+        error = pairingRequiredMessage;
+      } else {
+        error = 'Bluetooth request failed: $e';
+      }
+    }
+
+    isLoading = false;
+    notifyListeners();
+    return result;
+  }
+
+  bool _hasSnapshot = false;
+  DateTime? _snapshotAt;
+
+  bool get hasImportSnapshot => _hasSnapshot;
+  DateTime? get importSnapshotTakenAt => _snapshotAt;
+
+  /// Call once at startup so the Undo affordance survives an app restart.
+  Future<void> loadImportSnapshotState() async {
+    final prefs = await SharedPreferences.getInstance();
+    _hasSnapshot = prefs.getString(_snapshotKey) != null;
+    final at = prefs.getString(_snapshotAtKey);
+    _snapshotAt = at == null ? null : DateTime.tryParse(at);
+    notifyListeners();
+  }
+
+  Future<void> _takeImportSnapshot() async {
+    if (profilesData == null) return;
+    final prefs = await SharedPreferences.getInstance();
+    final now = DateTime.now().toUtc();
+    await prefs.setString(_snapshotKey, jsonEncode(profilesData));
+    await prefs.setString(_snapshotAtKey, now.toIso8601String());
+    _hasSnapshot = true;
+    _snapshotAt = now;
+  }
+
+  /// Applies a parsed transfer to the device.
+  ///
+  /// A snapshot is taken before EVERY import, not only the destructive one. An append is not
+  /// destructive, but undoing one is just as useful, and a rule that fires on every import
+  /// cannot be got wrong about which case it covers.
+  Future<bool> importTransfer(ParsedTransfer t) async {
+    if (profilesData == null) {
+      error = 'Connect to a Draupnir before importing.';
+      notifyListeners();
+      return false;
+    }
+
+    await _takeImportSnapshot();
+
+    if (t.isConfig) {
+      // Replaces everything. This is restore.
+      profilesData = Map<String, dynamic>.from(t.payload);
+    } else {
+      // Appends. Never overwrites, and never renumbers pos — pos is a stable identifier and the
+      // ring-order key, unique only WITHIN a profile, so an appended profile cannot collide.
+      final profiles = profilesData!['profiles'] as List;
+      final incoming = Map<String, dynamic>.from(t.payload);
+      incoming['name'] =
+          uniqueProfileName(incoming['name'].toString(), profiles);
+      profiles.add(incoming);
+    }
+
+    notifyListeners();
+    await saveProfiles();
+    if (error != null) return false;
+
+    // Re-read so the UI reflects what the device actually stored, including any icon merge it
+    // performed on the way in.
+    await fetchProfiles();
+    return error == null;
+  }
+
+  /// Re-sends the config captured immediately before the last import.
+  Future<bool> undoImport() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString(_snapshotKey);
+    if (saved == null) {
+      error = 'There is no pre-import snapshot to restore.';
+      notifyListeners();
+      return false;
+    }
+    profilesData = Map<String, dynamic>.from(jsonDecode(saved) as Map);
+    notifyListeners();
+    await saveProfiles();
+    if (error != null) return false;
+    await fetchProfiles();
+    return error == null;
   }
 
   // The firmware rejects unauthenticated access at the GATT layer, so there is no single
@@ -451,7 +658,12 @@ class DraupnirState extends ChangeNotifier {
         'profiles': profilesData,
       });
       if (response['status'] != 'ok') {
-        error = 'Failed to save profiles: ${response['message']}';
+        if (_looksLikeConfigModeRefusal(response['message'])) {
+          needsConfigMode = true;
+          error = configModeRequiredMessage;
+        } else {
+          error = 'Failed to save profiles: ${response['message']}';
+        }
       }
     } catch (e) {
       if (_looksLikeAuthFailure(e)) {
@@ -492,11 +704,50 @@ class DraupnirState extends ChangeNotifier {
     await saveProfiles();
   }
 
+  // Must match MAX_MACROS in both firmwares (macro_engine.h, M5_M6_config.ino). pos is a stable
+  // identifier and ring-ordering key, NOT a grid slot -- see docs/Draupnir_Spec.md section 6.
+  static const int maxMacros = 32;
+
   List<dynamic> get currentMacros {
     if (profilesData == null) return [];
     final profiles = profilesData!['profiles'] as List;
     if (profiles.isEmpty || activeProfileIdx >= profiles.length) return [];
     return profiles[activeProfileIdx]['macros'] ?? [];
+  }
+
+  /// Macros in ascending `pos` order -- the order the device's ring draws them in.
+  ///
+  /// The stored array is in whatever order edits left it; `pos` is the ordering key, so anything
+  /// presenting macros to the user must sort. The firmware sorts for exactly the same reason (see
+  /// scan_active_positions()).
+  List<dynamic> get sortedMacros {
+    final list = List<dynamic>.from(currentMacros);
+    list.sort((a, b) => ((a['pos'] ?? 0) as int).compareTo((b['pos'] ?? 0) as int));
+    return list;
+  }
+
+  /// Lowest `pos` not currently in use, or -1 when the profile is full.
+  ///
+  /// Lowest-free rather than highest-plus-one so that gaps left by deletion get reused before the
+  /// ceiling is approached -- otherwise a long edit session of add/delete walks pos upward and
+  /// hits maxMacros with a mostly-empty profile.
+  int get lowestFreePos {
+    final used = currentMacros.map((m) => m['pos'] as int?).whereType<int>().toSet();
+    for (int p = 0; p < maxMacros; p++) {
+      if (!used.contains(p)) return p;
+    }
+    return -1;
+  }
+
+  Future<void> deleteMacro(int pos) async {
+    if (profilesData == null) return;
+    List profiles = profilesData!['profiles'] as List;
+    if (activeProfileIdx >= profiles.length) return;
+
+    List macros = profiles[activeProfileIdx]['macros'] ?? [];
+    macros.removeWhere((m) => m['pos'] == pos);
+    profiles[activeProfileIdx]['macros'] = macros;
+    await saveProfiles();
   }
 
   Future<void> updateMacro(int pos, Map<String, dynamic> macroData) async {

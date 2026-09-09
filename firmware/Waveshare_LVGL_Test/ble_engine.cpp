@@ -233,17 +233,36 @@ static void handleBleCommand(char *cmdStr) {
   String cmd = req["cmd"] | "";
 
   if (cmd == "get_profiles") {
+    // Export needs the icon bitmaps the normal path strips (see
+    // docs/superpowers/specs/2026-09-07-profile-export-import-design.md). Absent or false is the
+    // common path and must stay byte-identical to before.
+    bool includeIcons = req["include_icons"] | false;
     bleSendPreamble();
     BleChunkSink sink;
-    IconXbmFilterSink filtered(sink);
-    filtered.print("{\"status\":\"ok\",\"profiles\":");
-    profiles_serialize(filtered);
-    filtered.print("}\n");
-    // filtered.flushRemainder() forwards any still-withheld marker-prefix bytes into sink's
-    // buffer; sink.flushRemainder() then sends whatever chunk that leaves (and is also what
-    // surfaces a failure sink.write() hit earlier, since it checks `failed` itself).
-    if (filtered.flushRemainder() && sink.flushRemainder()) {
-      Serial.printf("[ble] get_profiles: streamed %u bytes\n", (unsigned)sink.totalSent);
+    bool ok;
+    if (includeIcons) {
+      // Serialize STRAIGHT into the chunk sink -- IconXbmFilterSink exists only to strip, so
+      // there is nothing to configure, only to skip. Note there is correspondingly no filter to
+      // flush here: only sink.flushRemainder() applies. Calling a filter's flush on this path
+      // (or omitting sink's) truncates the tail of the response, which presents at the app as
+      // malformed JSON rather than as a missing flush.
+      sink.print("{\"status\":\"ok\",\"profiles\":");
+      profiles_serialize(sink);
+      sink.print("}\n");
+      ok = sink.flushRemainder();
+    } else {
+      IconXbmFilterSink filtered(sink);
+      filtered.print("{\"status\":\"ok\",\"profiles\":");
+      profiles_serialize(filtered);
+      filtered.print("}\n");
+      // filtered.flushRemainder() forwards any still-withheld marker-prefix bytes into sink's
+      // buffer; sink.flushRemainder() then sends whatever chunk that leaves (and is also what
+      // surfaces a failure sink.write() hit earlier, since it checks `failed` itself).
+      ok = filtered.flushRemainder() && sink.flushRemainder();
+    }
+    if (ok) {
+      Serial.printf("[ble] get_profiles: streamed %u bytes (icons=%d)\n",
+                    (unsigned)sink.totalSent, includeIcons ? 1 : 0);
     } else {
       Serial.println("[ble] get_profiles: send aborted (ack retries exhausted)");
       // Best-effort: without this the app has nothing to react to and waits out its full 30s
@@ -258,6 +277,25 @@ static void handleBleCommand(char *cmdStr) {
     JsonObject profilesObj = req["profiles"];
     if (profilesObj.isNull()) {
       sendBleMessage("{\"status\":\"error\",\"message\":\"No profiles object provided\"}");
+      return;
+    }
+
+    // Refuse a document from a NEWER schema before anything touches flash. Placed here, ahead of
+    // the icon merge and the temp-write, so a refusal leaves the stored profiles completely
+    // untouched -- the atomic write's guarantee is about power loss, not about us choosing to
+    // commit a document we cannot interpret.
+    //
+    // Reported back to the app rather than dropped: a save that silently does nothing is the
+    // failure mode this whole check exists to remove.
+    if (!profiles_schema_version_ok(profilesObj)) {
+      int ver = profilesObj["version"] | 0;
+      Serial.printf("[ble] save_profiles: REFUSED, document declares version %d, firmware understands %d\n",
+                    ver, SCHEMA_VERSION);
+      char msg[128];
+      snprintf(msg, sizeof(msg),
+               "{\"status\":\"error\",\"message\":\"Schema version %d not supported (max %d) -- update the firmware\"}",
+               ver, SCHEMA_VERSION);
+      sendBleMessage(msg);
       return;
     }
 

@@ -2,23 +2,31 @@
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
-#include <WiFi.h>
-#include <WiFiManager.h>
-#include <ESPmDNS.h>
-#include <WebServer.h>
 #include "USB.h"
 #include "USBHIDKeyboard.h"
 #include "USBHIDConsumerControl.h"
 #include "USBHIDMouse.h"
-#include "index_html.h"
 #include <Adafruit_NeoTrellis.h>
 #include "icons.h"
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
-#include <BLE2902.h>
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+
+// These guards exist because this API's signature failure mode is compiling cleanly and
+// enforcing nothing. BLECharacteristic.h:162-194 defines PROPERTY_WRITE_ENC / _AUTHEN as
+// literally 0 under #if defined(CONFIG_BLUEDROID_ENABLED), and as the real BLE_GATT_CHR_F_*
+// bits only under #if defined(CONFIG_NIMBLE_ENABLED). Build against the wrong one and the
+// permission flags in setup() become a no-op that no test short of a hostile central would
+// catch. Fail the build instead.
+#if !defined(CONFIG_NIMBLE_ENABLED) && !defined(CONFIG_BT_NIMBLE_ENABLED)
+#error "Expected a NimBLE-backed core. Under Bluedroid the GATT permission flags in setup() are 0 and enforce nothing."
+#endif
+static_assert(BLECharacteristic::PROPERTY_WRITE_ENC != 0,
+              "PROPERTY_WRITE_ENC is 0 -- the RX permission flags would be a silent no-op.");
+static_assert(BLECharacteristic::PROPERTY_WRITE_AUTHEN != 0,
+              "PROPERTY_WRITE_AUTHEN is 0 -- the RX permission flags would be a silent no-op.");
 
 #define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -29,7 +37,10 @@
 // current one. 0xFE can't collide with a real JSON command chunk (those are ASCII/UTF-8, <0x80).
 #define BLE_CHUNK_ACK_MARKER 0xFE
 
-enum AppMode { RUN_MODE, CONFIG_MODE, WIFI_SETUP_MODE };
+// WIFI_SETUP_MODE is gone with the rest of the Wi-Fi surface (spec v3 §1 cuts the web config
+// path permanently). CONFIG_MODE survives as an informational screen, not a gate -- see the
+// note above handleBleCommand.
+enum AppMode { RUN_MODE, CONFIG_MODE };
 AppMode currentMode = RUN_MODE;
 // The bespoke `pairingToken` / `pair` scheme is removed (spec v3 §7, M6/H1). It reimplemented —
 // badly — what BLE bonding already does correctly, and the companion app no longer sends a
@@ -63,6 +74,14 @@ BLEServer *pServer = nullptr;
 BLECharacteristic *pTxCharacteristic = nullptr;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
+// Set on the BLE host task, read from loop(). volatile, and never touched by anything that
+// draws -- the display belongs to the loop() task (see the pairing screen dispatch in loop()).
+static volatile bool pairingActive = false;
+static volatile uint32_t currentPasskey = 0;
+// BLE_HS_CONN_HANDLE_NONE (0xffff, host/ble_hs.h) when nothing is connected.
+static volatile uint16_t bleConnHandle = BLE_HS_CONN_HANDLE_NONE;
+
+void drawPairingScreen(); // defined further down, next to enterConfigMode()
 // RX reassembly buffer for chunked BLE commands — a save_profiles command can be ~12KB+.
 // Growing a String one byte at a time via += to that size repeatedly hit failed reallocations
 // once the heap fragmented (largestBlock measured as low as ~9KB mid-session), silently
@@ -98,19 +117,17 @@ USBHIDKeyboard Keyboard;
 USBHIDConsumerControl ConsumerControl;
 USBHIDMouse Mouse;
 Preferences prefs;
-WebServer server(80);
 
 JsonDocument profilesDoc;
 int activeProfileIdx = 0;
 int selectedMacroIdx = 0;
 long oldPosition = -999;
-bool mdnsStarted = false;
 bool uiNeedsRedraw = false;
 unsigned long lastRedrawTime = 0;
 
 const char* defaultProfilesJson = R"=====(
 {
-  "version": 2,
+  "version": 3,
   "activeProfile": 0,
   "settings": { "brightness": 160, "ledBrightness": 60, "buzzer": true },
   "profiles": [
@@ -132,16 +149,57 @@ const char* defaultProfilesJson = R"=====(
 }
 )=====";
 
+// M8b: pos is a stable identifier and ring-ordering key, NOT an index. See
+// docs/Draupnir_Spec.md section 6 and the Waveshare's macro_engine.cpp, which took the same
+// change -- the macro engine is shared-layer, only the display differs.
+//
+// MAX_MACROS is the data-model ceiling (highest legal pos is 31). RUNNING_SLOTS is a RAM limit:
+// how many macros can play at once. They were the same number only because one array served both
+// jobs.
+#define MAX_MACROS     32
+#define RUNNING_SLOTS  16
+#define SCHEMA_VERSION 3
+
 struct ActiveMacro {
   bool active = false;
   bool isToggle = false;
-  int keyIndex = -1;
+  int pos = -1;                 // WHICH macro this slot plays -- the identity, not an index
   JsonObject macroDef;
   int currentActionIndex = 0;
   unsigned long nextActionTime = 0;
   uint16_t color = 0;
 };
-ActiveMacro runningMacros[16];
+
+// A POOL. The array index means nothing -- slot 3 is not pos 3. `.pos` is the identity and every
+// query goes through findRunningSlot(). Before M8b this was indexed BY pos, which is what
+// actually capped macros at 16.
+ActiveMacro runningMacros[RUNNING_SLOTS];
+
+// Index of the slot playing `pos`, or -1.
+int findRunningSlot(int pos) {
+  for (int i = 0; i < RUNNING_SLOTS; i++) {
+    if (runningMacros[i].active && runningMacros[i].pos == pos) return i;
+  }
+  return -1;
+}
+
+// Index of a free slot, or -1 when all RUNNING_SLOTS are busy.
+int claimFreeSlot() {
+  for (int i = 0; i < RUNNING_SLOTS; i++) {
+    if (!runningMacros[i].active) return i;
+  }
+  return -1;
+}
+
+// True if this firmware understands the document's declared schema version. Refuses only versions
+// ABOVE SCHEMA_VERSION -- v3 is a strict relaxation of v2, so every v2 file is a valid v3 file,
+// and a missing `version` is legacy rather than an error.
+bool schemaVersionOk(JsonVariantConst doc) {
+  JsonVariantConst v = doc["version"];
+  if (v.isNull()) return true;
+  int ver = v | 0;
+  return ver <= SCHEMA_VERSION;
+}
 
 bool inRotaryMode = false;
 JsonObject activeRotaryMacro;
@@ -221,6 +279,16 @@ void drawRunUI() {
   uint16_t selectedMacroColor = TFT_WHITE;
   uint16_t unselectedColor = hexToRGB565("#24242D");
   
+  // THIS 16 IS DELIBERATE AND STAYS. This ring is 16 FIXED dots -- one per position around the
+  // circle -- not the Waveshare's N-wedges-sized-to-fill. M8b uncapped the ENGINE on this board,
+  // not the ring: a macro above pos 15 stores, loads, fires and stops correctly here, is
+  // triggerable from the app and over BLE, but has no dot to be drawn in and cannot be selected
+  // on this screen.
+  //
+  // That is an accepted, documented divergence between the two supported boards (see
+  // docs/Draupnir_Spec.md section 4 of the M8b design). Closing it means porting the dynamic
+  // wedge ring onto M5GFX at 240x240 with no LVGL, which is most of the deferred M5Dial catch-up
+  // and belongs with the security gate -- not here. Do not "fix" this loop in isolation.
   for (int i = 0; i < 16; i++) {
     float angle = -PI / 2 + (i * PI * 2 / 16.0);
     int cx = centerX + cos(angle) * radius;
@@ -279,7 +347,9 @@ void drawRunUI() {
       d.fillCircle(cx, cy, 18, unselectedColor);
     }
     
-    if (runningMacros[i].active) {
+    // `i` here is a RING POSITION (this ring is 16 fixed dots), so ask by pos rather than
+    // indexing the pool -- those coincided only while runningMacros[] was indexed by pos.
+    if (findRunningSlot(i) >= 0) {
       d.drawCircle(cx, cy, 19, TFT_GREEN);
       d.drawCircle(cx, cy, 20, TFT_GREEN);
     }
@@ -297,9 +367,10 @@ void drawRunUI() {
     d.drawString("Empty", 120, 160);
   }
   
-  // Draw Kill All if any macro is running
+  // Draw Kill All if any macro is running. Scans the POOL, so it still sees a macro above pos 15
+  // even though this ring cannot draw one.
   bool anyRunning = false;
-  for (int i=0; i<16; i++) {
+  for (int i = 0; i < RUNNING_SLOTS; i++) {
     if (runningMacros[i].active) anyRunning = true;
   }
   if (anyRunning) {
@@ -325,6 +396,15 @@ void loadProfiles() {
   
   if (error) {
     Serial.println("Failed to parse profiles.json");
+  } else if (!schemaVersionOk(profilesDoc)) {
+    // A file from a NEWER firmware or client. Refuse rather than load a document whose meaning we
+    // do not know -- silently dropping whatever we fail to understand is the exact failure the
+    // version field exists to prevent.
+    Serial.printf("profiles.json declares version %d, this firmware understands %d -- refusing\n",
+                  (int)(profilesDoc["version"] | 0), SCHEMA_VERSION);
+    profilesDoc.clear();
+    deserializeJson(profilesDoc, defaultProfilesJson);
+    activeProfileIdx = 0;
   } else {
     Serial.println("Loaded profiles.json");
     activeProfileIdx = prefs.getInt("activeProfile", 0);
@@ -399,41 +479,61 @@ uint8_t getSpecialKeyCode(const char* key) {
   return 0;
 }
 
-void fireMacro(JsonObject macro, int keyIdx) {
+void fireMacro(JsonObject macro, int pos) {
   const char* mode = macro["mode"] | "play_once";
-  
+
   if (strcmp(mode, "rotary") == 0) {
     inRotaryMode = true;
     activeRotaryMacro = macro;
     requestRedraw();
     return;
   }
-  
+
+  if (pos < 0 || pos >= MAX_MACROS) {
+    Serial.printf("fireMacro: pos=%d out of range\n", pos);
+    return;
+  }
+
   bool isToggle = (strcmp(mode, "toggle") == 0);
-  
-  if (runningMacros[keyIdx].active && runningMacros[keyIdx].isToggle) {
+
+  int slot = findRunningSlot(pos);
+  if (slot >= 0 && runningMacros[slot].isToggle) {
     // Kill toggle macro
-    runningMacros[keyIdx].active = false;
-    if (trellisFound) {
-      trellis.pixels.setPixelColor(keyIdx, 0);
+    runningMacros[slot].active = false;
+    runningMacros[slot].pos = -1;
+    runningMacros[slot].macroDef = JsonObject();
+    // The NeoTrellis LED is addressed by KEY index, which is only the same as pos for the 16
+    // physical keys -- the pad genuinely has 16. A macro above that has no LED to clear.
+    if (trellisFound && pos < 16) {
+      trellis.pixels.setPixelColor(pos, 0);
       trellis.pixels.show();
     }
     // Redraw UI to possibly remove Kill All button
     requestRedraw();
     return;
   }
-  
-  runningMacros[keyIdx].active = true;
-  runningMacros[keyIdx].isToggle = isToggle;
-  runningMacros[keyIdx].keyIndex = keyIdx;
-  runningMacros[keyIdx].macroDef = macro;
-  runningMacros[keyIdx].currentActionIndex = 0;
-  runningMacros[keyIdx].nextActionTime = millis();
-  
+
+  // Re-firing a non-toggle macro already playing reuses its slot rather than claiming a second;
+  // two slots on one pos would make findRunningSlot() ambiguous.
+  if (slot < 0) slot = claimFreeSlot();
+  if (slot < 0) {
+    // Refuse rather than evict -- an eviction can strand held modifiers, and killAllMacros() is
+    // the only path that releases HID state.
+    Serial.printf("fireMacro: pos=%d refused, all %d running slots busy\n", pos, RUNNING_SLOTS);
+    return;
+  }
+
+  runningMacros[slot].active = true;
+  runningMacros[slot].isToggle = isToggle;
+  runningMacros[slot].pos = pos;
+  runningMacros[slot].macroDef = macro;
+  runningMacros[slot].currentActionIndex = 0;
+  runningMacros[slot].nextActionTime = millis();
+
   const char* colorHex = macro["color"] | "#FFFFFF";
   long rgb = strtol(colorHex + 1, nullptr, 16);
-  runningMacros[keyIdx].color = rgb;
-  
+  runningMacros[slot].color = rgb;
+
   requestRedraw(); // Show kill all button if needed
 }
 
@@ -505,17 +605,22 @@ void executeAction(JsonObject action) {
 
 void updateMacros() {
   unsigned long now = millis();
-  for (int i = 0; i < 16; i++) {
+  for (int i = 0; i < RUNNING_SLOTS; i++) {
     if (runningMacros[i].active) {
       if (now >= runningMacros[i].nextActionTime) {
         JsonArray actions = runningMacros[i].macroDef["actions"];
         if (runningMacros[i].currentActionIndex >= actions.size()) {
           if (runningMacros[i].isToggle) {
-            runningMacros[i].currentActionIndex = 0; 
+            runningMacros[i].currentActionIndex = 0;
           } else {
+            int donePos = runningMacros[i].pos;
+            // Release the slot back to the pool: identity and JsonObject too, not just the flag.
             runningMacros[i].active = false;
-            if (trellisFound) {
-              trellis.pixels.setPixelColor(i, 0);
+            runningMacros[i].pos = -1;
+            runningMacros[i].macroDef = JsonObject();
+            // LED is addressed by KEY index; the pad has 16 physical keys.
+            if (trellisFound && donePos >= 0 && donePos < 16) {
+              trellis.pixels.setPixelColor(donePos, 0);
               trellis.pixels.show();
             }
             requestRedraw(); // hide kill all if needed
@@ -543,11 +648,16 @@ void updateMacros() {
 
 void killAllMacros() {
   bool changed = false;
-  for (int i = 0; i < 16; i++) {
+  for (int i = 0; i < RUNNING_SLOTS; i++) {
     if (runningMacros[i].active) {
+      int pos = runningMacros[i].pos;
       runningMacros[i].active = false;
+      runningMacros[i].pos = -1;
+      runningMacros[i].macroDef = JsonObject();  // drop the reference into the document pool
       changed = true;
-      if (trellisFound) trellis.pixels.setPixelColor(i, 0);
+      // The LED index is the KEY index, not the slot index -- those coincided only while this
+      // array was indexed by pos. The pad has 16 physical keys; a macro above that has no LED.
+      if (trellisFound && pos >= 0 && pos < 16) trellis.pixels.setPixelColor(pos, 0);
     }
   }
   if (trellisFound) trellis.pixels.show();
@@ -605,11 +715,11 @@ TrellisCallback trellisEvent(keyEvent evt) {
 // Per-chunk payload size (excluding our 1-byte sequence prefix). Verified directly by testing:
 // full 500B chunks reliably got SUCCESS_NOTIFY from the stack but never reached the app (0/5
 // retries acked over 4s), while a ~20B size (hit by accident via an earlier MTU-lookup bug)
-// delivered 160+ consecutive chunks with zero retries. WiFi/BLE coexistence — this firmware runs
-// WiFi STA + a WebServer alongside BLE — was the leading suspect, so WiFi is now paused for the
-// duration of any BLE connection (see MyServerCallbacks). 100B is a middle ground between that
-// proven-reliable size and full throughput now that the radio isn't shared; re-measure if drops
-// come back.
+// delivered 160+ consecutive chunks with zero retries. WiFi/BLE coexistence was the leading
+// suspect: this firmware used to run WiFi STA + a WebServer alongside BLE, and WiFi was paused
+// for the duration of every BLE connection to work around it. WiFi is now deleted outright, so
+// the radio is never shared and the contention cannot recur. 100B is a middle ground between
+// that proven-reliable size and full throughput; re-measure if drops come back.
 const int BLE_CHUNK_PAYLOAD_SIZE = 100;
 
 // Sends one chunk, prefixed with a sequence byte, via notify() and blocks until the app echoes
@@ -702,11 +812,18 @@ static const char ICON_XBM_MARKER[] = ",\"icon_xbm\":\"";
 // message with the '\n' delimiter, then call flushRemainder() and check failed.
 class BleChunkSink : public Print {
 public:
+  // Stripping is the default because it is the common path: the app only needs icon *names*,
+  // and the 18x18 bitmaps are display-side data it never renders. Export is the exception --
+  // it needs the bitmaps to travel, or a profile shared to another device silently loses every
+  // custom icon. See the export/import design doc.
+  explicit BleChunkSink(bool stripIcons = true) : _stripIcons(stripIcons) {}
+
   bool failed = false;     // sticky: set when a chunk exhausts its ack retries
   size_t totalSent = 0;    // bytes emitted after icon_xbm stripping (for logging)
 
   size_t write(uint8_t c) override {
     if (failed) return 0;
+    if (!_stripIcons) return emit(c) ? 1 : 0; // export path: no marker matching at all
     if (_skipping) {
       // Swallowing an icon_xbm hex value: it contains no quotes or escapes, so it ends at the
       // next '"' (also swallowed — the marker's opening quote was never emitted).
@@ -768,6 +885,7 @@ private:
   uint8_t _seq = 0;      // same per-message sequence numbering the app already dedups on
   int _matched = 0;      // bytes of ICON_XBM_MARKER currently matched (withheld)
   bool _skipping = false; // inside an icon_xbm hex value
+  bool _stripIcons = true; // false => forward icon_xbm through untouched (export path)
 
   bool emit(uint8_t c) {
     _buf[_fill++] = c;
@@ -835,12 +953,26 @@ void handleBleCommand(char *cmdStr) {
   }
   
   String cmd = req["cmd"] | "";
-  // The `pair` command and the per-request `token` check are removed (spec v3 §7, M6/H1) --
-  // see the note at the top of this file. Config access is gated on CONFIG_MODE.
-  if (currentMode != CONFIG_MODE) {
-    sendBleMessage("{\"status\":\"error\",\"message\":\"Not in Config Mode\"}");
+  // The `pair` command and the per-request `token` check are removed (spec v3 §7, M6/H1) -- see
+  // the note at the top of this file. The CONFIG_MODE check that stood here is removed too: it
+  // was a physical-presence gate, not authentication, and it stopped nothing once the user
+  // swiped down. An encrypted, MITM-authenticated link is the authorization now. CONFIG_MODE
+  // survives as an informational screen.
+  //
+  // Belt-and-braces behind the GATT permission flags on RX (see setup()). If those ever fail to
+  // enforce -- the documented failure mode of this API -- this refuses the command anyway and
+  // says so on Serial, rather than executing it quietly. Runs on the loop task, reading a handle
+  // the BLE task published: the hand-off-via-flag pattern the threading rules require.
+  ble_gap_conn_desc desc;
+  if (bleConnHandle == BLE_HS_CONN_HANDLE_NONE ||
+      ble_gap_conn_find(bleConnHandle, &desc) != 0 ||
+      !desc.sec_state.encrypted || !desc.sec_state.authenticated) {
+    Serial.println("[ble] cmd REFUSED: link not encrypted+authenticated");
+    sendBleMessage("{\"status\":\"error\",\"message\":\"Not paired\"}");
     return;
   }
+  Serial.printf("[ble] cmd '%s' accepted (enc=%d auth=%d bond=%d)\n", cmd.c_str(),
+                desc.sec_state.encrypted, desc.sec_state.authenticated, desc.sec_state.bonded);
 
   if (cmd == "get_profiles") {
     // Stream the response straight from the already-loaded global profilesDoc into the chunked
@@ -851,14 +983,15 @@ void handleBleCommand(char *cmdStr) {
     // (the {"status":"ok","profiles":} corruption). See BleChunkSink for details.
     Serial.printf("get_profiles: heap before: free=%u largestBlock=%u\n",
                   (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+    bool includeIcons = req["include_icons"] | false;
     bleSendPreamble();
-    BleChunkSink sink;
+    BleChunkSink sink(!includeIcons);
     sink.print("{\"status\":\"ok\",\"profiles\":");
-    serializeJson(profilesDoc, sink);           // icon_xbm stripped on the fly by the sink
+    serializeJson(profilesDoc, sink);           // icon_xbm stripped by the sink unless exporting
     sink.print("}\n");                           // '\n' = end-of-message delimiter for the app
     if (sink.flushRemainder()) {
-      Serial.print("get_profiles: streamed bytes = ");
-      Serial.println(sink.totalSent);
+      Serial.printf("get_profiles: streamed bytes = %u (icons=%d)\n",
+                    (unsigned)sink.totalSent, includeIcons ? 1 : 0);
       Serial.println("BLE TX: sent");
     } else {
       Serial.println("get_profiles: send aborted (chunk ack retries exhausted)");
@@ -870,6 +1003,22 @@ void handleBleCommand(char *cmdStr) {
     JsonObject profilesObj = req["profiles"];
     if (profilesObj.isNull()) {
       sendBleMessage("{\"status\":\"error\",\"message\":\"No profiles object provided\"}");
+      return;
+    }
+
+    // Refuse a newer-schema document before anything touches flash, and TELL the app -- a save
+    // that silently does nothing is the failure this check exists to remove. Note this board's
+    // write is still a direct truncate-and-write rather than the Waveshare's temp/verify/rename,
+    // so returning early here matters more: there is no atomic commit to abort further down.
+    if (!schemaVersionOk(profilesObj)) {
+      int ver = profilesObj["version"] | 0;
+      Serial.printf("save_profiles: REFUSED, document declares version %d, firmware understands %d\n",
+                    ver, SCHEMA_VERSION);
+      char msg[128];
+      snprintf(msg, sizeof(msg),
+               "{\"status\":\"error\",\"message\":\"Schema version %d not supported (max %d) -- update the firmware\"}",
+               ver, SCHEMA_VERSION);
+      sendBleMessage(msg);
       return;
     }
 
@@ -917,26 +1066,80 @@ void handleBleCommand(char *cmdStr) {
       }
     }
 
-    File f = LittleFS.open("/profiles.json", "w");
-    if (f) {
-      serializeJson(profilesObj, f);
-      f.close();
-      
-      killAllMacros();
-      loadProfiles();
-      
-      int brightness = profilesDoc["settings"]["brightness"] | 160;
-      M5Dial.Display.setBrightness(brightness);
-      
-      int orientation = profilesDoc["settings"]["orientation"] | 0;
-      M5Dial.Display.setRotation(orientation);
+    // Write-temp-then-rename. Opening /profiles.json with "w" directly truncated the only good
+    // copy before a single byte of the new one was written, and the serializeJson() byte count
+    // was never checked -- a power loss, a full filesystem, or a short write left a truncated,
+    // unparseable config with no way back short of a reflash. Nothing here touches
+    // /profiles.json until the temp file has been written, closed, and verified on disk.
+    static const char *PROFILES_PATH = "/profiles.json";
+    static const char *PROFILES_TMP_PATH = "/profiles.json.tmp";
 
-      requestRedraw();
-      sendBleMessage("{\"status\":\"ok\"}");
-    } else {
-      sendBleMessage("{\"status\":\"error\",\"message\":\"Failed to write file\"}");
+    LittleFS.remove(PROFILES_TMP_PATH); // clear any leftover from a previous failed save
+    File f = LittleFS.open(PROFILES_TMP_PATH, "w");
+    if (!f) {
+      sendBleMessage("{\"status\":\"error\",\"message\":\"Failed to open temp file\"}");
+      return;
     }
-  } 
+    size_t expected = measureJson(profilesObj);
+    size_t written = serializeJson(profilesObj, f);
+    f.close();
+
+    // Re-open to confirm close() actually flushed the full document to flash, rather than
+    // trusting the writer's own byte count.
+    size_t onDisk = 0;
+    File verify = LittleFS.open(PROFILES_TMP_PATH, "r");
+    if (verify) {
+      onDisk = verify.size();
+      verify.close();
+    }
+
+    if (expected == 0 || written != expected || onDisk != expected) {
+      Serial.printf("[ble] save_profiles: write failed (expected=%u written=%u onDisk=%u)\n",
+                    (unsigned)expected, (unsigned)written, (unsigned)onDisk);
+      LittleFS.remove(PROFILES_TMP_PATH);
+      // The original /profiles.json is untouched, so do NOT reload -- the in-memory document
+      // still matches what is on flash.
+      sendBleMessage("{\"status\":\"error\",\"message\":\"Failed to write file\"}");
+      return;
+    }
+
+    if (!LittleFS.rename(PROFILES_TMP_PATH, PROFILES_PATH)) {
+      // Some LittleFS/VFS builds refuse to rename onto an existing file. Only now, with a
+      // verified-good temp file in hand, is it safe to drop the original.
+      LittleFS.remove(PROFILES_PATH);
+      if (!LittleFS.rename(PROFILES_TMP_PATH, PROFILES_PATH)) {
+        Serial.println("[ble] save_profiles: rename into place failed");
+        LittleFS.remove(PROFILES_TMP_PATH);
+        // The device now has no config file. loadProfiles() finds none and regenerates defaults
+        // -- the correct recovery, though still a failure from the caller's point of view.
+        killAllMacros();
+        loadProfiles();
+        sendBleMessage("{\"status\":\"error\",\"message\":\"Failed to commit file\"}");
+        return;
+      }
+    }
+
+    Serial.printf("[ble] save_profiles: committed %u bytes\n", (unsigned)onDisk);
+
+    // killAllMacros() BEFORE loadProfiles() is not optional. The macro engine holds JsonObject
+    // references into profilesDoc, and deserializeJson() clears and reallocates that document's
+    // pool -- reloading with a macro mid-sequence is a use-after-free.
+    //
+    // Unlike the Waveshare (which defers this via a profilesDirty flag), the M5Dial reloads
+    // immediately and correctly: nothing but loop() ever touches profilesDoc on this board,
+    // because it draws from loop() rather than from a separate LVGL task.
+    killAllMacros();
+    loadProfiles();
+
+    int brightness = profilesDoc["settings"]["brightness"] | 160;
+    M5Dial.Display.setBrightness(brightness);
+
+    int orientation = profilesDoc["settings"]["orientation"] | 0;
+    M5Dial.Display.setRotation(orientation);
+
+    requestRedraw();
+    sendBleMessage("{\"status\":\"ok\"}");
+  }
   else if (cmd == "trigger") {
     int pIdx = req["profile"] | activeProfileIdx;
     int mIdx = req["macro"] | -1;
@@ -968,23 +1171,57 @@ void handleBleCommand(char *cmdStr) {
   }
 }
 
+// IO_CAP_OUT: this device can only DISPLAY a passkey, not accept input -- the phone/app side
+// enters what we show here. Regenerated per-connection (regenPassKeyOnConnect) so it's a fresh
+// random code each pairing, not a fixed shared secret.
+class SecurityCallbacks : public BLESecurityCallbacks {
+  uint32_t onPassKeyRequest() override { return 0; } // we never have input capability
+  void onPassKeyNotify(uint32_t pass_key) override {
+    // Runs on the BLE host task. Sets flags ONLY -- drawing to M5Dial.Display from here would
+    // race the loop() task that owns the panel. loop() watches pairingActive and paints.
+    currentPasskey = pass_key;
+    pairingActive = true;
+    Serial.printf("[ble] show passkey: %06u\n", (unsigned)pass_key);
+  }
+  bool onSecurityRequest() override { return true; }
+  bool onConfirmPIN(uint32_t pin) override { return true; }
+  // This core (m5stack:esp32 3.3.8) is NimBLE-backed despite the Bluedroid-styled class names,
+  // confirmed in its sdkconfig.h. BLESecurity.h declares BOTH overloads -- esp_ble_auth_cmpl_t
+  // (line 228) and ble_gap_conn_desc* (line 238). Override the latter; the former is never
+  // called here, so overriding it would look correct and never fire.
+  void onAuthenticationComplete(ble_gap_conn_desc *desc) override {
+    pairingActive = false;
+    Serial.printf("[ble] authentication complete, encrypted=%d authenticated=%d bonded=%d\n",
+                  desc->sec_state.encrypted, desc->sec_state.authenticated, desc->sec_state.bonded);
+  }
+};
+
 class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
+    // NimBLE overload (BLEServer.h:306) -- gives us the connection handle, so we can request
+    // security immediately and so handleBleCommand() can look the link's security state up later.
+    void onConnect(BLEServer* pServer, ble_gap_conn_desc* desc) override {
       deviceConnected = true;
-      // The actual WiFi pause happens on the main loop (see the deviceConnected/oldDeviceConnected
-      // transition handling below), not here — this callback runs on the BLE stack's own task, and
-      // driving a WiFi driver reconfiguration from that foreign task while the main loop is
-      // concurrently building the get_profiles response corrupted it (verified: reverting this to
-      // a loop-driven toggle fixed a reproducible empty-JSON response that appeared as soon as this
-      // callback called WiFi.mode() directly).
-      Serial.print("BLE Client Connected, connectedCount=");
-      Serial.print(pServer->getConnectedCount());
-      Serial.print(" peerDevices=");
-      Serial.println(pServer->getPeerDevices(false).size());
+      bleConnHandle = desc->conn_handle;
+      int rc = 0;
+      bool started = BLESecurity::startSecurity(desc->conn_handle, &rc);
+      // startSecurity is only a REQUEST, which a hostile central is free to ignore. The GATT
+      // permission flags on RX/TX are what actually enforce; this just gets a well-behaved
+      // client prompted promptly instead of on its first rejected write.
+      //
+      // Keep this callback cheap. It runs on the BLE stack's own task, and the last time real
+      // work was done here -- reconfiguring the WiFi driver, back when WiFi existed -- it
+      // corrupted the get_profiles response the main loop was concurrently building (verified:
+      // a reproducible empty-JSON response appeared the moment this callback called WiFi.mode()
+      // directly, and moving the work to a loop-driven toggle fixed it). WiFi is gone, but the
+      // rule it taught is not: hand work off to loop(), don't do it here.
+      Serial.printf("BLE Client Connected, conn_handle=%d startSecurity ok=%d rc=%d connectedCount=%d\n",
+                    desc->conn_handle, started, rc, pServer->getConnectedCount());
     };
 
-    void onDisconnect(BLEServer* pServer) {
+    void onDisconnect(BLEServer* pServer, ble_gap_conn_desc* desc) override {
       deviceConnected = false;
+      pairingActive = false;
+      bleConnHandle = BLE_HS_CONN_HANDLE_NONE;
       // A half-received command from a dropped connection must not poison the next one.
       bleRxLen = 0;
       Serial.print("BLE Client Disconnected, connectedCount=");
@@ -994,8 +1231,17 @@ class MyServerCallbacks: public BLEServerCallbacks {
     }
 };
 
+// Window for the duplicate-write guard below. The app paces its chunks with an explicit 20ms
+// delay AND waits for each write's ATT response, so two genuinely distinct chunks cannot arrive
+// closer together than tens of milliseconds. That pacing is app-side, so it bounds the gap here
+// regardless of this board's connection interval (unlike the Waveshare, this firmware does not
+// call updateConnParams). A stack-level duplicate of a single write arrives within a millisecond
+// or two, so 10ms separates the two cases with a wide margin.
+static const uint32_t BLE_RX_DUP_WINDOW_MS = 10;
+
 class MyCallbacks: public BLECharacteristicCallbacks {
     String lastRxValue;
+    uint32_t lastRxValueMs = 0;
     void onWrite(BLECharacteristic *pCharacteristic) {
       String rxValue = pCharacteristic->getValue();
       if (rxValue.length() == 2 && (uint8_t)rxValue[0] == BLE_CHUNK_ACK_MARKER) {
@@ -1008,11 +1254,30 @@ class MyCallbacks: public BLECharacteristicCallbacks {
       // Harmless there (just a log line); here it used to double-append into the RX buffer and,
       // combined with heap fragmentation, corrupt the reassembled save_profiles command down to
       // a garbage tail. Skip an exact repeat of the immediately-previous write.
-      if (rxValue == lastRxValue) {
-        Serial.println("BLE RX: duplicate write ignored");
+      //
+      // THE WINDOW IS LOAD-BEARING, and its absence was a real, shipped bug. Without it this
+      // guard never expires, so it compares against the previous write forever -- and the app's
+      // first command after reconnecting is byte-identical to its first command last session
+      // ({"cmd":"get_profiles"}). The result was that the device bonded and reconnected perfectly
+      // and then silently swallowed every command, which presented as "cannot reconnect, and
+      // restarting the app does not help" (the stale state is here, on the device, so only a
+      // reboot cleared it). Captured on hardware 2026-09-06: connect, encrypted=1 authenticated=1
+      // bonded=1, then "duplicate write ignored" and handleBleCommand never ran.
+      //
+      // Note the trap for anyone porting between the boards: ble_engine.cpp's onDisconnect says
+      // lastRxValue "needs no reset ... so it self-expires". That is true THERE because the
+      // Waveshare has this window. It was not true here, because this board did not.
+      //
+      // With the window, no reset on disconnect is needed: a reconnect takes seconds, thousands
+      // of times longer than 10ms, so the guard has long since expired.
+      uint32_t nowMs = millis();
+      if (rxValue == lastRxValue && (nowMs - lastRxValueMs) < BLE_RX_DUP_WINDOW_MS) {
+        Serial.printf("BLE RX: duplicate write ignored (%u bytes, %ums apart)\n",
+                      (unsigned)rxValue.length(), (unsigned)(nowMs - lastRxValueMs));
         return;
       }
       lastRxValue = rxValue;
+      lastRxValueMs = nowMs;
 
       Serial.print("BLE RX bytes: ");
       Serial.println(rxValue.length());
@@ -1072,120 +1337,29 @@ class TxLogCallbacks: public BLECharacteristicCallbacks {
     }
 };
 
-// The Bearer-token branch is removed along with the rest of the pairingToken scheme (M6/H1).
-// The legacy web UI on this board is gated on CONFIG_MODE only. The whole web server is slated
-// for removal (spec v3 §1 cuts the web config path permanently); that removal is out of scope
-// for M6 and is not attempted here.
-bool isAuthorized() {
-  return currentMode == CONFIG_MODE;
+// Painted from loop() on the pairingActive false->true edge. Never called from a BLE callback:
+// SecurityCallbacks::onPassKeyNotify runs on the BLE host task and only sets flags, because the
+// display belongs to the loop() task.
+void drawPairingScreen() {
+  auto& d = M5Dial.Display;
+  d.fillScreen(TFT_BLACK);
+  d.setTextDatum(middle_center);
+  d.setFont(&fonts::Orbitron_Light_24);
+  d.setTextColor(TFT_CYAN, TFT_BLACK);
+  d.drawString("PAIRING", 120, 60);
+
+  d.setTextColor(TFT_WHITE, TFT_BLACK);
+  d.drawString("Enter PIN:", 120, 110);
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%06u", (unsigned)currentPasskey);
+  d.drawString(buf, 120, 150);
 }
 
-void setupWebServer() {
-  server.enableCORS(true);
-
-  server.on("/", HTTP_GET, [](){
-    if (currentMode != CONFIG_MODE) {
-      server.send(403, "text/plain", "Forbidden. Swipe down on Draupnir to enter Config Mode.");
-      return;
-    }
-    server.send(200, "text/html", INDEX_HTML);
-  });
-  
-  // /api/pair removed with the pairingToken scheme (M6/H1).
-
-  server.on("/api/profiles", HTTP_GET, [](){
-    if (!isAuthorized()) {
-      server.send(401, "application/json", "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
-      return;
-    }
-    File file = LittleFS.open("/profiles.json", "r");
-    if(!file){
-      server.send(500, "text/plain", "Failed to open file");
-      return;
-    }
-    server.streamFile(file, "application/json");
-    file.close();
-  });
-  
-  server.on("/api/profiles", HTTP_POST, [](){
-    if (!isAuthorized()) {
-      server.send(401, "application/json", "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
-      return;
-    }
-    if(server.hasArg("plain")) {
-      String body = server.arg("plain");
-      File f = LittleFS.open("/profiles.json", "w");
-      if(f) {
-        f.print(body);
-        f.close();
-        server.send(200, "text/plain", "OK");
-        killAllMacros();
-        loadProfiles();
-        
-        int brightness = profilesDoc["settings"]["brightness"] | 160;
-        M5Dial.Display.setBrightness(brightness);
-        
-        int orientation = profilesDoc["settings"]["orientation"] | 0;
-        M5Dial.Display.setRotation(orientation);
-
-        requestRedraw();
-      } else {
-        server.send(500, "text/plain", "Failed to write");
-      }
-    } else {
-      server.send(400, "text/plain", "No body");
-    }
-  });
-  
-  server.on("/api/trigger", HTTP_POST, [](){
-    if (!isAuthorized()) {
-      server.send(401, "application/json", "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
-      return;
-    }
-    if(server.hasArg("plain")) {
-      String body = server.arg("plain");
-      JsonDocument req;
-      DeserializationError err = deserializeJson(req, body);
-      if(!err) {
-        int pIdx = req["profile"] | activeProfileIdx;
-        int mIdx = req["macro"] | -1;
-        
-        JsonArray profiles = profilesDoc["profiles"];
-        if (pIdx >= 0 && pIdx < profiles.size()) {
-          JsonObject prof = profiles[pIdx];
-          JsonArray macros = prof["macros"];
-          bool fired = false;
-          for (JsonObject m : macros) {
-            int pos = m["pos"] | -1;
-            if (pos == mIdx) {
-              fireMacro(m, mIdx);
-              fired = true;
-              break;
-            }
-          }
-          if (fired) {
-            server.send(200, "application/json", "{\"status\":\"ok\"}");
-          } else {
-            server.send(404, "application/json", "{\"status\":\"error\",\"message\":\"Macro not found\"}");
-          }
-        } else {
-          server.send(404, "application/json", "{\"status\":\"error\",\"message\":\"Profile not found\"}");
-        }
-      } else {
-        server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid JSON\"}");
-      }
-    } else {
-      server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"No body\"}");
-    }
-  });
-
-  server.begin();
-}
-
-void enterConfigMode() {
-  currentMode = CONFIG_MODE;
-  killAllMacros();
-  
+// Split out from enterConfigMode() so the pairing screen can repaint over itself when pairing
+// ends while the dial is sitting in Config Mode. requestRedraw() is only honoured by the
+// RUN_MODE branch of loop(), so without this the PAIRING screen stayed up until the next tap.
+// Drawing only -- no mode change, and crucially no killAllMacros().
+void drawConfigModeScreen() {
   auto& d = M5Dial.Display;
   d.fillScreen(TFT_BLACK);
   d.setTextDatum(middle_center);
@@ -1194,43 +1368,23 @@ void enterConfigMode() {
   d.drawString("CONFIG MODE", 120, 60);
   
   d.setFont(&fonts::Orbitron_Light_24);
+  // Was the Wi-Fi IP address, back when this screen told you where to point a browser. BLE is
+  // the only transport now, so the useful facts are which board this is and whether the app is
+  // actually attached.
   d.setTextColor(TFT_WHITE, TFT_BLACK);
-  d.drawString("IP Address:", 120, 110);
-  d.drawString(WiFi.localIP().toString(), 120, 140);
-  
+  d.drawString("BLE", 120, 100);
+  d.drawString("Draupnir_Mini", 120, 130);
+  d.setTextColor(deviceConnected ? TFT_GREEN : TFT_DARKGRAY, TFT_BLACK);
+  d.drawString(deviceConnected ? "app connected" : "waiting for app", 120, 160);
+
   d.setTextColor(TFT_DARKGRAY, TFT_BLACK);
   d.drawString("TAP TO EXIT", 120, 190);
 }
 
-void enterWiFiSetupMode() {
-  currentMode = WIFI_SETUP_MODE;
-  
+void enterConfigMode() {
+  currentMode = CONFIG_MODE;
   killAllMacros();
-  
-  auto& d = M5Dial.Display;
-  d.fillScreen(TFT_BLACK);
-  d.setTextDatum(middle_center);
-  d.setFont(&fonts::Orbitron_Light_24);
-  d.setTextColor(TFT_ORANGE, TFT_BLACK);
-  d.drawString("Wi-Fi SETUP", 120, 60);
-  
-  d.setFont(&fonts::Orbitron_Light_24);
-  d.setTextColor(TFT_WHITE, TFT_BLACK);
-  d.drawString("Connect to hotspot:", 120, 120);
-  d.drawString("Draupnir-Setup", 120, 150);
-  
-  server.stop(); 
-  
-  WiFiManager wm;
-  bool res = wm.startConfigPortal("Draupnir-Setup");
-  
-  if (!res) {
-    Serial.println("Failed to connect or hit timeout");
-  } else {
-    Serial.println("Connected to Wi-Fi!");
-  }
-  
-  ESP.restart();
+  drawConfigModeScreen();
 }
 
 void setup() {
@@ -1270,11 +1424,6 @@ void setup() {
   int orientation = profilesDoc["settings"]["orientation"] | 0;
   M5Dial.Display.setRotation(orientation);
   
-  WiFi.mode(WIFI_STA);
-  WiFi.begin();
-
-  setupWebServer();
-
   // USB must start before BLE on ESP32-S3 — USB.begin() disrupts BLE if it runs after
   Keyboard.begin();
   ConsumerControl.begin();
@@ -1285,27 +1434,87 @@ void setup() {
   // Initialize BLE
   bleRxQueue = xQueueCreate(4, sizeof(char*));
   bleAckQueue = xQueueCreate(1, sizeof(uint8_t));
-  BLEDevice::init("Draupnir");
+  // Advertised name. Deliberately NOT "Draupnir" — that is the Waveshare knob's name, and when
+  // both boards were on the air the companion app connected to whichever answered the scan
+  // first, with no way to tell them apart or to pick. The app matches any name containing
+  // "draupnir" (case-insensitive) so this still discovers normally; it just gives the picker
+  // something to distinguish. Changing this string breaks nothing else — the app never matches
+  // on the exact name, and the service UUID is unchanged.
+  BLEDevice::init("Draupnir_Mini");
   bleRxBuf = (char*)malloc(BLE_RX_BUFFER_SIZE);
   if (bleRxBuf == nullptr) {
     Serial.println("FATAL: failed to allocate BLE RX buffer");
   }
   BLEDevice::setMTU(512);
+
+  BLESecurity::setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
+  BLESecurity::setCapability(ESP_IO_CAP_OUT);
+  BLESecurity::setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+  BLESecurity::setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+  BLESecurity::setPassKey(false, 0); // false = randomly generated, not this fixed value
+  // A passkey fixed for the board's uptime is a weaker secret than a per-pairing one, and with
+  // bonding working the user only ever types it once anyway.
+  //
+  // ROLLBACK LADDER, in order, if unexplained resets into the ROM bootloader appear (this
+  // happened on the Waveshare during M6/H1 -- see docs/M6_Hardening_WorkOrder.md):
+  //   1. flip this to false,
+  //   2. drop PROPERTY_WRITE_AUTHEN from the RX characteristic below,
+  //   3. drop the ENC flags entirely -- which is this board's pre-M6 behaviour and is INSECURE.
+  //      Do NOT stop at step 3 and call it done; report the boot reason instead.
+  BLESecurity::regenPassKeyOnConnect(true);
+  BLEDevice::setSecurityCallbacks(new SecurityCallbacks());
+
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 
   BLEService *pService = pServer->createService(SERVICE_UUID);
+  // ---------------------------------------------------------------------------------------
+  // GATT permission enforcement. This is what the stack actually enforces; the
+  // BLESecurity::startSecurity() call in MyServerCallbacks::onConnect() is only a request a
+  // hostile central can ignore. Without these bits any central in radio range could write
+  // save_profiles or trigger -- i.e. inject keystrokes into the attached host.
+  //
+  // READ THIS BEFORE CHANGING IT. The permission API here differs from every Bluedroid example
+  // online. BLECharacteristic::setAccessPermissions() is a NO-OP on this core: its body is
+  // wrapped in #ifdef CONFIG_BLUEDROID_ENABLED, and BLEService::start() builds
+  // ble_gatt_chr_def.flags from m_properties, never from m_permissions. The enforcement bits
+  // live in the PROPERTIES bitmask instead. ENC = "encrypted link"; AUTHEN additionally means
+  // the key came from an MITM-protected pairing (our passkey display).
+  //
+  // CCCD: NimBLE creates the 0x2902 descriptor itself for any characteristic with NOTIFY, and
+  // BLECharacteristic::addDescriptor() explicitly discards a manually-added BLE2902 on this core
+  // (see its #ifdef CONFIG_NIMBLE_ENABLED early-return) -- so the old addDescriptor(new
+  // BLE2902()) was dead code and is removed. The auto-created CCCD is protected via
+  // BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC instead, which is what makes "subscribe to TX" require
+  // an encrypted link.
+  //
+  // KNOWN GAP: BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN (0x10000) cannot be applied through this
+  // wrapper -- BLECharacteristic.h:245 stores properties in esp_gatt_char_prop_t, a uint16_t,
+  // so the bit is silently truncated. The CCCD is therefore gated on encryption but not
+  // explicitly on authentication. That should not be exploitable here, because
+  // setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND) means this device will not complete a
+  // Just Works pairing at all, so any encrypted link is necessarily an authenticated one.
+  //
+  // VERIFIED on this board by hostile-central test, 2026-09-07: an unbonded central is refused.
+  // (The Waveshare's equivalent test was 2026-08-07.) Until then this was an inference from the
+  // MITM auth mode rather than an observation, and was labelled as such -- the label is removed
+  // now because the test was actually run, not because the reasoning got more convincing.
+  //
+  // It reopens the moment setAuthenticationMode() is relaxed away from *_MITM_*. If you change
+  // that line, this comment is void and the CCCD is genuinely unprotected against Just Works.
   pTxCharacteristic = pService->createCharacteristic(
                         CHARACTERISTIC_UUID_TX,
-                        BLECharacteristic::PROPERTY_NOTIFY
+                        BLECharacteristic::PROPERTY_NOTIFY |
+                        BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC
                       );
-  pTxCharacteristic->addDescriptor(new BLE2902());
   pTxCharacteristic->setCallbacks(new TxLogCallbacks());
 
   BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
                                            CHARACTERISTIC_UUID_RX,
                                            BLECharacteristic::PROPERTY_WRITE |
-                                           BLECharacteristic::PROPERTY_WRITE_NR
+                                           BLECharacteristic::PROPERTY_WRITE_NR |
+                                           BLECharacteristic::PROPERTY_WRITE_ENC |
+                                           BLECharacteristic::PROPERTY_WRITE_AUTHEN
                                          );
   pRxCharacteristic->setCallbacks(new MyCallbacks());
 
@@ -1322,159 +1531,152 @@ void setup() {
   Serial.println("Draupnir M5/M6 Ready");
 }
 
-bool waitRelease = false;
-
 void loop() {
   M5Dial.update();
-  
-  if (trellisFound) {
+
+  // Edge-triggered, not level-triggered: this display is painted imperatively, so repainting
+  // every tick would flicker and never repainting would leave the passkey up forever.
+  static bool wasPairing = false;
+  bool isPairing = pairingActive;
+  if (isPairing != wasPairing) {
+    if (isPairing) {
+      drawPairingScreen();
+    } else if (currentMode == CONFIG_MODE) {
+      // requestRedraw() would be ignored -- only the RUN_MODE branch below dispatches it.
+      drawConfigModeScreen();
+    } else {
+      requestRedraw();
+    }
+    wasPairing = isPairing;
+  }
+
+  // Not while the passkey is up: trellis.read() dispatches trellisEvent(), which fires macros.
+  if (trellisFound && !isPairing) {
     trellis.read();
   }
-  
+
   if (currentMode == RUN_MODE) {
-    server.handleClient();
     updateMacros();
-    
-    if (WiFi.status() == WL_CONNECTED && !mdnsStarted) {
-      if (MDNS.begin("draupnir")) {
-        Serial.println("MDNS started: draupnir.local");
-        MDNS.addService("http", "tcp", 80);
-      }
-      Serial.print("Wi-Fi connected! IP: ");
-      Serial.println(WiFi.localIP());
-      mdnsStarted = true;
-    }
-    
-    long newPosRaw = M5Dial.Encoder.read();
-    long newPos = newPosRaw / 4;
-    if (newPos != oldPosition) {
-      if (inRotaryMode) {
-        JsonArray actions = activeRotaryMacro["actions"];
-        if (newPos > oldPosition) {
-          if (actions.size() > 0) executeAction(actions[0]);
-          oldPosition++;
-        } else {
-          if (actions.size() > 1) executeAction(actions[1]);
-          oldPosition--;
-        }
-      } else {
-        M5Dial.Speaker.tone(1000, 10);
-        selectedMacroIdx = (newPos % 16);
-        if (selectedMacroIdx < 0) selectedMacroIdx += 16;
-        oldPosition = newPos;
-        requestRedraw();
-      }
-    }
-    
-    if (uiNeedsRedraw && millis() - lastRedrawTime > 50) {
-      drawRunUI();
-      uiNeedsRedraw = false;
-      lastRedrawTime = millis();
-    }
-    
-    if (M5Dial.BtnA.wasReleased()) {
-      if (inRotaryMode) {
-        inRotaryMode = false;
-        M5Dial.Speaker.tone(2000, 30);
-        requestRedraw();
-      } else {
-        Serial.println("Knob pressed. Firing macro...");
-        M5Dial.Speaker.tone(4000, 30);
-        
-        JsonArray profiles = profilesDoc["profiles"];
-        JsonObject prof = profiles[activeProfileIdx];
-        JsonArray macros = prof["macros"];
-        
-        for (JsonObject m : macros) {
-          if (m["pos"] == selectedMacroIdx) {
-            fireMacro(m, selectedMacroIdx);
-            break;
+
+    // The pairing screen owns the display and the inputs while it is up. Someone reading a PIN
+    // off the glass must not fire a macro into their host by brushing it. Macros already running
+    // are still serviced above; the queued redraw is deliberately NOT dispatched in here either,
+    // because drawRunUI() would paint straight over the passkey.
+    if (!isPairing) {
+      long newPosRaw = M5Dial.Encoder.read();
+      long newPos = newPosRaw / 4;
+      if (newPos != oldPosition) {
+        if (inRotaryMode) {
+          JsonArray actions = activeRotaryMacro["actions"];
+          if (newPos > oldPosition) {
+            if (actions.size() > 0) executeAction(actions[0]);
+            oldPosition++;
+          } else {
+            if (actions.size() > 1) executeAction(actions[1]);
+            oldPosition--;
           }
+        } else {
+          M5Dial.Speaker.tone(1000, 10);
+          selectedMacroIdx = (newPos % 16);
+          if (selectedMacroIdx < 0) selectedMacroIdx += 16;
+          oldPosition = newPos;
+          requestRedraw();
         }
       }
-    }
-    
-    if (M5Dial.BtnA.wasHold()) {
-      M5Dial.Speaker.tone(2000, 100);
-      waitRelease = true;
-      enterWiFiSetupMode();
-    }
-    
-    auto touch = M5Dial.Touch.getDetail();
-    if (touch.wasReleased()) {
-      bool changed = false;
-      JsonArray profiles = profilesDoc["profiles"];
-      int numProfiles = profiles.size();
       
-      if (touch.distanceY() < -40 && abs(touch.distanceX()) < 30) {
-        // Swipe Up -> Kill All
-        M5Dial.Speaker.tone(1000, 50);
-        delay(50);
-        M5Dial.Speaker.tone(800, 50);
-        killAllMacros();
-      } else if (touch.distanceY() > 40 && abs(touch.distanceX()) < 30) {
-        // Swipe Down -> Enter Config Mode
-        M5Dial.Speaker.tone(1500, 50);
-        enterConfigMode();
-      } else if (abs(touch.distanceX()) < 10 && touch.y > 60 && touch.y < 180) { 
-        if (inRotaryMode && touch.x >= 80 && touch.x <= 160 && touch.y >= 80 && touch.y <= 160) {
+      if (uiNeedsRedraw && millis() - lastRedrawTime > 50) {
+        drawRunUI();
+        uiNeedsRedraw = false;
+        lastRedrawTime = millis();
+      }
+      
+      if (M5Dial.BtnA.wasReleased()) {
+        if (inRotaryMode) {
           inRotaryMode = false;
           M5Dial.Speaker.tone(2000, 30);
           requestRedraw();
-        } else if (!inRotaryMode) {
-          if (touch.x < 80 && activeProfileIdx > 0) {
-            activeProfileIdx--;
-            changed = true;
-          } else if (touch.x > 160 && activeProfileIdx < numProfiles - 1) {
-            activeProfileIdx++;
-            changed = true;
-          } else if (touch.x >= 80 && touch.x <= 160 && touch.y >= 80 && touch.y <= 160) {
-            Serial.println("Screen tapped. Firing macro...");
-            M5Dial.Speaker.tone(4000, 30);
-            
-            JsonObject prof = profiles[activeProfileIdx];
-            JsonArray macros = prof["macros"];
-            
-            for (JsonObject m : macros) {
-              if (m["pos"] == selectedMacroIdx) {
-                fireMacro(m, selectedMacroIdx);
-                break;
-              }
+        } else {
+          Serial.println("Knob pressed. Firing macro...");
+          M5Dial.Speaker.tone(4000, 30);
+          
+          JsonArray profiles = profilesDoc["profiles"];
+          JsonObject prof = profiles[activeProfileIdx];
+          JsonArray macros = prof["macros"];
+          
+          for (JsonObject m : macros) {
+            if (m["pos"] == selectedMacroIdx) {
+              fireMacro(m, selectedMacroIdx);
+              break;
             }
           }
         }
-      } else if (touch.distanceX() > 40 && activeProfileIdx > 0 && !inRotaryMode) { 
-        activeProfileIdx--;
-        changed = true;
-      } else if (touch.distanceX() < -40 && activeProfileIdx < numProfiles - 1 && !inRotaryMode) { 
-        activeProfileIdx++;
-        changed = true;
       }
       
-      if (changed) {
-        prefs.putInt("activeProfile", activeProfileIdx);
-        M5Dial.Speaker.tone(3000, 30);
-        killAllMacros(); // Kill macros on profile change just to be safe
-        requestRedraw();
+      auto touch = M5Dial.Touch.getDetail();
+      if (touch.wasReleased()) {
+        bool changed = false;
+        JsonArray profiles = profilesDoc["profiles"];
+        int numProfiles = profiles.size();
+        
+        if (touch.distanceY() < -40 && abs(touch.distanceX()) < 30) {
+          // Swipe Up -> Kill All
+          M5Dial.Speaker.tone(1000, 50);
+          delay(50);
+          M5Dial.Speaker.tone(800, 50);
+          killAllMacros();
+        } else if (touch.distanceY() > 40 && abs(touch.distanceX()) < 30) {
+          // Swipe Down -> Enter Config Mode
+          M5Dial.Speaker.tone(1500, 50);
+          enterConfigMode();
+        } else if (abs(touch.distanceX()) < 10 && touch.y > 60 && touch.y < 180) { 
+          if (inRotaryMode && touch.x >= 80 && touch.x <= 160 && touch.y >= 80 && touch.y <= 160) {
+            inRotaryMode = false;
+            M5Dial.Speaker.tone(2000, 30);
+            requestRedraw();
+          } else if (!inRotaryMode) {
+            if (touch.x < 80 && activeProfileIdx > 0) {
+              activeProfileIdx--;
+              changed = true;
+            } else if (touch.x > 160 && activeProfileIdx < numProfiles - 1) {
+              activeProfileIdx++;
+              changed = true;
+            } else if (touch.x >= 80 && touch.x <= 160 && touch.y >= 80 && touch.y <= 160) {
+              Serial.println("Screen tapped. Firing macro...");
+              M5Dial.Speaker.tone(4000, 30);
+              
+              JsonObject prof = profiles[activeProfileIdx];
+              JsonArray macros = prof["macros"];
+              
+              for (JsonObject m : macros) {
+                if (m["pos"] == selectedMacroIdx) {
+                  fireMacro(m, selectedMacroIdx);
+                  break;
+                }
+              }
+            }
+          }
+        } else if (touch.distanceX() > 40 && activeProfileIdx > 0 && !inRotaryMode) { 
+          activeProfileIdx--;
+          changed = true;
+        } else if (touch.distanceX() < -40 && activeProfileIdx < numProfiles - 1 && !inRotaryMode) { 
+          activeProfileIdx++;
+          changed = true;
+        }
+        
+        if (changed) {
+          prefs.putInt("activeProfile", activeProfileIdx);
+          M5Dial.Speaker.tone(3000, 30);
+          killAllMacros(); // Kill macros on profile change just to be safe
+          requestRedraw();
+        }
       }
-    }
+    } // end !isPairing
   } else if (currentMode == CONFIG_MODE) {
-    server.handleClient();
     auto touch = M5Dial.Touch.getDetail();
-    if (touch.wasReleased() || M5Dial.BtnA.wasReleased()) {
+    if (!isPairing && (touch.wasReleased() || M5Dial.BtnA.wasReleased())) {
       currentMode = RUN_MODE;
       M5Dial.Speaker.tone(2000, 30);
       requestRedraw();
-    }
-  } else if (currentMode == WIFI_SETUP_MODE) {
-    server.handleClient();
-    
-    if (waitRelease && M5Dial.BtnA.isReleased()) {
-      waitRelease = false;
-    }
-    
-    if (!waitRelease && M5Dial.BtnA.wasPressed()) {
-      ESP.restart();
     }
   }
   
@@ -1490,25 +1692,18 @@ void loop() {
 
   // BLE reconnection handling
   if (!deviceConnected && oldDeviceConnected) {
-    // Restore WiFi/web access for Config Mode now that BLE no longer needs exclusive radio time.
-    // Routes are already registered from setup()'s setupWebServer() call — just restart the
-    // listener, don't re-register them.
-    WiFi.mode(WIFI_STA);
-    WiFi.begin();
-    server.begin();
     delay(500); // give the bluetooth stack the chance to get ready
     BLEDevice::startAdvertising(); // restart advertising (pServer->startAdvertising silently fails on ESP32)
     Serial.println("Restart BLE advertising");
     oldDeviceConnected = deviceConnected;
   }
   if (deviceConnected && !oldDeviceConnected) {
-    // WiFi STA + the web server aren't needed at the same time as a BLE session in practice — and
-    // WiFi/BLE radio coexistence was the leading suspect for large BLE notify chunks being
-    // silently dropped (verified: tiny ~20B chunks were reliable, 500B chunks weren't). Freeing
-    // the radio for BLE's exclusive use while a client is connected removes that contention.
-    server.stop();
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
+    // Was: server.stop(); WiFi.disconnect(true); WiFi.mode(WIFI_OFF). WiFi/BLE radio coexistence
+    // was the leading suspect for large BLE notify chunks being silently dropped (verified: ~20B
+    // chunks were reliable, 500B chunks weren't), so WiFi was paused for the duration of every
+    // BLE session. Deleting WiFi outright subsumes that fix -- contention cannot recur on a radio
+    // that is never brought up. Kept as an explicit branch because the transition pair is a
+    // recognisable idiom and the disconnect side above still does real work.
     oldDeviceConnected = deviceConnected;
   }
   

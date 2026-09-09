@@ -8,14 +8,19 @@ start until this lands.
 
 ---
 
-> ## Status — updated 2026-07-25
+> ## Status — **M6 COMPLETE**, updated 2026-09-07
 >
-> **All seven tasks are code-complete and compile-verified. None is hardware-verified.**
+> **Done and hardware-verified.** The milestone's defining test — an unbonded BLE central being
+> rejected — **passed on the Waveshare 2026-08-07** (nRF Connect, pairing declined; the handler
+> never saw the bytes across four unencrypted connections, and CCCD writes never completed).
 > Commits, in order: `8051a7d` (H2), `c868e31` (H3), `0c09ef8` (H4), `d2edc07` (H5),
 > `798fa46` (H6), `a2733c7` (H7), `3607a28` (H1). Baseline is `6373651`.
 >
-> **M6 is NOT complete.** The milestone's defining test — an unbonded BLE central being rejected
-> — has not been run. See H1's verification section.
+> **The same hardening later shipped to the M5Dial**, whose own hostile-central test passed
+> **2026-09-07** — see `docs/HANDOFF.md` §4. Both supported boards are now proven by refusal.
+>
+> *The rest of this document is the original 2026-07-25 work order, kept as the implementation
+> record. Its per-task "not yet verified" notes describe that date, not today.*
 >
 > **Two prescriptions in H1 as originally written were wrong for this core** and have been
 > corrected in place below; the notes are kept rather than deleted because the reasoning matters.
