@@ -35,16 +35,21 @@ IN_APP_COLORS = 128
 GLYPH_BOX = (0.395, 0.305, 0.675, 0.735)
 GLYPH_PX = 192
 
+# The launcher icons use the GLYPH, not the full mark, for the same reason the AppBar does: at
+# 48-192px the raven's linework and the rune rim turn to mush. Confirmed on device at both sizes.
+# The full logo is reserved for the connection screen, where it has room to be read.
+#
 # Legacy launcher icons get an opaque dark ground; a transparent legacy icon renders
 # inconsistently across launchers, and the mark is drawn for a dark backdrop.
 LEGACY_DENSITIES = [("mdpi", 48), ("hdpi", 72), ("xhdpi", 96), ("xxhdpi", 144), ("xxxhdpi", 192)]
-LEGACY_CONTENT = 0.86
+LEGACY_CONTENT = 0.60
 
-# Adaptive icons (Android 8+) are masked by the launcher; the outer ~22% of the foreground can be
-# cropped, so the mark occupies only the inner ~62% and survives a circle, squircle or
-# rounded-square mask intact.
+# Adaptive icons (Android 8+) are masked by the launcher. The visible area is the central 72 of
+# 108dp, and a circular mask inscribes a circle in that — so a TALL glyph needs more margin than a
+# wide one, or its top and bottom get clipped by the curve. 0.50 keeps the full rune inside the
+# circle with room to spare.
 ADAPTIVE_DENSITIES = [("mdpi", 108), ("hdpi", 162), ("xhdpi", 216), ("xxhdpi", 324), ("xxxhdpi", 432)]
-ADAPTIVE_CONTENT = 0.62
+ADAPTIVE_CONTENT = 0.50
 
 
 def fit_square(img, canvas_px, content_frac, background=None):
@@ -75,9 +80,13 @@ def main():
     logo.save(out, optimize=True)
     print("  assets/logo.png", logo.size, os.path.getsize(out), "bytes")
 
+    # The glyph crop, at full quality. Used both as the in-app AppBar asset and as the source for
+    # every launcher icon, so the two never drift apart.
     gx0, gy0, gx1, gy1 = GLYPH_BOX
-    glyph = src.crop((int(w * gx0), int(h * gy0), int(w * gx1), int(h * gy1)))
-    glyph = fit_square(glyph, GLYPH_PX, 1.0)
+    glyph_src = src.crop((int(w * gx0), int(h * gy0), int(w * gx1), int(h * gy1)))
+    print("  glyph crop:", glyph_src.size)
+
+    glyph = fit_square(glyph_src, GLYPH_PX, 1.0)
     # The rune is one colour plus a gradient, so a small palette costs nothing visible.
     glyph = glyph.quantize(colors=64, method=Image.FASTOCTREE)
     out = os.path.join(assets_dir, "glyph.png")
@@ -87,13 +96,13 @@ def main():
     for name, px in LEGACY_DENSITIES:
         out = os.path.join(RES, "mipmap-" + name, "ic_launcher.png")
         os.makedirs(os.path.dirname(out), exist_ok=True)
-        fit_square(src, px, LEGACY_CONTENT, BG).convert("RGB").save(out, optimize=True)
+        fit_square(glyph_src, px, LEGACY_CONTENT, BG).convert("RGB").save(out, optimize=True)
         print("  ic_launcher", name, px)
 
     for name, px in ADAPTIVE_DENSITIES:
         out = os.path.join(RES, "mipmap-" + name, "ic_launcher_foreground.png")
         os.makedirs(os.path.dirname(out), exist_ok=True)
-        fit_square(src, px, ADAPTIVE_CONTENT).save(out, optimize=True)
+        fit_square(glyph_src, px, ADAPTIVE_CONTENT).save(out, optimize=True)
         print("  ic_launcher_foreground", name, px)
 
     anydpi = os.path.join(RES, "mipmap-anydpi-v26")
