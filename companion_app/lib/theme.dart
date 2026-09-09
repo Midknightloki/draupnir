@@ -6,9 +6,13 @@ class AppTheme {
   static const Color surface = Color(0xFF1E1E1E);
   static const Color surfaceHighlight = Color(0xFF2A2A2A);
   
-  // Razer Synapse / Gamer accents
-  static const Color accent = Color(0xFF00FF00); // Bright Neon Green
-  static const Color accentDim = Color(0xFF004400); 
+  // Brand palette, sampled from the Draupnir Forge logo (assets/logo.png) rather than picked by
+  // eye: cyan is the raven, magenta the rune rim, gold the centre bind-rune. Replaces the earlier
+  // neon green, which was a Razer-Synapse-inspired placeholder and clashed with the mark.
+  static const Color accent = Color(0xFF48F0D8);     // raven cyan
+  static const Color accentDim = Color(0xFF0E3A35);  // same hue, dark enough for fills behind text
+  static const Color brandMagenta = Color(0xFFC048C0); // rune rim
+  static const Color brandGold = Color(0xFFF0C040);    // centre bind-rune
 
   static const Color textPrimary = Color(0xFFEEEEEE);
   static const Color textSecondary = Color(0xFFAAAAAA);

@@ -27,6 +27,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
     return Scaffold(
       appBar: AppBar(
+        // The mark, small, beside the mode label. The title stays the MODE ("CONFIGURATOR" /
+        // "VIRTUAL DECK") rather than the product name — it is doing useful work telling you
+        // which mode you are in, and the logo carries the branding without displacing it.
+        leading: Padding(
+          padding: const EdgeInsets.all(8),
+          child: Image.asset('assets/logo.png', fit: BoxFit.contain),
+        ),
         title: Text(
           state.isEditorMode ? 'CONFIGURATOR' : 'VIRTUAL DECK',
           style: GoogleFonts.orbitron(fontWeight: FontWeight.bold),
@@ -480,6 +487,25 @@ class _DashboardScreenState extends State<DashboardScreen> {
       // on-device web UI, which is cut permanently (spec v3 §1, §7).
       child: Column(
         children: [
+          // The front door of the app: before a connection there is nothing else on screen, so
+          // this is where the mark earns its place rather than competing with the ring.
+          Image.asset(
+            'assets/logo.png',
+            width: 180,
+            fit: BoxFit.contain,
+            semanticLabel: 'Draupnir Forge',
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'DRAUPNIR FORGE',
+            style: GoogleFonts.orbitron(
+              fontWeight: FontWeight.bold,
+              fontSize: 18,
+              letterSpacing: 2,
+              color: AppTheme.textPrimary,
+            ),
+          ),
+          const SizedBox(height: 16),
           const Text(
             'Pair "Draupnir" in your phone\'s Bluetooth settings first — the knob shows the PIN '
             'on its screen.',
