@@ -54,8 +54,9 @@ Full brief: `docs/Draupnir_Spec.md` (v3). Read it before design work.
   **Holocron Labs**, applicationId **`net.holocronlabs.draupnir`** -- reverse-DNS of a domain
   the owner controls, leaving `net.holocronlabs.*` for sibling apps. This **cannot change after
   the first Play release** (a different package is a different app, with no upgrade path for
-  anyone who installed the first), and the same string becomes the iOS bundle ID. Not in the
-  code yet: `build.gradle.kts` still says `com.example.companion_app`, which Play rejects.
+  anyone who installed the first), and the same string becomes the iOS bundle ID. **In the code
+  as of 2026-09-09** — `namespace`, `applicationId`, and the Kotlin package that `namespace`
+  forces `MainActivity` to live in.
 
 ## Toolchain — arduino-cli (agent-driven, primary path)
 ```

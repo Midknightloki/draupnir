@@ -523,9 +523,31 @@ different app on Play, with no upgrade path for anyone who installed the first o
 becomes the iOS bundle ID later (iOS is a separate, later milestone; the `ios/` platform folder
 does not exist yet and needs a Mac).
 
-It is **not in the code yet** — `android/app/build.gradle.kts` still carries
-`com.example.companion_app` for both `namespace` and `applicationId`, which Play rejects outright.
-Changing it is part of M11a.
+**It is in the code as of 2026-09-09**, verified in the built release APK rather than the source:
+the merged manifest carries `net.holocronlabs.draupnir` with no trace of `com.example`. Note that
+`namespace` is not just a string — it dictates where `MainActivity` must live, so the Kotlin source
+moved to `kotlin/net/holocronlabs/draupnir/` with a matching `package` declaration.
+
+**Permission hygiene landed with it**, and was verified by parsing the merged release manifest:
+
+| | |
+|---|---|
+| `INTERNET` | **removed** — release only; `src/debug` and `src/profile` keep it, which is why hot reload still works |
+| `BLUETOOTH_ADVERTISE` | **removed** — this app is a BLE central; it never advertises |
+| `ACCESS_FINE_LOCATION` | **bounded to `maxSdkVersion=30`** — on API 31+ `neverForLocation` replaces it, so a modern phone is never asked for location |
+| `usesCleartextTraffic` | **removed** — another leftover of the cut Wi-Fi UI |
+
+Dropping `INTERNET` is what makes "collects no data, shares no data" an honest Data Safety
+declaration rather than one the manifest contradicts. `package:http` went with it, confirmed unused
+first.
+
+`.gitignore` now carries keystore patterns, deliberately **before any keystore exists** — that
+ordering is the whole protection, since `.gitignore` cannot retroactively un-commit anything and
+this repo is public. **No key has been generated yet**, and no signed bundle has been built. Those
+are the two remaining pieces of M11a.
+
+> **A trap worth knowing:** XML comments cannot contain `--`, which this project uses freely as an
+> em-dash in C++ and Dart. The first manifest edit failed to parse for that reason alone.
 
 The probe is already done, and it came back clean: `flutter build apk --release` and `appbundle`
 both succeed, and **BLE works from the release APK** — R8 does not strip anything
