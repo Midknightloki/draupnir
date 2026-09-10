@@ -506,9 +506,26 @@ macros).
 
 ### Step 3 — M11, publish to Google Play
 
-Scoped but not designed. **The applicationId is decided: `net.l0k1.draupnir`** — permanent once
-published, and it becomes the iOS bundle ID later (iOS is a separate, later milestone; the `ios/`
-platform folder does not exist yet and needs a Mac).
+Scoped but not designed.
+
+**Publisher identity is decided (2026-09-09):**
+
+| | |
+|---|---|
+| `applicationId` | **`net.holocronlabs.draupnir`** |
+| Developer name | **Holocron Labs** |
+
+Reverse-DNS of `holocronlabs.net`, a domain the owner controls, which is the convention that keeps
+the namespace from colliding with anyone else's — and it leaves `net.holocronlabs.*` free for the
+other apps planned under that identity. It supersedes an earlier `net.l0k1.draupnir`, changed
+before first publish precisely because **it can never be changed after**: a different package is a
+different app on Play, with no upgrade path for anyone who installed the first one. The same string
+becomes the iOS bundle ID later (iOS is a separate, later milestone; the `ios/` platform folder
+does not exist yet and needs a Mac).
+
+It is **not in the code yet** — `android/app/build.gradle.kts` still carries
+`com.example.companion_app` for both `namespace` and `applicationId`, which Play rejects outright.
+Changing it is part of M11a.
 
 The probe is already done, and it came back clean: `flutter build apk --release` and `appbundle`
 both succeed, and **BLE works from the release APK** — R8 does not strip anything

@@ -50,6 +50,12 @@ Full brief: `docs/Draupnir_Spec.md` (v3). Read it before design work.
 - **Storage:** `profiles.json` in LittleFS (atomic write via tmp + rename); last profile +
   brightness in NVS.
 - **Open source** (firmware + hardware), MIT.
+- **Publisher identity (permanent):** the companion app publishes as **Draupnir Forge** by
+  **Holocron Labs**, applicationId **`net.holocronlabs.draupnir`** -- reverse-DNS of a domain
+  the owner controls, leaving `net.holocronlabs.*` for sibling apps. This **cannot change after
+  the first Play release** (a different package is a different app, with no upgrade path for
+  anyone who installed the first), and the same string becomes the iOS bundle ID. Not in the
+  code yet: `build.gradle.kts` still says `com.example.companion_app`, which Play rejects.
 
 ## Toolchain — arduino-cli (agent-driven, primary path)
 ```
