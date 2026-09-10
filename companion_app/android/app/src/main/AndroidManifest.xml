@@ -1,26 +1,41 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- PERMISSIONS ARE DELIBERATELY MINIMAL. Every one below is justified; anything not listed
+         was removed on purpose. Adding one back is a Play review question and a user-trust cost,
+         so justify it here rather than pasting it from a plugin's README.
 
-    <!-- Request legacy Bluetooth permissions on older devices. -->
+         NO INTERNET. This app makes zero network calls – no analytics, no crash reporting, no
+         accounts, no cloud. Everything happens over BLE to hardware in the user's hand. That is
+         what makes the Play Data Safety declaration "collects no data, shares no data", and
+         declaring network access we never use would undermine it for nothing. Debug and profile
+         builds still get INTERNET from their own manifests (src/debug, src/profile) because the
+         Flutter tool needs it for hot reload – release builds do not. -->
+
+    <!-- Legacy Bluetooth, Android 11 (API 30) and below only. Superseded by the _SCAN/_CONNECT
+         split on API 31+. -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
 
-    <!-- Needed only if your app looks for Bluetooth devices. -->
+    <!-- Scanning, to find a Draupnir. neverForLocation is an assertion we mean: scan results are
+         used to match a device name and connect, never to derive position. -->
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
 
-    <!-- Needed only if your app makes the device discoverable to other devices. -->
-    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
-
-    <!-- Needed only if your app communicates with already-paired Bluetooth devices. -->
+    <!-- Talking to the board once connected. -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
-    <!-- Needed only if your app uses Bluetooth scan results to derive physical location. -->
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <!-- Location, ONLY on Android 11 and below, where the platform required it for BLE scanning
+         and offered no way to opt out. On API 31+ the neverForLocation flag above replaces it, so
+         the ceiling keeps a modern device from ever being asked for location by this app. Without
+         the ceiling this reads as an unexplained location grab – a Play review question and a
+         reasonable thing for a user to distrust. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+
+    <!-- BLUETOOTH_ADVERTISE is NOT declared. This app is a BLE central: it scans and connects.
+         It never advertises. The permission came from plugin boilerplate. -->
+
     <application
         android:label="Draupnir Forge"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher"
-        android:usesCleartextTraffic="true">
+        android:icon="@mipmap/ic_launcher">
         <activity
             android:name=".MainActivity"
             android:exported="true"
