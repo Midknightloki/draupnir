@@ -1514,12 +1514,13 @@ void setup() {
   // tap-to-fire and swipe-down-to-kill both work. The encoder is NOT a valid check for this --
   // it kept working right through the original failure, which is what made the bug misleading.
   //
-  // STILL OPEN, and unrelated to the above: the motor produces no felt output. haptics_init()
-  // reports the DRV2605 present at 0x5A with status 0xA0 (DEVICE_ID 5, no fault bits) and
-  // configures cleanly, but a pulse cannot be felt. Untested candidates: no actuator populated,
-  // an LRA driven in ERM mode (haptics.cpp predicts 'weakly or not at all'), an unasserted EN
-  // pin. The DRV2605's own diagnostic mode (MODE=0x06, set GO, read DIAG_RESULT) distinguishes
-  // these in one flash and is the right next step -- do not guess between them.
+  // The motor on THIS unit does not respond, and it is a HARDWARE fault, not a firmware one.
+  // Measured 2026-09-09 with the DRV2605's own actuator diagnostic: DIAG_RESULT=1 with
+  // OC_DETECT=1, while every configuration register read back exactly as written. ERM, LRA and
+  // full-amplitude Real-Time Playback were all tried; nothing was felt on any of them. See
+  // haptics.cpp for the full measurement. Haptics is therefore implemented-but-unconfirmed on
+  // this board -- do not spend another round on drive mode or register configuration; the open
+  // question is whether that motor is wired to this driver, and it needs a multimeter.
   //
   // Note also that haptics_pulse() has exactly ONE call site (swipe-down kill-all, and only
   // while a macro runs). That is not really 'haptic feedback' yet; wiring it to macro fire and

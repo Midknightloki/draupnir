@@ -89,12 +89,25 @@ void haptics_init() {
   drv_write(DRV2605_REG_BREAK, 0x00);
   drv_write(DRV2605_REG_AUDIOMAX, 0x64);
 
-  // ERM open-loop, library A. ERM (eccentric rotating mass) is the assumption: it suits the small
-  // coin motors these boards usually carry, and open loop avoids needing an auto-calibration pass.
+  // ERM open-loop, library A. ERM (eccentric rotating mass) suits the small coin motors these
+  // boards usually carry, and open loop avoids needing an auto-calibration pass.
   //
-  // If the motor turns out to be an LRA, this drives it weakly or not at all rather than damaging
-  // anything -- the fix is to set the FEEDBACK N_ERM_LRA bit (0x80) and use library 6. Judge by
-  // whether the buzz is clearly felt.
+  // THIS UNIT'S MOTOR DOES NOT RESPOND, AND IT IS NOT A DRIVE-MODE PROBLEM. Measured on hardware
+  // 2026-09-09 with the DRV2605's own actuator diagnostic (MODE 0x06):
+  //
+  //     STATUS=0xA9  DIAG_RESULT=1 (actuator missing/open/short)  OC_DETECT=1 (over-current)
+  //
+  // Every register above was read back exactly as written (MODE 0x00, LIBRARY 0x01, WAVESEQ1
+  // 0x01, FEEDBACK 0x36 -> ERM, CONTROL3 0xA0 -> open loop), so the configuration is correct and
+  // the writes stick. Driving it three ways -- ERM waveform, LRA waveform with library 6, and
+  // Real-Time Playback at full amplitude, which bypasses the effect ROM entirely -- produced
+  // nothing felt on any of them. A motor is physically present in the enclosure (owner confirmed
+  // by eye), but the driver reports its output terminals as faulted.
+  //
+  // So the ERM-vs-LRA question this comment used to pose is ANSWERED and is not the issue:
+  // switching to LRA was tried and changed nothing. Do not spend another round on drive mode.
+  // The open question is electrical -- whether that motor is wired to this driver at all, and
+  // whether its leads are intact -- and it needs a multimeter, not a firmware change.
   uint8_t feedback = 0;
   if (drv_read(DRV2605_REG_FEEDBACK, &feedback)) {
     drv_write(DRV2605_REG_FEEDBACK, feedback & 0x7F); // N_ERM_LRA = 0 -> ERM
@@ -122,3 +135,4 @@ void haptics_pulse() {
 bool haptics_available() {
   return s_available;
 }
+
