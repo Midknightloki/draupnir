@@ -1,6 +1,6 @@
 # Draupnir — Session Handoff
 
-*Written 2026-08-22, updated 2026-09-06 for the M5Dial security gate. Pick up here.*
+*Written 2026-08-22, updated 2026-09-09. Pick up here.*
 
 This is a continuation brief for whoever works on Draupnir next — another agent, a fresh session,
 or the owner. It assumes **no prior context**.
@@ -48,71 +48,35 @@ is a keyboard — are deleted outright. Both supported boards are now on the sam
 and both are proven by **refusal**, not merely by acceptance: the hostile-central test passed on
 the Waveshare 2026-08-07 and on the M5Dial 2026-09-07. Nothing security-related is outstanding.
 
-**Profile export/import is built and verified on the M5Dial** (2026-09-08) — an enveloped JSON
-file, whole-config restore, single-profile sharing via the OS share sheet, and an undo that
-survives an app restart. One criterion is deliberately still open: the **cross-device** transfer,
-which is the only test that can prove custom icons actually travel. See §4 and §6 Step 1.
+**Profile export/import is done and fully verified** — an enveloped JSON file, whole-config
+restore, single-profile sharing via the OS share sheet, and an undo that survives an app restart.
+Verified on the M5Dial 2026-09-08, and the **cross-device** transfer — the criterion a same-device
+round trip structurally cannot prove — passed on both boards 2026-09-09.
+
+**The app is rebranded as Draupnir Forge** (logo, launcher icon, brand palette), in PR #12.
+
+**The haptics/touch conflict is solved** (2026-09-09): the cause was a diagnostic I²C bus scan, not
+haptics. See §4 finding 6. The motor still produces no felt output — a separate, still-open
+question, listed under NOT verified.
 
 ---
 
 ## 3. Where things stand
 
-Branch **`feat/profile-export-import`**, 8 commits ahead of `feat/m5dial-security-gate`:
+**Everything through export/import is merged to `master`.** The stacked-branch era is over: the
+five feature branches and the `review/waveshare-m6-foundation` integration branch are all merged
+and deleted, and `main` (a stale M6-era branch that had neither the security gate nor
+export/import) is gone. `master` is the default and the only long-lived branch.
 
-```
-555d378  feat: get_profiles include_icons on the Waveshare
-cab5bec  feat: get_profiles include_icons on the M5Dial
-37a42bb  feat: profile transfer envelope, with tests
-1575b8a  feat: fetch profiles with icons, for export only
-a5940b4  feat: import, pre-import snapshot, and undo
-02547d0  feat: export/import UI with cross-device warning and undo
-d214be2  fix: export via the OS share sheet — getSaveLocation is a no-op on Android
-```
+**Open: PR #12, `feat/branding-draupnir-forge` -> `master`** — the Draupnir Forge rebrand, plus a
+merge of the security gate and export/import that predated master catching up.
 
-`d214be2` is a fix for a bug in this branch's own Task 6, not pre-existing — see §4. This branch
-adds the first real unit tests in the repo (`companion_app/test/profile_transfer_test.dart`, 16
-cases); `flutter test` is now a meaningful gate for Dart code, though the firmware still has none.
+A caution earned the hard way. Four PRs once all showed "merged" while `master` had **neither** the
+security gate nor export/import, because each had merged into its own stacked base and nothing
+propagated upward. `master` sat for a while missing the milestone that closed a remote
+keystroke-injection hole. **PR into `master` directly**; do not rebuild the stack.
 
-Under it, branch **`feat/m5dial-security-gate`** is 8 commits ahead of `feat/m8b-uncap-pos`, which
-it branches from:
-
-```
-7384294  feat: delete the M5Dial web server and all Wi-Fi
-e21a69d  feat: enforce BLE pairing on the M5Dial config channel
-3e68d03  fix: make M5Dial profile saves atomic
-6bbbacc  feat: show the BLE passkey on the M5Dial screen
-7e5a1f1  fix: app copy said the M5Dial needs no pairing
-1c7e3b8  fix: time-window the M5Dial RX duplicate guard          <- HEAD
-```
-
-The last one is not part of the planned work: it is a **pre-existing** bug the gate's testing
-exposed, and it is the reason reconnect appeared broken. See §4 and finding 5.
-
-Under it, branch **`feat/m8b-uncap-pos`** is 9 commits ahead of `feat/m9-icons-orientation-rotary`,
-which it branches from. `review/waveshare-m6-foundation` is the integration branch every milestone
-PRs into: PR #2 (M7/M8) and PR #3 (M9) are merged there, PR #4 (M9's M5Dial verification docs),
-PR #5 (M8b) and PR #6 (the security gate) are still open.
-**Merge order: #4, then #5, then #6, then this branch.**
-
-```
-295dc5a  docs: M8b design — uncap pos, schema v3
-ed13255  docs: M8b implementation plan — six tasks
-9ba1750  feat(m8b): key running-macro state by identity, not by pos
-2cffbcc  feat(m8b): check the schema version instead of just declaring it
-59fc5f3  feat(m8b): uncap the M5Dial macro engine, keep its 16-dot ring
-17a98b0  feat(m8b): deck renders what exists, plus a trailing + tile
-60ee198  docs: M8b — replace the NOT YET IMPLEMENTED box with what shipped
-b4d7583  feat: distinct board names, a picker, and a real Config Mode message
-e559c21  docs: M8b verified on hardware — promote it, re-point the handoff   <- HEAD
-```
-
-The cap was never `NUM_MACRO_SLOTS`; it was that `runningMacros[]` was indexed **by `pos`**, so
-raising the constant would have compiled and been the wrong fix. The pool is now keyed by macro
-identity: `MAX_MACROS` 32 addressable, `RUNNING_SLOTS` 16 concurrent, and firing a 17th concurrent
-macro is refused and logged rather than corrupting a slot. `b4d7583` is an unplanned follow-on —
-see §4 and the M8b ledger.
-
-Below is the M9 branch state, still accurate for the branch under it:
+Below is the M9 branch state, kept for the commit-level history it records:
 
 ```
 7a29c90  refactor(ui): dispatch input through a mode table
@@ -306,17 +270,39 @@ also serves the "share a profile with someone else" purpose better than a save d
 export and import now surface failures in a dialog — the original defect was not merely the wrong
 API, it was the wrong API failing invisibly.
 
+### Verified on hardware — 2026-09-09, both boards
+
+Both boards on current firmware for the first time (the Waveshare had only ever been *compiled*
+against the export/import work until tonight).
+
+- **The cross-device transfer passes.** A profile exported from the M5Dial and imported to the
+  Waveshare arrives with its custom `icon_xbm` bitmaps rendering on the ring, with no editing.
+  This is the criterion a same-device round trip **structurally cannot** prove — `save_profiles`
+  merges stored bitmaps back by `pos`, so the device commits an identical document whether or not
+  the file carried any. Export/import is now fully verified.
+  > **Use a profile that actually has bitmaps.** The first attempt used `Windows controls`, which
+  > has icon *names* but zero `icon_xbm`, so nothing icon-shaped was in the file and the absence
+  > looked like a bug. `Autofill` (`Pro`, `Lock`) is the only profile in the owner's config with
+  > real bitmaps. This cost a round; check the file before concluding anything.
+- **The release build works.** `flutter build apk --release` and `appbundle` both succeed, and
+  BLE connects and fetches profiles from the release APK on a Pixel 10 Pro. R8 minification does
+  **not** strip anything `flutter_blue_plus` needs — which was the open risk, since the failure
+  mode would have been a silent "scan finds nothing" reaching users rather than a build error.
+  Size is a non-issue: 50.4 MB of the 52.8 MB APK is native libs for three ABIs, and Play splits
+  an AAB per device (~19 MB on arm64). Do not "optimise" it.
+- **The haptics/touch conflict is root-caused and fixed.** See finding 6 below.
+
 ### NOT verified — read this before assuming otherwise
 
-- **The cross-device transfer — export from one board, import to the other.** This is *the*
-  criterion for this feature and it has not been run: the Waveshare was off-site. Everything above
-  was done on the M5Dial alone, and a same-device round trip **structurally cannot** prove icons
-  travelled: `save_profiles` merges stored bitmaps back in by `pos`, so the device commits an
-  identical document whether or not the file contained any. What *is* proven is that the export
-  half writes real `icon_xbm` bytes into the file. What is not proven is that the import half
-  delivers them to a device that does not already have them. Run it when the Waveshare returns:
-  export a profile with custom icons from the M5Dial, import it to the Waveshare, and look at the
-  ring.
+- **The haptic motor produces no felt output.** `haptics_init()` reports the DRV2605 present at
+  `0x5A`, status `0xA0` (DEVICE_ID 5, no fault bits), and configures cleanly — but a pulse cannot
+  be felt, with a macro genuinely running and swipe-down invoked (the only path that calls
+  `haptics_pulse()`). Untested candidates: no actuator populated, an LRA driven in ERM mode
+  (`haptics.cpp` predicts exactly "weakly or not at all"), an unasserted `EN` pin, or writes not
+  sticking. **Do not guess between them** — the DRV2605's own diagnostic mode (`MODE=0x06`, set
+  `GO`, read `DIAG_RESULT` in status bit 3) reports whether an actuator is connected and
+  drivable, and distinguishes all four in one flash.
+
 - **Importing a file with no `draupnir` key.** Not exercised on device. The rejection logic is
   covered by a passing unit test (`parseEnvelope rejects a file with no draupnir key`), and the UI
   path to it — `parseEnvelope` → `TransferException` → alert dialog — is the same one the
@@ -335,10 +321,10 @@ API, it was the wrong API failing invisibly.
   showed display and touch can be right/wrong independently of each other, so a value-by-value
   breakdown was never isolated; only the aggregate "rotates for all four values" was confirmed.
 
-### Five findings — do not re-derive these on the next hardware round
+### Seven findings — do not re-derive these on the next hardware round
 
 Each of these cost a full hardware round (flash → observe → diagnose → fix → reflash) to find. All
-five are instances of something that compiles cleanly and does nothing observable — treat that symptom
+most are instances of something that compiles cleanly and does nothing observable — treat that symptom
 as the first hypothesis, not a last resort (see the tally below).
 
 1. **The SH8601 is a QSPI panel; commands must carry the write opcode.** `lcd_set_orientation()`
@@ -381,6 +367,38 @@ as the first hypothesis, not a last resort (see the tally below).
    which has a 10 ms window, and false on the M5Dial, which had none — so the comment actively
    reassures a reader porting between the boards. When copying reasoning across the two targets,
    check that the premise holds on both. Fixed in `1c7e3b8` by porting the window.
+
+6. **A diagnostic bus scan broke the thing it shared a bus with.** `haptics_init()` opened with an
+   `i2c_scan()` probing all 112 addresses — **including `0x15`, the CST816 touch controller** —
+   immediately after `Touch_Init()`. Poking the touch chip while it was still starting left it
+   unable to deliver events: no `CLICKED`, no `GESTURE`, while the encoder kept working. That last
+   detail is what made it misleading for so long; it looked like an LVGL or input-routing fault
+   rather than a bus one, and cost the feature a milestone of being written off as blocked.
+
+   Isolated by single-variable bisect on hardware, 2026-09-09:
+
+   | scan | delay before `haptics_init()` | touch |
+   |---|---|---|
+   | yes | none | **broken** (the documented original) |
+   | yes | ~1 s | works |
+   | yes | none | **broken** (controlled re-test) |
+   | **no** | none | **works** |
+
+   Note the second row: a delay *also* made it work, which would have looked like a fix and
+   shipped a magic number over the real cause. The delay was only letting the CST816 finish
+   starting before being probed. **The scan is deleted, not delayed** — and it had already served
+   its whole purpose by telling us the bus carries `0x15` and `0x5A`. Re-adding it to re-answer a
+   settled question would reintroduce the bug; `haptics.cpp` says so at the deletion site.
+
+7. **Icon bitmaps exist only for macros edited since the feature landed.** The app writes
+   `icon_xbm` **only for the macro being edited** (`editor_panel.dart`), and the Waveshare renders
+   icons **only** from `icon_xbm` — never from the icon *name*. In the owner's live config that is
+   **2 of 24 macros with a bitmap, 20 with a name and no bitmap**, so 22 render no icon on that
+   board, and the only fix today is opening and re-saving each macro by hand. Not an
+   export/import bug: a transfer carries faithfully whatever exists. The cheap direction is
+   app-side — generate `icon_xbm` for every macro on save, not just the edited one — but check the
+   payload cost first: ~108 hex chars × 20 macros is ~2.4 KB against the Waveshare's 8 KB BLE RX
+   buffer.
 
 **Tally worth keeping in view:** seven LVGL/esp_lcd APIs have now compiled cleanly and done nothing
 in this project's history, two of them (findings 1 and 2 above) in M9 alone. Finding 5 is the same
@@ -454,46 +472,56 @@ and is verified on hardware — positive path 2026-09-06, hostile-central negati
 Both supported boards now enforce pairing, bonding and GATT permission flags, and both claims are
 backed by a real refusal test rather than by inference. Nothing security-related is outstanding.
 
-### Step 1 — Finish verifying export/import *(needs the Waveshare)*
+### Step 1 — Land the rebrand
 
-Export/import is **built and verified on the M5Dial** (§4), on branch `feat/profile-export-import`.
-What remains is the criterion that actually proves it: **export a profile with custom icons from
-one board and import it to the other.** A same-device round trip cannot establish that icons
-travel, because `save_profiles` merges stored bitmaps back by `pos` regardless. Ten minutes once
-both boards are on the desk.
+PR #12 (`feat/branding-draupnir-forge` -> `master`) is open and hardware-checked: logo, launcher
+icon and brand palette, plus the release-build validation below. Merge it and `master` is current.
 
-### Step 2 — M10's remaining half, and polish
+### Step 2 — Icon bitmaps for every macro *(small, and it fixes a visible gap)*
 
-Buzzer/haptic feedback — **tabled**, see the DRV2605 note in §6 above: run the I²C scan before
-debugging the CST816 conflict.
+**22 of 24 macros in the owner's config render no icon on the Waveshare** — see §4 finding 7. The
+app writes `icon_xbm` only for the macro being edited, and the Waveshare renders only from
+`icon_xbm`, never from the icon name. The fix is app-side: generate the bitmap for every macro on
+save. Check the payload cost against the Waveshare's 8 KB BLE RX buffer first (~2.4 KB for 20
+macros).
 
-M10 as originally written is **two independent subsystems** and should be decomposed: export/import
-(shared schema + app, no hardware dependency) and buzzer/haptic feedback (blocked). They get
-separate designs.
+### Step 3 — M11, publish to Google Play
 
-**Haptics is TABLED as of 2026-09-07** — the Waveshare is off-site — and the reason to revisit it
-is narrower than "debug an I²C conflict":
+Scoped but not designed. **The applicationId is decided: `net.l0k1.draupnir`** — permanent once
+published, and it becomes the iOS bundle ID later (iOS is a separate, later milestone; the `ios/`
+platform folder does not exist yet and needs a Mac).
 
-> **Check first whether the DRV2605 exists at all.** `haptics.cpp:12` states the address is *"an
-> assumption from the datasheet, not from a verified schematic"*, and the §3 hardware table lists
-> no haptic driver and no buzzer for the Waveshare. That table is derived from the firmware, so it
-> is not proof of absence — but nobody has ever confirmed the chip is on the bus. The commit that
-> added haptics (`982946d`) describes it as restoring "feedback the M5Dial build had", and what
-> the M5Dial has is a **speaker**, which already beeps on every action. So the M5Dial half of
-> "buzzer feedback" is arguably already shipped, and the Waveshare half may be driving a chip that
-> is not there.
->
-> **The diagnostic is already written.** `haptics_init()` opens with an `i2c_scan()` that probes
-> all 112 addresses and logs whatever answers. Uncomment the call, flash, read the serial log —
-> touch will break for that boot, which does not matter, because a broken touchscreen still prints
-> to serial. One flash, one log read, and it forks the work:
->   - **Only `0x15` answers** → no DRV2605. Not a firmware task at all; it is a P2 hardware item.
->     Park or delete `haptics.cpp`, and the CST816 bug becomes moot.
->   - **`0x5A` answers too** → the motor is real and it is the I²C ordering bug. *Then* run the
->     three-step single-variable bisect already written at `Waveshare_LVGL_Test.ino:1519`.
->
-> Do the scan before the bisect. Debugging the conflict is only worth it if something is on the
-> other end.
+The probe is already done, and it came back clean: `flutter build apk --release` and `appbundle`
+both succeed, and **BLE works from the release APK** — R8 does not strip anything
+`flutter_blue_plus` needs. That was the one real engineering risk. What remains is mostly
+configuration and paperwork:
+
+- `applicationId` off `com.example.*` (Play rejects it outright)
+- a real keystore + Play App Signing — and **add keystore patterns to `.gitignore` BEFORE creating
+  one**, or a committed `key.properties` leaks credentials into history
+- permission hygiene: `ACCESS_FINE_LOCATION` is declared unbounded though `BLUETOOTH_SCAN` already
+  carries `neverForLocation`; `BLUETOOTH_ADVERTISE` is boilerplate (the app is a central and never
+  advertises); `INTERNET` is declared but **the app makes zero network calls** — `package:http` is
+  an unused leftover from the cut Wi-Fi UI. Removing it earns a "collects no data, shares no data"
+  Data Safety declaration, the easiest privacy posture available.
+- privacy policy, Data Safety form, content rating, 512x512 icon, 1024x500 feature graphic,
+  screenshots, and a Play Console account
+- check early whether the **12 testers / 14 days closed test** requirement applies to the account;
+  it is a schedule item, not a code item, and discovering it late costs two weeks
+
+Split it: **M11a release readiness** (all in-repo, testable, ends in a signed AAB) gates **M11b
+store presence** (artifacts and Console work, most of which only the owner can do).
+
+### Step 4 — Haptics, remaining half
+
+The touch conflict is fixed (§4 finding 6) and haptics is enabled. What is left is that **the motor
+produces no felt output**. Do not guess between the candidates — run the DRV2605's own diagnostic
+mode (`MODE=0x06`, set `GO`, read `DIAG_RESULT`), which reports whether an actuator is connected
+and drivable, and settles it in one flash.
+
+Also worth noting: `haptics_pulse()` has exactly one call site (swipe-down kill-all, and only while
+a macro runs). Even with a working motor that is not really haptic feedback; wiring it to macro
+fire and selection change is the actual design work.
 
 ### Also worth doing, not blocking
 
