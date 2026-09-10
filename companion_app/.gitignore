@@ -43,3 +43,22 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# ---------------------------------------------------------------------------------
+# RELEASE SIGNING -- these must never be committed.
+#
+# The upload keystore and the properties file that holds its passwords. A committed
+# key.properties puts those passwords in the repository history permanently, and this
+# repo is public -- deleting the file afterwards does not remove them. These patterns
+# are deliberately in place BEFORE any keystore exists, because the ordering is the
+# whole protection: .gitignore cannot retroactively un-commit anything.
+#
+# Losing the keystore is the other failure mode. Back it up somewhere that is not this
+# working copy -- a password manager or encrypted backup. With Play App Signing a lost
+# UPLOAD key can be reset by Google, but treat it as unrecoverable and you never have to
+# find out.
+# ---------------------------------------------------------------------------------
+*.jks
+*.keystore
+key.properties
+android/key.properties
