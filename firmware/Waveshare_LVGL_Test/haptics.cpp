@@ -44,25 +44,30 @@ static bool drv_read(uint8_t reg, uint8_t *value) {
                                       I2C_TIMEOUT_TICKS) == ESP_OK;
 }
 
-// Probe every 7-bit address and log what answers. Cheap (one zero-length write each) and run
-// once at boot, and it is the only way we learn what is actually on this bus -- the DRV2605
-// address here is an assumption from the datasheet, not from a verified schematic.
-static void i2c_scan(void) {
-  Serial.print("[haptics] I2C scan:");
-  int found = 0;
-  for (uint8_t addr = 0x08; addr < 0x78; addr++) {
-    uint8_t dummy = 0;
-    if (i2c_master_write_to_device(HAPTICS_I2C_PORT, addr, &dummy, 0, I2C_TIMEOUT_TICKS) == ESP_OK) {
-      Serial.printf(" 0x%02X", addr);
-      found++;
-    }
-  }
-  if (found == 0) Serial.print(" (nothing responded)");
-  Serial.println();
-}
+// THE BLIND I2C SCAN IS DELETED. DO NOT REINTRODUCE IT.
+//
+// It used to probe all 112 addresses here to discover what was on the bus. That included 0x15 --
+// the CST816 touch controller -- so haptics_init()'s very first act was to poke the touch chip
+// while it was still coming up from Touch_Init(). The result was the long-standing "haptics
+// breaks touch" bug: no CLICKED and no GESTURE ever reached LVGL, while the encoder kept working,
+// which made it look like an LVGL or input-routing fault rather than a bus one.
+//
+// Isolated by single-variable bisect on hardware, 2026-09-09:
+//
+//   scan + no delay   -> touch BROKEN   (the documented original)
+//   scan + ~1s delay  -> touch works    (delay let the CST816 finish starting first)
+//   scan + no delay   -> touch BROKEN   (controlled re-test, one variable back)
+//   NO scan, no delay -> touch WORKS    (this build)
+//
+// A delay would also have masked it, which is why one is NOT used here: the scan is the cause,
+// and a settling delay would only have hidden it behind a magic number.
+//
+// The scan has also served its entire purpose. It answered the question it existed to ask -- the
+// bus carries 0x15 (CST816) and 0x5A (DRV2605), so the datasheet address was right after all.
+// Re-adding it to re-answer that would reintroduce the bug. If you ever genuinely need to
+// enumerate the bus again, do it from a throwaway build, not from haptics_init().
 
 void haptics_init() {
-  i2c_scan();
 
   uint8_t status = 0;
   if (!drv_read(0x00, &status)) {
