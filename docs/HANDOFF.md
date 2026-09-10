@@ -56,8 +56,10 @@ round trip structurally cannot prove — passed on both boards 2026-09-09.
 **The app is rebranded as Draupnir Forge** (logo, launcher icon, brand palette), in PR #12.
 
 **The haptics/touch conflict is solved** (2026-09-09): the cause was a diagnostic I²C bus scan, not
-haptics. See §4 finding 6. The motor still produces no felt output — a separate, still-open
-question, listed under NOT verified.
+haptics. See §4 finding 6. Haptics is enabled, and the firmware side is verified correct by
+register readback — but **the motor on this unit does not respond**, because the DRV2605 reports
+its output faulted with over-current. That is a hardware fault, not a firmware one, and it is
+accepted as a nice-to-have gap rather than a blocker. Listed under NOT verified.
 
 ---
 
@@ -68,8 +70,9 @@ five feature branches and the `review/waveshare-m6-foundation` integration branc
 and deleted, and `main` (a stale M6-era branch that had neither the security gate nor
 export/import) is gone. `master` is the default and the only long-lived branch.
 
-**Open: PR #12, `feat/branding-draupnir-forge` -> `master`** — the Draupnir Forge rebrand, plus a
-merge of the security gate and export/import that predated master catching up.
+**PR #12 (the Draupnir Forge rebrand) is merged.** `master` carries the branding, the logo and
+launcher-icon assets, and `design/generate_app_icons.py`, which regenerates every asset from the
+tracked master logo.
 
 A caution earned the hard way. Four PRs once all showed "merged" while `master` had **neither** the
 security gate nor export/import, because each had merged into its own stacked base and nothing
@@ -294,14 +297,30 @@ against the export/import work until tonight).
 
 ### NOT verified — read this before assuming otherwise
 
-- **The haptic motor produces no felt output.** `haptics_init()` reports the DRV2605 present at
-  `0x5A`, status `0xA0` (DEVICE_ID 5, no fault bits), and configures cleanly — but a pulse cannot
-  be felt, with a macro genuinely running and swipe-down invoked (the only path that calls
-  `haptics_pulse()`). Untested candidates: no actuator populated, an LRA driven in ERM mode
-  (`haptics.cpp` predicts exactly "weakly or not at all"), an unasserted `EN` pin, or writes not
-  sticking. **Do not guess between them** — the DRV2605's own diagnostic mode (`MODE=0x06`, set
-  `GO`, read `DIAG_RESULT` in status bit 3) reports whether an actuator is connected and
-  drivable, and distinguishes all four in one flash.
+- **Haptics is implemented but cannot be confirmed on this unit — hardware fault.** The firmware
+  side is complete and *proven correct by register readback*; the motor does not respond because
+  the driver reports its output faulted. Measured 2026-09-09 with the DRV2605's own actuator
+  diagnostic (`MODE 0x06`):
+
+  ```
+  STATUS=0xA9   DIAG_RESULT=1 (actuator missing/open/short)   OC_DETECT=1 (over-current)
+  ```
+
+  Every configuration register read back exactly as written — `MODE 0x00`, `LIBRARY 0x01`,
+  `WAVESEQ1 0x01`, `FEEDBACK 0x36` (ERM), `CONTROL3 0xA0` (open loop) — so the writes stick and
+  the setup is right. The motor was then driven three ways: ERM waveform, LRA waveform with
+  library 6, and **Real-Time Playback at full amplitude, which bypasses the effect ROM entirely**.
+  Nothing was felt on any of them.
+
+  **The ERM-vs-LRA question is answered and is not the cause** — LRA was tried and changed
+  nothing. `EN` is also ruled out by inference: the DRV2605 gates its own I²C on `EN`, so a chip
+  answering at `0x5A` cannot have it low. A motor is physically present in the enclosure (owner
+  confirmed by eye), but that confirms one exists, not that it is wired to *this* driver or that
+  its leads are intact.
+
+  **Do not spend another round on firmware.** The remaining question is electrical and needs a
+  multimeter across the motor terminals plus a look at whether those leads reach the DRV2605.
+  Accepted as a nice-to-have gap rather than a blocker (owner, 2026-09-09).
 
 - **Importing a file with no `draupnir` key.** Not exercised on device. The rejection logic is
   covered by a passing unit test (`parseEnvelope rejects a file with no draupnir key`), and the UI
@@ -512,16 +531,20 @@ configuration and paperwork:
 Split it: **M11a release readiness** (all in-repo, testable, ends in a signed AAB) gates **M11b
 store presence** (artifacts and Console work, most of which only the owner can do).
 
-### Step 4 — Haptics, remaining half
+### Step 4 — Haptics: closed as far as firmware can take it
 
-The touch conflict is fixed (§4 finding 6) and haptics is enabled. What is left is that **the motor
-produces no felt output**. Do not guess between the candidates — run the DRV2605's own diagnostic
-mode (`MODE=0x06`, set `GO`, read `DIAG_RESULT`), which reports whether an actuator is connected
-and drivable, and settles it in one flash.
+Nothing to do here in code. The touch conflict is fixed (§4 finding 6) and `haptics_init()` is
+enabled; the motor does not respond because the DRV2605 reports its output faulted, with
+over-current, while every register reads back correct. ERM, LRA and full-amplitude RTP were all
+tried. Recorded under NOT verified, accepted as a nice-to-have gap.
 
-Also worth noting: `haptics_pulse()` has exactly one call site (swipe-down kill-all, and only while
-a macro runs). Even with a working motor that is not really haptic feedback; wiring it to macro
-fire and selection change is the actual design work.
+If it is ever revisited it is a **bench** task, not a coding one: meter the motor terminals and
+confirm whether those leads actually run to the DRV2605. Worth re-testing on P2 hardware, where
+the firmware should work unchanged if the actuator is sound.
+
+One thing that *is* still design work, independent of the fault: `haptics_pulse()` has exactly one
+call site — swipe-down kill-all, and only while a macro runs. Even with a working motor that is
+not really haptic feedback. Wiring it to macro fire and selection change is the real feature.
 
 ### Also worth doing, not blocking
 

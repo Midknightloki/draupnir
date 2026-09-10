@@ -14,10 +14,16 @@
 // Touch_Init(), which is what installs the shared I2C driver this reuses -- calling it earlier
 // fails on an uninstalled bus.
 //
-// Also logs a full I2C bus scan. The DRV2605's address on this board is assumed, not confirmed
-// from a schematic, so the scan is how we learn the truth on first boot: if 0x5A is absent the
-// log still shows every device that did answer.
+// The bus scan this used to log is DELETED -- it was probing 0x15, the touch controller, and
+// breaking it. See the note at the top of haptics.cpp. It also already answered its question:
+// the bus carries 0x15 (CST816) and 0x5A (DRV2605).
 void haptics_init();
+
+// NOTE ON THIS UNIT: the firmware side is complete and verified by register readback, but the
+// motor cannot be made to respond -- the DRV2605 reports an actuator fault with over-current on
+// its own diagnostic. See the measurement recorded in haptics.cpp. Every entry point below still
+// behaves correctly; they simply drive an output nothing is listening to on this particular
+// board. Treat haptics as implemented-but-unconfirmed rather than working or broken.
 
 // Short confirmation buzz. Safe to call from any task -- a single I2C transaction, no blocking
 // waits beyond the bus timeout, and a no-op if the chip is absent.
