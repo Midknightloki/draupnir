@@ -5,7 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.companion_app"
+    // PERMANENT. This is the app's identity on Google Play and it cannot be changed after the
+    // first release -- a different package is a different app, with no upgrade path for anyone
+    // who installed the first one. Reverse-DNS of holocronlabs.net, a domain we control, leaving
+    // net.holocronlabs.* free for sibling apps. The same string becomes the iOS bundle ID.
+    namespace = "net.holocronlabs.draupnir"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -15,8 +19,8 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.example.companion_app"
+        // See the namespace note above -- permanent, and Play rejects com.example.* outright.
+        applicationId = "net.holocronlabs.draupnir"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion

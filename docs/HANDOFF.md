@@ -506,9 +506,48 @@ macros).
 
 ### Step 3 — M11, publish to Google Play
 
-Scoped but not designed. **The applicationId is decided: `net.l0k1.draupnir`** — permanent once
-published, and it becomes the iOS bundle ID later (iOS is a separate, later milestone; the `ios/`
-platform folder does not exist yet and needs a Mac).
+Scoped but not designed.
+
+**Publisher identity is decided (2026-09-09):**
+
+| | |
+|---|---|
+| `applicationId` | **`net.holocronlabs.draupnir`** |
+| Developer name | **Holocron Labs** |
+
+Reverse-DNS of `holocronlabs.net`, a domain the owner controls, which is the convention that keeps
+the namespace from colliding with anyone else's — and it leaves `net.holocronlabs.*` free for the
+other apps planned under that identity. It supersedes an earlier `net.l0k1.draupnir`, changed
+before first publish precisely because **it can never be changed after**: a different package is a
+different app on Play, with no upgrade path for anyone who installed the first one. The same string
+becomes the iOS bundle ID later (iOS is a separate, later milestone; the `ios/` platform folder
+does not exist yet and needs a Mac).
+
+**It is in the code as of 2026-09-09**, verified in the built release APK rather than the source:
+the merged manifest carries `net.holocronlabs.draupnir` with no trace of `com.example`. Note that
+`namespace` is not just a string — it dictates where `MainActivity` must live, so the Kotlin source
+moved to `kotlin/net/holocronlabs/draupnir/` with a matching `package` declaration.
+
+**Permission hygiene landed with it**, and was verified by parsing the merged release manifest:
+
+| | |
+|---|---|
+| `INTERNET` | **removed** — release only; `src/debug` and `src/profile` keep it, which is why hot reload still works |
+| `BLUETOOTH_ADVERTISE` | **removed** — this app is a BLE central; it never advertises |
+| `ACCESS_FINE_LOCATION` | **bounded to `maxSdkVersion=30`** — on API 31+ `neverForLocation` replaces it, so a modern phone is never asked for location |
+| `usesCleartextTraffic` | **removed** — another leftover of the cut Wi-Fi UI |
+
+Dropping `INTERNET` is what makes "collects no data, shares no data" an honest Data Safety
+declaration rather than one the manifest contradicts. `package:http` went with it, confirmed unused
+first.
+
+`.gitignore` now carries keystore patterns, deliberately **before any keystore exists** — that
+ordering is the whole protection, since `.gitignore` cannot retroactively un-commit anything and
+this repo is public. **No key has been generated yet**, and no signed bundle has been built. Those
+are the two remaining pieces of M11a.
+
+> **A trap worth knowing:** XML comments cannot contain `--`, which this project uses freely as an
+> em-dash in C++ and Dart. The first manifest edit failed to parse for that reason alone.
 
 The probe is already done, and it came back clean: `flutter build apk --release` and `appbundle`
 both succeed, and **BLE works from the release APK** — R8 does not strip anything
