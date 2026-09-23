@@ -7,7 +7,7 @@ import 'dart:convert';
 
 import '../state/draupnir_state.dart';
 import '../theme.dart';
-import '../utils/feather_icons_map.dart';
+import '../utils/macro_icons.dart';
 import '../utils/icon_generator.dart';
 
 class EditorPanel extends StatefulWidget {
@@ -335,6 +335,31 @@ class _EditorPanelState extends State<EditorPanel> {
     );
   }
 
+  /// One selectable glyph in the picker. Factored out because the grid is now built per
+  /// category rather than from a single flat index, so the cell is rendered from several
+  /// places and must look identical in all of them.
+  Widget _buildIconCell(BuildContext dialogCtx, String iconName) {
+    final selected = _selectedIcon == iconName;
+    return InkWell(
+      onTap: () {
+        setState(() => _selectedIcon = iconName);
+        Navigator.pop(dialogCtx);
+      },
+      borderRadius: BorderRadius.circular(8),
+      child: Tooltip(
+        message: iconName,
+        child: Container(
+          decoration: BoxDecoration(
+            color: selected ? AppTheme.accent.withOpacity(0.3) : AppTheme.surface,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: selected ? AppTheme.accent : Colors.transparent),
+          ),
+          child: Icon(macroIcons[iconName], color: Colors.white),
+        ),
+      ),
+    );
+  }
+
   void _showIconPickerModal() {
     showDialog(
       context: context,
@@ -342,7 +367,22 @@ class _EditorPanelState extends State<EditorPanel> {
         String searchQuery = "";
         return StatefulBuilder(
           builder: (context, setModalState) {
-            final filteredKeys = featherIconsMap.keys.where((k) => k.toLowerCase().contains(searchQuery.toLowerCase())).toList();
+            final query = searchQuery.trim().toLowerCase();
+
+            // Searching flattens the categories: when you are hunting for a specific glyph the
+            // headings are noise, and a match in "Other" should surface as readily as one in
+            // Media. With no query the sections are the point -- a macro vocabulary browsed by
+            // what you are binding, rather than 190 icons in one alphabetical wall.
+            final List<MapEntry<String, List<String>>> sections = query.isEmpty
+                ? iconCategories
+                : [
+                    MapEntry(
+                      'Results',
+                      macroIcons.keys.where((k) => k.toLowerCase().contains(query)).toList(),
+                    )
+                  ];
+            final bool noResults = sections.every((s) => s.value.isEmpty);
+
             return AlertDialog(
               title: const Text('Select Icon'),
               backgroundColor: AppTheme.surfaceHighlight,
@@ -361,39 +401,45 @@ class _EditorPanelState extends State<EditorPanel> {
                     ),
                     const SizedBox(height: 16),
                     Expanded(
-                      child: GridView.builder(
-                        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                          crossAxisCount: 5,
-                          crossAxisSpacing: 8,
-                          mainAxisSpacing: 8,
-                        ),
-                        // One row per match, straight from the map. It used to be
-                        // `filteredKeys.length + 3` for three hardcoded extras rendered only
-                        // when the query matched their own names -- so any other search sent
-                        // indices 0, 1 and 2 down the else branch with mapIdx at -3, -2 and -1,
-                        // painting three empty cells above the first real result. 'mic' was also
-                        // in the map already, so it appeared twice.
-                        itemCount: filteredKeys.length,
-                        itemBuilder: (context, idx) {
-                          final String iconName = filteredKeys[idx];
-                          final IconData iconData = featherIconsMap[iconName]!;
-
-                          return InkWell(
-                            onTap: () {
-                              setState(() => _selectedIcon = iconName);
-                              Navigator.pop(ctx);
-                            },
-                            child: Container(
-                              decoration: BoxDecoration(
-                                color: _selectedIcon == iconName ? AppTheme.accent.withOpacity(0.3) : AppTheme.surface,
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(color: _selectedIcon == iconName ? AppTheme.accent : Colors.transparent),
+                      child: noResults
+                          ? Center(
+                              child: Text(
+                                'No icon matches "${searchQuery.trim()}".',
+                                style: const TextStyle(color: Colors.grey),
+                                textAlign: TextAlign.center,
                               ),
-                              child: Icon(iconData, color: Colors.white),
+                            )
+                          : ListView(
+                              children: [
+                                for (final section in sections)
+                                  if (section.value.isNotEmpty) ...[
+                                    Padding(
+                                      padding: const EdgeInsets.only(top: 4, bottom: 8),
+                                      child: Text(
+                                        section.key.toUpperCase(),
+                                        style: const TextStyle(
+                                          fontSize: 11,
+                                          letterSpacing: 1.2,
+                                          fontWeight: FontWeight.bold,
+                                          color: Colors.grey,
+                                        ),
+                                      ),
+                                    ),
+                                    GridView.count(
+                                      crossAxisCount: 5,
+                                      crossAxisSpacing: 8,
+                                      mainAxisSpacing: 8,
+                                      shrinkWrap: true,
+                                      physics: const NeverScrollableScrollPhysics(),
+                                      children: [
+                                        for (final iconName in section.value)
+                                          _buildIconCell(ctx, iconName),
+                                      ],
+                                    ),
+                                    const SizedBox(height: 12),
+                                  ],
+                              ],
                             ),
-                          );
-                        },
-                      ),
                     ),
                   ],
                 ),
