@@ -240,6 +240,188 @@ void drawRotaryUI() {
   d.fillTriangle(200, 120, 190, 110, 190, 130, color);
 }
 
+// Ring-centre geometry, shared by the full redraw and the partial one. Getting these wrong is
+// what produced leftover needle pixels and label fragments on the first attempt, so the
+// relationships are spelled out rather than left implicit:
+//
+//   dot centres sit at r=100; a dot is radius 18, and 20 with its running ring
+//     -> a normal dot occupies r=82..118, a running one r=80..120
+//   NEEDLE_TIP_R (74) < 80  ->  the needle stops clear of even a running dot. It previously
+//     reached exactly 80, tying with the running ring, so any erase wide enough to remove the
+//     needle also bit a dot, and any erase narrow enough to spare the dot left the tip behind.
+//     That tie is what put a red pixel at every position the needle had visited.
+static const int NEEDLE_TIP_R    = 74;
+
+// ===========================================================================================
+// ENCODER -- hardware quadrature via PCNT, replacing M5Dial.Encoder.read().
+//
+// WHY THIS EXISTS. M5Dial.Encoder is the PJRC Encoder library, which decodes in an ISR *if* it
+// can attach one. On this board it cannot. The dial is on GPIO 41/40 (M5Dial.h:9-10), but
+// utility/Encoder.h builds its interrupt dispatch table from CORE_INT<n>_PIN macros whose ESP32
+// block stops at CORE_INT39_PIN -- the original ESP32's GPIO range, never extended for the
+// ESP32-S3. The `case CORE_INT40_PIN:` / `case CORE_INT41_PIN:` arms are present in the source
+// but sit behind #ifdefs that are never satisfied, so they compile out. Both attach_interrupt()
+// calls fall through the switch and return 0, leaving interrupts_in_use == 0, which sends every
+// read() down the polling branch at Encoder.h:142 -- a software quadrature decode that advances
+// only when read() is called.
+//
+// That put the decode on loop()'s cadence. A polled quadrature decoder resolves at most one
+// state transition per sample, so with loop() at ~10ms the ceiling was ~100 transitions/sec,
+// about 25 detents/sec. Past that, transitions alias: a traced fast flick produced 4 counts in
+// 61ms with an isolated -1 in the middle of a forward run. Slow turns were exact, fast flicks
+// stalled or ran backwards, and the threshold moved whenever loop()'s duration changed -- which
+// is why making the redraw cheaper appeared to "cause" it.
+//
+// PCNT counts in silicon. Counts cannot be missed regardless of what loop() is doing, so the
+// sampling ceiling is gone rather than merely raised.
+//
+// Scale is deliberately kept identical to the library's: x4 decoding, four counts per detent,
+// so the `/ 4` at the call site and everything downstream of it is unchanged.
+// ===========================================================================================
+#include "driver/pulse_cnt.h"
+
+#define ENC_PIN_A 41            // DIAL_ENCODER_PIN_A
+#define ENC_PIN_B 40            // DIAL_ENCODER_PIN_B
+
+// The hardware counter is 16-bit. At a limit it resets to zero and fires a watch event, so the
+// full position is (whole revolutions of the counter) + (current count). Limits are set well
+// inside the 16-bit range; the value only decides how often the watch callback runs.
+#define ENC_PCNT_LIMIT 10000
+
+static pcnt_unit_handle_t encUnit = NULL;
+static volatile int32_t   encAccum = 0;     // written from the watch ISR, read from loop()
+
+static bool IRAM_ATTR encOnReachLimit(pcnt_unit_handle_t unit,
+                                      const pcnt_watch_event_data_t *edata, void *ctx) {
+  encAccum += edata->watch_point_value;
+  return false;   // no task woken
+}
+
+static void encoderInit() {
+  pcnt_unit_config_t unitCfg = {};
+  unitCfg.high_limit = ENC_PCNT_LIMIT;
+  unitCfg.low_limit  = -ENC_PCNT_LIMIT;
+  ESP_ERROR_CHECK(pcnt_new_unit(&unitCfg, &encUnit));
+
+  // Mechanical contacts ring. Quadrature decoding already cancels most of it -- bounce on one
+  // channel while the other is stable produces matched +1/-1 pairs -- but filtering the
+  // sub-microsecond spikes keeps that work out of the counter entirely.
+  pcnt_glitch_filter_config_t filterCfg = {};
+  filterCfg.max_glitch_ns = 1000;
+  ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(encUnit, &filterCfg));
+
+  // x4 decoding: each channel counts both edges of its own line, and the other line's level
+  // decides the direction. Two channels, two edges each, four counts per detent.
+  pcnt_chan_config_t chanACfg = {};
+  chanACfg.edge_gpio_num  = ENC_PIN_A;
+  chanACfg.level_gpio_num = ENC_PIN_B;
+  pcnt_channel_handle_t chanA = NULL;
+  ESP_ERROR_CHECK(pcnt_new_channel(encUnit, &chanACfg, &chanA));
+
+  pcnt_chan_config_t chanBCfg = {};
+  chanBCfg.edge_gpio_num  = ENC_PIN_B;
+  chanBCfg.level_gpio_num = ENC_PIN_A;
+  pcnt_channel_handle_t chanB = NULL;
+  ESP_ERROR_CHECK(pcnt_new_channel(encUnit, &chanBCfg, &chanB));
+
+  // Edge actions verified on hardware: clockwise increases, matching what the PJRC library
+  // reported, so "clockwise moves the selection forward" is unchanged for anyone using this.
+  ESP_ERROR_CHECK(pcnt_channel_set_edge_action(chanA,
+      PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_DECREASE));
+  ESP_ERROR_CHECK(pcnt_channel_set_level_action(chanA,
+      PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE));
+  ESP_ERROR_CHECK(pcnt_channel_set_edge_action(chanB,
+      PCNT_CHANNEL_EDGE_ACTION_DECREASE, PCNT_CHANNEL_EDGE_ACTION_INCREASE));
+  ESP_ERROR_CHECK(pcnt_channel_set_level_action(chanB,
+      PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE));
+
+  // The encoder's contacts pull to ground, so both lines need pull-ups. pcnt_new_channel()
+  // configures the pins as inputs; it does not promise a pull-up, so set them explicitly.
+  gpio_pullup_en((gpio_num_t)ENC_PIN_A);
+  gpio_pullup_en((gpio_num_t)ENC_PIN_B);
+
+  ESP_ERROR_CHECK(pcnt_unit_add_watch_point(encUnit, ENC_PCNT_LIMIT));
+  ESP_ERROR_CHECK(pcnt_unit_add_watch_point(encUnit, -ENC_PCNT_LIMIT));
+  pcnt_event_callbacks_t cbs = {};
+  cbs.on_reach = encOnReachLimit;
+  ESP_ERROR_CHECK(pcnt_unit_register_event_callbacks(encUnit, &cbs, NULL));
+
+  ESP_ERROR_CHECK(pcnt_unit_enable(encUnit));
+  ESP_ERROR_CHECK(pcnt_unit_clear_count(encUnit));
+  ESP_ERROR_CHECK(pcnt_unit_start(encUnit));
+}
+
+// Raw count, four per detent -- same scale and sense as M5Dial.Encoder.read().
+static long encoderRead() {
+  if (!encUnit) return 0;
+  int count = 0;
+  int32_t before, after;
+  // The watch ISR resets the hardware counter and bumps encAccum. Reading the two separately
+  // can straddle that, which would read a stale accumulator against an already-reset count and
+  // report a 10000-count jump. Re-read if the accumulator moved underneath us.
+  do {
+    before = encAccum;
+    pcnt_unit_get_count(encUnit, &count);
+    after = encAccum;
+  } while (before != after);
+  return (long)after + (long)count;
+}
+
+// Ring position the needle was last painted at, so the partial redraw can erase exactly that
+// triangle instead of clearing the whole hub. -1 means "nothing to erase" -- set after a full
+// drawRunUI(), which has already cleared the screen. Both draw paths keep it current.
+static int lastNeedleIdx = -1;
+// Draws one ring dot: its colour fill, its icon, and the running-state ring. The dot's own
+// geometry is derived from `i` so callers need nothing but the index.
+//
+// Extracted from drawRunUI()'s loop so the partial-redraw path can repaint individual dots.
+// That path has to clear text bands that overlap the ring -- a macro name wider than the hub
+// genuinely runs over the dots either side, and always has: drawRunUI() draws the labels AFTER
+// the dots, so the text sits on top of them. Erasing such a label means clearing across dots,
+// which means being able to put them back.
+static void drawRingDot(int i, JsonArray macros, uint16_t unselectedColor) {
+  auto& d = M5Dial.Display;
+  float angle = -PI / 2 + (i * PI * 2 / 16.0);
+  int cx = 120 + cos(angle) * 100;
+  int cy = 120 + sin(angle) * 100;
+
+  JsonObject mObj;
+  bool hasMacro = false;
+  for (JsonObject m : macros) {
+    if ((m["pos"] | -1) == i) { mObj = m; hasMacro = true; break; }
+  }
+
+  if (hasMacro) {
+    d.fillCircle(cx, cy, 18, hexToRGB565(mObj["color"] | "#FFFFFF"));
+    const char* iconXbmStr = mObj["icon_xbm"] | "";
+    if (strlen(iconXbmStr) == 108) {
+      uint8_t xbmData[54];
+      for (int b = 0; b < 54; b++) {
+        char hex[3] = { iconXbmStr[b*2], iconXbmStr[b*2+1], '\0' };
+        xbmData[b] = (uint8_t)strtol(hex, NULL, 16);
+      }
+      d.drawXBitmap(cx - 9, cy - 9, xbmData, 18, 18, TFT_BLACK);
+    } else {
+      const char* iconStr = mObj["icon"] | "";
+      if (strcmp(iconStr, "tool") == 0 || strcmp(iconStr, "hammer") == 0) {
+        d.drawXBitmap(cx - icon_tool_width/2, cy - icon_tool_height/2, icon_tool_bits, icon_tool_width, icon_tool_height, TFT_BLACK);
+      } else if (strcmp(iconStr, "type") == 0 || strcmp(iconStr, "text") == 0) {
+        d.drawXBitmap(cx - icon_type_width/2, cy - icon_type_height/2, icon_type_bits, icon_type_width, icon_type_height, TFT_BLACK);
+      } else if (strcmp(iconStr, "mic") == 0) {
+        d.drawXBitmap(cx - icon_mic_width/2, cy - icon_mic_height/2, icon_mic_bits, icon_mic_width, icon_mic_height, TFT_BLACK);
+      }
+    }
+  } else {
+    d.fillCircle(cx, cy, 18, unselectedColor);
+  }
+
+  // `i` here is a RING POSITION (this ring is 16 fixed dots), so ask by pos rather than
+  // indexing the pool -- those coincided only while runningMacros[] was indexed by pos.
+  if (findRunningSlot(i) >= 0) {
+    d.drawCircle(cx, cy, 19, TFT_GREEN);
+    d.drawCircle(cx, cy, 20, TFT_GREEN);
+  }
+}
 // Repaints ONLY the centre of the ring: the selection needle and the text it sweeps through.
 // The 16 dots, their icons and the profile arrows are left untouched.
 //
@@ -276,19 +458,80 @@ static void drawSelectionCentre() {
     }
   }
 
-  d.fillCircle(120, 120, 78, TFT_BLACK);
   d.setTextDatum(middle_center);
+  d.setFont(&fonts::Orbitron_Light_24);
+
+  // Erase the OLD NEEDLE ONLY, by repainting its exact triangle in black.
+  //
+  // This replaces a fillCircle over the whole hub. That disc worked, but it also wiped the
+  // profile name on every single detent -- and erase-then-redraw at detent rate is precisely
+  // what reads as flicker. The name does not change when the selection moves, so blanking it
+  // was pure cost. fillTriangle is not antialiased, so painting the same triangle in black
+  // removes it exactly, leaving everything around it untouched.
+  if (lastNeedleIdx >= 0 && lastNeedleIdx != selectedMacroIdx) {
+    float pa = -PI / 2 + (lastNeedleIdx * PI * 2 / 16.0);
+    d.fillTriangle(120 + cos(pa) * NEEDLE_TIP_R, 120 + sin(pa) * NEEDLE_TIP_R,
+                   120 + cos(pa - PI / 2) * 3, 120 + sin(pa - PI / 2) * 3,
+                   120 + cos(pa + PI / 2) * 3, 120 + sin(pa + PI / 2) * 3,
+                   TFT_BLACK);
+  }
+
+  // Clear exactly as much of the name band as is actually dirty: the wider of the outgoing and
+  // incoming labels. Sizing it to the text instead of the screen is what keeps the dot repaint
+  // below from touching the whole ring -- a full-width band hit 8 of 16 dots on every detent,
+  // each one re-parsing 54 bytes of icon hex, which would have handed back the lag this
+  // function exists to remove.
+  static int lastNameW = 0;
+  const char *nameStr = (selectedMacroName != nullptr) ? selectedMacroName : "Empty";
+  int nameW = d.textWidth(nameStr);
+  int clearW = (nameW > lastNameW ? nameW : lastNameW) + 8;
+  lastNameW = nameW;
+
+  const int NAME_Y0 = 146, NAME_Y1 = 174;   // macro name is drawn at y=160
+  int nameX0 = 120 - clearW / 2;
+  int nameX1 = 120 + clearW / 2;
+  d.fillRect(nameX0, NAME_Y0, clearW, NAME_Y1 - NAME_Y0, TFT_BLACK);
+
+  // Put back only the dots that rect actually crossed -- usually none, since most names fit
+  // inside the hub. A dot reaches 20px from its centre at worst (18 for the fill, 20 with the
+  // running ring).
+  for (int i = 0; i < 16; i++) {
+    float a = -PI / 2 + (i * PI * 2 / 16.0);
+    int dx = 120 + cos(a) * 100;
+    int dy = 120 + sin(a) * 100;
+    if (dx + 20 >= nameX0 && dx - 20 <= nameX1 &&
+        dy + 20 >= NAME_Y0 && dy - 20 <= NAME_Y1) {
+      drawRingDot(i, macros, hexToRGB565("#24242D"));
+    }
+  }
 
   // The needle, same construction as drawRunUI's.
   float angle = -PI / 2 + (selectedMacroIdx * PI * 2 / 16.0);
-  d.fillTriangle(120 + cos(angle) * 80, 120 + sin(angle) * 80,
+  d.fillTriangle(120 + cos(angle) * NEEDLE_TIP_R, 120 + sin(angle) * NEEDLE_TIP_R,
                  120 + cos(angle - PI / 2) * 3, 120 + sin(angle - PI / 2) * 3,
                  120 + cos(angle + PI / 2) * 3, 120 + sin(angle + PI / 2) * 3,
                  hexToRGB565("#BB0A00"));
 
-  d.setFont(&fonts::Orbitron_Light_24);
-  d.setTextColor(hexToRGB565(prof["color"] | "#FF00FF"), TFT_BLACK);
-  d.drawString(prof["name"] | "Profile", 120, 105);
+  // Repaint the upper labels ONLY if a needle actually ran through them.
+  //
+  // Neither changes when the selection moves, so repainting them every detent was the remaining
+  // flicker. They only need restoring where the erase above, or the draw just now, cut across
+  // them -- which happens only for needles pointing upward. A needle reaches its tip at
+  // y = 120 + sin(a)*NEEDLE_TIP_R and spreads from the hub centre, so it enters a band whose
+  // bottom edge is Y when that tip y is above Y.
+  //
+  // Nine of the sixteen positions touch neither label, and now cost nothing.
+  auto tipY = [](int idx) {
+    return 120.0f + sinf(-PI / 2 + (idx * PI * 2 / 16.0f)) * NEEDLE_TIP_R;
+  };
+  float tipNew = tipY(selectedMacroIdx);
+  float tipOld = (lastNeedleIdx >= 0) ? tipY(lastNeedleIdx) : tipNew;
+  float tipTop = (tipNew < tipOld) ? tipNew : tipOld;
+
+  if (tipTop < 117.0f) {   // profile name occupies y 93..117
+    d.setTextColor(hexToRGB565(prof["color"] | "#FF00FF"), TFT_BLACK);
+    d.drawString(prof["name"] | "Profile", 120, 105);
+  }
 
   if (selectedMacroName != nullptr) {
     d.setTextColor(selectedMacroColor, TFT_BLACK);
@@ -298,17 +541,22 @@ static void drawSelectionCentre() {
     d.drawString("Empty", 120, 160);
   }
 
-  // Redrawn identically rather than conditionally cleared: a macro starting or stopping routes
-  // through a full redraw, so this state cannot change underneath a selection move.
-  bool anyRunning = false;
-  for (int i = 0; i < RUNNING_SLOTS; i++) {
-    if (runningMacros[i].active) anyRunning = true;
+  // Same reasoning, and the same guard: a macro starting or stopping routes through a full
+  // redraw, so this state cannot change underneath a selection move -- it only needs restoring
+  // where a needle cut it. Only three positions reach this high.
+  if (tipTop < 65.0f) {
+    bool anyRunning = false;
+    for (int i = 0; i < RUNNING_SLOTS; i++) {
+      if (runningMacros[i].active) anyRunning = true;
+    }
+    if (anyRunning) {
+      d.setTextColor(TFT_RED, TFT_BLACK);
+      d.drawString("Kill all", 120, 65);
+      d.fillTriangle(120, 40, 115, 50, 125, 50, TFT_RED);
+    }
   }
-  if (anyRunning) {
-    d.setTextColor(TFT_RED, TFT_BLACK);
-    d.drawString("Kill all", 120, 65);
-    d.fillTriangle(120, 40, 115, 50, 125, 50, TFT_RED);
-  }
+
+  lastNeedleIdx = selectedMacroIdx;
 }
 
 void drawRunUI() {
@@ -378,52 +626,29 @@ void drawRunUI() {
     
     if (i == selectedMacroIdx) {
       uint16_t needleColor = hexToRGB565("#BB0A00");
-      int nx = centerX + cos(angle) * (radius - 20);
-      int ny = centerY + sin(angle) * (radius - 20);
+      // NEEDLE_TIP_R, not radius-20. The tip used to reach exactly r=80, which is also the inner
+      // edge of a running dot's green ring -- so a clear big enough to erase the needle was
+      // necessarily big enough to bite a dot, and a clear small enough to spare the dot left the
+      // tip behind. It left a red pixel at every position the needle had visited. Pulling the
+      // tip in to 74 breaks the tie: see the note on drawSelectionCentre().
+      int nx = centerX + cos(angle) * NEEDLE_TIP_R;
+      int ny = centerY + sin(angle) * NEEDLE_TIP_R;
       int bx1 = centerX + cos(angle - PI/2) * 3;
       int by1 = centerY + sin(angle - PI/2) * 3;
       int bx2 = centerX + cos(angle + PI/2) * 3;
       int by2 = centerY + sin(angle + PI/2) * 3;
       d.fillTriangle(nx, ny, bx1, by1, bx2, by2, needleColor);
-      
+      // Keep the partial-redraw path's erase target in step. Without this it would erase a
+      // triangle the full redraw never drew, punching a black wedge through the ring.
+      lastNeedleIdx = selectedMacroIdx;
+
       if (hasMacro) {
         selectedMacroName = mObj["name"] | "Macro";
         selectedMacroColor = hexToRGB565(mObj["color"] | "#FFFFFF");
       }
     }
     
-    if (hasMacro) {
-      uint16_t color = hexToRGB565(mObj["color"] | "#FFFFFF");
-      d.fillCircle(cx, cy, 18, color);
-      
-      const char* iconXbmStr = mObj["icon_xbm"] | "";
-      if (strlen(iconXbmStr) == 108) {
-        uint8_t xbmData[54];
-        for (int b = 0; b < 54; b++) {
-          char hex[3] = { iconXbmStr[b*2], iconXbmStr[b*2+1], '\0' };
-          xbmData[b] = (uint8_t)strtol(hex, NULL, 16);
-        }
-        d.drawXBitmap(cx - 9, cy - 9, xbmData, 18, 18, TFT_BLACK);
-      } else {
-        const char* iconStr = mObj["icon"] | "";
-        if (strcmp(iconStr, "tool") == 0 || strcmp(iconStr, "hammer") == 0) {
-          d.drawXBitmap(cx - icon_tool_width/2, cy - icon_tool_height/2, icon_tool_bits, icon_tool_width, icon_tool_height, TFT_BLACK);
-        } else if (strcmp(iconStr, "type") == 0 || strcmp(iconStr, "text") == 0) {
-          d.drawXBitmap(cx - icon_type_width/2, cy - icon_type_height/2, icon_type_bits, icon_type_width, icon_type_height, TFT_BLACK);
-        } else if (strcmp(iconStr, "mic") == 0) {
-          d.drawXBitmap(cx - icon_mic_width/2, cy - icon_mic_height/2, icon_mic_bits, icon_mic_width, icon_mic_height, TFT_BLACK);
-        }
-      }
-    } else {
-      d.fillCircle(cx, cy, 18, unselectedColor);
-    }
-    
-    // `i` here is a RING POSITION (this ring is 16 fixed dots), so ask by pos rather than
-    // indexing the pool -- those coincided only while runningMacros[] was indexed by pos.
-    if (findRunningSlot(i) >= 0) {
-      d.drawCircle(cx, cy, 19, TFT_GREEN);
-      d.drawCircle(cx, cy, 20, TFT_GREEN);
-    }
+    drawRingDot(i, macros, unselectedColor);
   }
   
   d.setFont(&fonts::Orbitron_Light_24);
@@ -1460,7 +1685,10 @@ void enterConfigMode() {
 
 void setup() {
   auto cfg = M5.config();
+  // enableEncoder stays true for the pin setup it does; M5Dial.Encoder itself is unused --
+  // encoderInit() below drives the dial through PCNT instead, for the reason documented there.
   M5Dial.begin(cfg, true, false);
+  encoderInit();
   
   Serial.begin(115200);
   
@@ -1634,7 +1862,7 @@ void loop() {
     // are still serviced above; the queued redraw is deliberately NOT dispatched in here either,
     // because drawRunUI() would paint straight over the passkey.
     if (!isPairing) {
-      long newPosRaw = M5Dial.Encoder.read();
+      long newPosRaw = encoderRead();
       long newPos = newPosRaw / 4;
       if (newPos != oldPosition) {
         if (inRotaryMode) {
@@ -1647,10 +1875,27 @@ void loop() {
             oldPosition--;
           }
         } else {
-          // The tone stays, on every detent. This dial's detents have no mechanical click, so
-          // this is the only tactile confirmation a step registered -- it was never the source
-          // of the lag.
-          M5Dial.Speaker.tone(1000, 10);
+          // The click stays -- this dial's detents have no mechanical click, so it is the only
+          // confirmation a step registered -- but it is rate-limited, and that limit is not
+          // cosmetic.
+          //
+          // tone() enqueues a 10ms tone into M5Unified's speaker buffer. Call it faster than it
+          // plays and the buffer saturates, at which point tone() stops being nearly free and
+          // starts costing real time inside loop() -- which delays the encoder read that follows
+          // it. Making the redraw cheap is what exposed this: loop() now spins far more often per
+          // flick than it did behind the old 50ms full redraw, so a call rate that used to be
+          // comfortable became a saturating one, and fast flicks stalled or appeared to run
+          // backwards.
+          //
+          // 35ms is longer than the tone itself, so the buffer can never back up. At ordinary
+          // turning speeds detents are much further apart than that and every one still clicks;
+          // only a flick thins them out, where they would smear into a buzz regardless.
+          static uint32_t lastToneMs = 0;
+          uint32_t nowMs = millis();
+          if (nowMs - lastToneMs >= 35) {
+            M5Dial.Speaker.tone(1000, 10);
+            lastToneMs = nowMs;
+          }
           selectedMacroIdx = (newPos % 16);
           if (selectedMacroIdx < 0) selectedMacroIdx += 16;
           oldPosition = newPos;
@@ -1785,6 +2030,6 @@ void loop() {
     // recognisable idiom and the disconnect side above still does real work.
     oldDeviceConnected = deviceConnected;
   }
-  
+
   delay(5);
 }
