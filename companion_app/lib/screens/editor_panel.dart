@@ -88,17 +88,30 @@ class _EditorPanelState extends State<EditorPanel> {
     _actions = List.from(macro['actions'] ?? []).map((e) => Map<String,dynamic>.from(e)).toList();
   }
 
+  // True while the write to the device is in flight, so the button can show progress and
+  // refuse a second tap.
+  bool _isSaving = false;
+
   Future<void> _saveMacro() async {
+    if (_isSaving) return;
     final state = context.read<DraupnirState>();
+    final messenger = ScaffoldMessenger.of(context);
     final colorHex = _selectedColor.value.toRadixString(16).padLeft(8, '0').substring(2).toUpperCase();
-    
+
     // Generate XBM string if it's a feather icon
     String iconXbm = "";
     if (featherIconsMap.containsKey(_selectedIcon)) {
       iconXbm = await generateXbmHexForIcon(featherIconsMap[_selectedIcon]!);
     }
 
-    state.updateMacro(widget.position, {
+    setState(() => _isSaving = true);
+
+    // Awaited, and the panel closes only on success. This used to be fire-and-forget: the call
+    // was not awaited and onClose() ran immediately, so the panel was gone before the write
+    // finished. A save that failed reported itself on a screen the user had already left, and a
+    // save that succeeded looked identical to one that never happened -- which is why a
+    // transferred profile appeared to need an edit-and-resave before its icon showed up.
+    final saved = await state.updateMacro(widget.position, {
       'name': _nameController.text,
       'color': colorHex,
       'mode': _mode,
@@ -106,8 +119,31 @@ class _EditorPanelState extends State<EditorPanel> {
       'icon_xbm': iconXbm,
       'actions': _actions,
     });
-    
-    widget.onClose();
+
+    if (!mounted) return;
+    setState(() => _isSaving = false);
+
+    if (saved) {
+      messenger.showSnackBar(const SnackBar(
+        content: Text('Saved to device.'),
+        duration: Duration(seconds: 2),
+      ));
+      widget.onClose();
+      return;
+    }
+
+    // Pairing and Config Mode take over the dashboard with their own guidance, so closing is
+    // right for those -- the user needs to see it. A retryable failure keeps the panel open so
+    // the edit is still there to retry.
+    if (state.needsPairing || state.needsConfigMode) {
+      widget.onClose();
+      return;
+    }
+    messenger.showSnackBar(SnackBar(
+      content: Text(state.lastSaveFailure ?? "Couldn't save to the device."),
+      action: SnackBarAction(label: 'RETRY', onPressed: _saveMacro),
+      duration: const Duration(seconds: 6),
+    ));
   }
 
   Future<void> _importSynapseXML() async {
@@ -731,8 +767,14 @@ class _EditorPanelState extends State<EditorPanel> {
         mainAxisAlignment: MainAxisAlignment.end,
         children: [
           ElevatedButton(
-            onPressed: _saveMacro,
-            child: const Text('SAVE TO DEVICE'),
+            onPressed: _isSaving ? null : _saveMacro,
+            child: _isSaving
+                ? const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Text('SAVE TO DEVICE'),
           ),
         ],
       ),

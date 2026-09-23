@@ -970,16 +970,22 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       onTap: () async {
                         final pos = state.lowestFreePos;
                         if (pos < 0) return;
-                        await state.updateMacro(pos, {
+                        final created = await state.updateMacro(pos, {
                           'name': 'New Macro',
                           'color': '#30C060',
                           'mode': 'play_once',
                           'actions': [],
                         });
-                        // Drop straight into the editor for the macro just created -- an empty
-                        // macro the user has to go find and open is not a useful outcome.
-                        if (context.mounted) {
+                        if (!context.mounted) return;
+                        // Only open the editor on a macro the device actually has. Opening one
+                        // the save never created would edit a macro that exists on this screen
+                        // and nowhere else.
+                        if (created) {
+                          // Drop straight into the editor for the macro just created -- an empty
+                          // macro the user has to go find and open is not a useful outcome.
                           setState(() => _editingKeyIdx = pos);
+                        } else {
+                          _reportSaveFailure(state, "Couldn't add the macro.");
                         }
                       },
                       child: const Center(
@@ -1072,6 +1078,20 @@ class _DashboardScreenState extends State<DashboardScreen> {
     // Close the editor if it was open on the macro just deleted, or it would sit there editing
     // something that no longer exists.
     if (_editingKeyIdx == pos) setState(() => _editingKeyIdx = null);
-    await state.deleteMacro(pos);
+    final deleted = await state.deleteMacro(pos);
+    if (!mounted || deleted) return;
+    _reportSaveFailure(state, "Couldn't delete the macro.");
+  }
+
+  /// Reports a retryable write failure in place, leaving the deck on screen.
+  ///
+  /// Pairing and Config Mode are deliberately excluded: those raise their own full-screen
+  /// guidance from the state layer, and a snackbar on top of it would just repeat it.
+  void _reportSaveFailure(DraupnirState state, String fallback) {
+    if (state.needsPairing || state.needsConfigMode) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(state.lastSaveFailure ?? fallback),
+      duration: const Duration(seconds: 6),
+    ));
   }
 }
