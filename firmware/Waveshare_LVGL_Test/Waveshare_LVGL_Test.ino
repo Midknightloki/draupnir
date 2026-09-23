@@ -540,9 +540,15 @@ static void ring_draw_event_cb(lv_event_t *e) {
       // blur, so the glow is stacked arcs at falling opacity. lv_draw_arc's `radius` is the
       // OUTER edge and `width` extends INWARD, so wider passes bleed toward the centre and can
       // never overflow the panel.
-      uint32_t lit = brighten(color, 0.55f);
+      // Lifted from 0.55/28/48 after hardware review: the selected wedge read as "a little too
+      // subtle" against a palette of adjacent blues and purples, where a 55% lift toward white
+      // is barely separable from a neighbour that is already light. Deliberately a moderate
+      // bump, not a wash -- the wedge should still be recognisably ITS OWN colour, which is the
+      // whole reason selection lights the slice in its own hue instead of painting it white.
+      // The fixed caret drawn after the wedge loop carries the unambiguous part of the signal.
+      uint32_t lit = brighten(color, 0.70f);
       static const struct { int16_t extra; lv_opa_t opa; } SEL_GLOW[] = {
-        { 22, 28 }, { 12, 48 },
+        { 22, 40 }, { 12, 66 },
       };
       for (unsigned g = 0; g < sizeof(SEL_GLOW) / sizeof(SEL_GLOW[0]); g++) {
         lv_draw_arc_dsc_t gl;
@@ -577,6 +583,33 @@ static void ring_draw_event_cb(lv_event_t *e) {
       run.width = RING_OUTER_R - RING_INNER_R; // whole band, so the wedge itself breathes
       lv_draw_arc(draw_ctx, &run, &center_pt, RING_OUTER_R, (uint16_t)lroundf(start), (uint16_t)lroundf(end));
     }
+  }
+
+  // Fixed selection caret at 12 o'clock.
+  //
+  // The RING rotates and the selection does not: since the M7/M8 ring rework the selected wedge
+  // always eases to the top, so this marker never needs to move or animate. That is what makes a
+  // static mark the right answer here -- it costs one arc, cannot drift out of sync with the
+  // selection, and unlike a colour wash it cannot be lost against a user-chosen wedge hue. The
+  // wash says "this one is brighter"; the caret says "this one", which is the part that was
+  // missing.
+  //
+  // Geometry, all of it load-bearing. lv_draw_arc's `radius` is the OUTER edge and `width`
+  // extends INWARD, so this spans r = 178-7 = 171 to 178: one pixel over RING_OUTER_R (172) so
+  // it visually touches the ring, and 2px clear of the 180px panel edge so it cannot clip.
+  // Wedge labels and icons sit at RING_MID_R (132), so nothing is obscured -- the outermost band
+  // of the ring is empty by construction.
+  //
+  // 270 degrees is 12 o'clock in lv_draw_arc's angle units; see wedge_center_angle(), whose
+  // +270.0f offset is the same fact. The 14-degree span is narrow enough to read as a tick
+  // rather than a ring segment.
+  if (active_count > 0) {
+    lv_draw_arc_dsc_t caret;
+    lv_draw_arc_dsc_init(&caret);
+    caret.color = lv_color_white();
+    caret.opa   = LV_OPA_COVER;
+    caret.width = 7;
+    lv_draw_arc(draw_ctx, &caret, &center_pt, RING_OUTER_R + 6, 263, 277);
   }
 
   // Tinted bloom -- fakes a glow with stacked arcs, since LVGL 8 has no blur. Colour follows the

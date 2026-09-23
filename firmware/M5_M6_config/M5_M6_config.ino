@@ -240,6 +240,77 @@ void drawRotaryUI() {
   d.fillTriangle(200, 120, 190, 110, 190, 130, color);
 }
 
+// Repaints ONLY the centre of the ring: the selection needle and the text it sweeps through.
+// The 16 dots, their icons and the profile arrows are left untouched.
+//
+// This exists because drawRunUI() opens with fillScreen(TFT_BLACK) and then repaints all 16 dots
+// plus their icons. That is far too expensive to run per detent, which is why it sat behind a
+// 50ms throttle -- and those two together were the whole complaint: the full clear was the
+// flicker, the throttle was the lag. Spinning fast always landed on the CORRECT position (the
+// encoder is read as an absolute count, so no steps are lost), but the intermediate frames were
+// dropped, so the needle appeared to teleport rather than sweep.
+//
+// Geometry is load-bearing. The dots sit at r=100 with radius 18, and 20 when ringed as running,
+// so they occupy r=80..120. Clearing r=78 stays 2px inside that and cannot erase a dot. The
+// needle reaches r=80, the profile name sits 15px above centre, the macro name 40px below, and
+// the kill-all indicator 55px above -- all within the cleared disc.
+//
+// Callers: the encoder selection path only. Anything that changes what the DOTS show -- a
+// profile switch, a macro edit, a macro starting or stopping -- must still go through
+// requestRedraw() and a full drawRunUI().
+static void drawSelectionCentre() {
+  auto& d = M5Dial.Display;
+
+  JsonArray profiles = profilesDoc["profiles"];
+  if (profiles.isNull() || profiles.size() == 0) return;
+  JsonObject prof = profiles[activeProfileIdx];
+  JsonArray macros = prof["macros"];
+
+  const char *selectedMacroName = nullptr;
+  uint16_t selectedMacroColor = TFT_WHITE;
+  for (JsonObject m : macros) {
+    if ((m["pos"] | -1) == selectedMacroIdx) {
+      selectedMacroName = m["name"] | "Macro";
+      selectedMacroColor = hexToRGB565(m["color"] | "#FFFFFF");
+      break;
+    }
+  }
+
+  d.fillCircle(120, 120, 78, TFT_BLACK);
+  d.setTextDatum(middle_center);
+
+  // The needle, same construction as drawRunUI's.
+  float angle = -PI / 2 + (selectedMacroIdx * PI * 2 / 16.0);
+  d.fillTriangle(120 + cos(angle) * 80, 120 + sin(angle) * 80,
+                 120 + cos(angle - PI / 2) * 3, 120 + sin(angle - PI / 2) * 3,
+                 120 + cos(angle + PI / 2) * 3, 120 + sin(angle + PI / 2) * 3,
+                 hexToRGB565("#BB0A00"));
+
+  d.setFont(&fonts::Orbitron_Light_24);
+  d.setTextColor(hexToRGB565(prof["color"] | "#FF00FF"), TFT_BLACK);
+  d.drawString(prof["name"] | "Profile", 120, 105);
+
+  if (selectedMacroName != nullptr) {
+    d.setTextColor(selectedMacroColor, TFT_BLACK);
+    d.drawString(selectedMacroName, 120, 160);
+  } else {
+    d.setTextColor(TFT_DARKGRAY, TFT_BLACK);
+    d.drawString("Empty", 120, 160);
+  }
+
+  // Redrawn identically rather than conditionally cleared: a macro starting or stopping routes
+  // through a full redraw, so this state cannot change underneath a selection move.
+  bool anyRunning = false;
+  for (int i = 0; i < RUNNING_SLOTS; i++) {
+    if (runningMacros[i].active) anyRunning = true;
+  }
+  if (anyRunning) {
+    d.setTextColor(TFT_RED, TFT_BLACK);
+    d.drawString("Kill all", 120, 65);
+    d.fillTriangle(120, 40, 115, 50, 125, 50, TFT_RED);
+  }
+}
+
 void drawRunUI() {
   if (inRotaryMode) {
     drawRotaryUI();
@@ -1576,11 +1647,19 @@ void loop() {
             oldPosition--;
           }
         } else {
+          // The tone stays, on every detent. This dial's detents have no mechanical click, so
+          // this is the only tactile confirmation a step registered -- it was never the source
+          // of the lag.
           M5Dial.Speaker.tone(1000, 10);
           selectedMacroIdx = (newPos % 16);
           if (selectedMacroIdx < 0) selectedMacroIdx += 16;
           oldPosition = newPos;
-          requestRedraw();
+          // Paint the centre immediately rather than queuing a full redraw. requestRedraw()
+          // would schedule drawRunUI(), which clears the whole screen and repaints all 16 dots
+          // with their icons -- so expensive it needs a 50ms throttle, and that throttle is what
+          // made a fast spin drop frames and look like it was skipping steps. The dots do not
+          // change when the selection moves, so there is nothing to repaint out here.
+          drawSelectionCentre();
         }
       }
       
