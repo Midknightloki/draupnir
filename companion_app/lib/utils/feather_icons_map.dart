@@ -44,6 +44,7 @@ final Map<String, IconData> featherIconsMap = {
   'folder': LucideIcons.folder,
   'globe': LucideIcons.globe,
   'grid': LucideIcons.grid,
+  'hammer': LucideIcons.hammer,
   'hardDrive': LucideIcons.hardDrive,
   'hash': LucideIcons.hash,
   'headphones': LucideIcons.headphones,
@@ -114,3 +115,21 @@ final Map<String, IconData> featherIconsMap = {
   'wifi': LucideIcons.wifi,
   'zap': LucideIcons.zap,
 };
+
+// Legacy `icon` values that predate the current set. Macros saved with one still render,
+// but they are not offered in the picker -- each points at the glyph that replaced it.
+const Map<String, String> legacyIconAliases = {
+  'text': 'type',
+};
+
+/// The glyph for an `icon` name, following [legacyIconAliases]; null if the name is unknown.
+///
+/// Every place that turns a name into a glyph goes through here. Three of them used to
+/// special-case 'hammer', 'text' and 'mic' inline with Material icons, which drifted: the
+/// editor preview drew Icons.build for 'hammer' while the save path, which rasterises only
+/// names present in [featherIconsMap], sent no bitmap at all. Picking those two produced a
+/// macro that looked fine in the app and had a blank face on the device.
+IconData? resolveIcon(String? name) {
+  if (name == null) return null;
+  return featherIconsMap[name] ?? featherIconsMap[legacyIconAliases[name]];
+}

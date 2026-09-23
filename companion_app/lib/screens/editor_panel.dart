@@ -100,8 +100,9 @@ class _EditorPanelState extends State<EditorPanel> {
 
     // Generate XBM string if it's a feather icon
     String iconXbm = "";
-    if (featherIconsMap.containsKey(_selectedIcon)) {
-      iconXbm = await generateXbmHexForIcon(featherIconsMap[_selectedIcon]!);
+    final glyph = resolveIcon(_selectedIcon);
+    if (glyph != null) {
+      iconXbm = await generateXbmHexForIcon(glyph);
     }
 
     setState(() => _isSaving = true);
@@ -302,11 +303,9 @@ class _EditorPanelState extends State<EditorPanel> {
   }
 
   Widget _buildIconSection() {
-    IconData currentIcon = Icons.help_outline;
-    if (_selectedIcon == 'hammer') currentIcon = Icons.build;
-    else if (_selectedIcon == 'text') currentIcon = Icons.text_fields;
-    else if (_selectedIcon == 'mic') currentIcon = Icons.mic;
-    else if (featherIconsMap.containsKey(_selectedIcon)) currentIcon = featherIconsMap[_selectedIcon]!;
+    // Same resolution the save path uses, so the preview cannot disagree with what the device
+    // is sent.
+    final IconData currentIcon = resolveIcon(_selectedIcon) ?? Icons.help_outline;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -368,19 +367,16 @@ class _EditorPanelState extends State<EditorPanel> {
                           crossAxisSpacing: 8,
                           mainAxisSpacing: 8,
                         ),
-                        itemCount: filteredKeys.length + 3, // +3 for defaults
+                        // One row per match, straight from the map. It used to be
+                        // `filteredKeys.length + 3` for three hardcoded extras rendered only
+                        // when the query matched their own names -- so any other search sent
+                        // indices 0, 1 and 2 down the else branch with mapIdx at -3, -2 and -1,
+                        // painting three empty cells above the first real result. 'mic' was also
+                        // in the map already, so it appeared twice.
+                        itemCount: filteredKeys.length,
                         itemBuilder: (context, idx) {
-                          String iconName;
-                          IconData iconData;
-                          if (idx == 0 && "hammer".contains(searchQuery.toLowerCase())) { iconName = 'hammer'; iconData = Icons.build; }
-                          else if (idx == 1 && "text".contains(searchQuery.toLowerCase())) { iconName = 'text'; iconData = Icons.text_fields; }
-                          else if (idx == 2 && "mic".contains(searchQuery.toLowerCase())) { iconName = 'mic'; iconData = Icons.mic; }
-                          else {
-                            int mapIdx = idx - 3;
-                            if (mapIdx < 0 || mapIdx >= filteredKeys.length) return const SizedBox.shrink();
-                            iconName = filteredKeys[mapIdx];
-                            iconData = featherIconsMap[iconName]!;
-                          }
+                          final String iconName = filteredKeys[idx];
+                          final IconData iconData = featherIconsMap[iconName]!;
 
                           return InkWell(
                             onTap: () {
