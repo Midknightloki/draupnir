@@ -893,7 +893,7 @@ bool needsBmp48(String? iconName, Set<String>? deviceGlyphs) {
 cd companion_app && flutter test
 ```
 
-Expected: PASS, 31/31 (27 existing + 4 new).
+Expected: PASS at 31 tests — the repo's baseline is **27**, plus the 4 added here. (An earlier draft of this plan said 34/34 as a *baseline*; that was the projected total after Task 7, not a starting point.)
 
 - [ ] **Step 5: Emit `icon_bmp48` on save**
 
@@ -940,7 +940,7 @@ that Task 7 exists to protect.
 cd companion_app && flutter analyze 2>&1 | grep -E "^\s*(error|warning)" && flutter test 2>&1 | tail -2
 ```
 
-Expected: only the pre-existing warning; 31/31 pass.
+Expected: only the pre-existing `dart:io` warning in `editor_panel.dart`; 31 tests pass.
 
 ```bash
 git add companion_app/lib/utils/icon_generator.dart companion_app/lib/screens/editor_panel.dart companion_app/test/icon_gap_test.dart
@@ -1030,7 +1030,7 @@ String? oversizeWarning(int documentBytes, int gapIconCount) {
 cd companion_app && flutter test
 ```
 
-Expected: PASS, 34/34.
+Expected: PASS at 34 tests — 31 after Task 6, plus the 3 added here.
 
 - [ ] **Step 5: Wire it into the save path**
 
@@ -1077,7 +1077,7 @@ Add `import 'package:companion_app/utils/icon_generator.dart';` if `draupnir_sta
 cd companion_app && flutter analyze 2>&1 | grep -E "^\s*(error|warning)" && flutter test 2>&1 | tail -2
 ```
 
-Expected: only the pre-existing warning; 34/34 pass.
+Expected: only the pre-existing `dart:io` warning; 34 tests pass.
 
 ```bash
 git add companion_app/lib companion_app/test
