@@ -684,8 +684,8 @@ class DraupnirState extends ChangeNotifier {
     }
 
     notifyListeners();
-    await saveProfiles();
-    if (error != null) return false;
+    final saved = await saveProfiles();
+    if (!saved) return false;
 
     // Re-read so the UI reflects what the device actually stored, including any icon merge it
     // performed on the way in.
@@ -696,16 +696,16 @@ class DraupnirState extends ChangeNotifier {
   /// Re-sends the config captured immediately before the last import.
   Future<bool> undoImport() async {
     final prefs = await SharedPreferences.getInstance();
-    final saved = prefs.getString(_snapshotKey);
-    if (saved == null) {
+    final snapshot = prefs.getString(_snapshotKey);
+    if (snapshot == null) {
       error = 'There is no pre-import snapshot to restore.';
       notifyListeners();
       return false;
     }
-    profilesData = Map<String, dynamic>.from(jsonDecode(saved) as Map);
+    profilesData = Map<String, dynamic>.from(jsonDecode(snapshot) as Map);
     notifyListeners();
-    await saveProfiles();
-    if (error != null) return false;
+    final saved = await saveProfiles();
+    if (!saved) return false;
     await fetchProfiles();
     return error == null;
   }
@@ -755,7 +755,20 @@ class DraupnirState extends ChangeNotifier {
     // only that the message was too big, and the user cannot act on that.
     final encoded = jsonEncode(profilesData);
     final gapCount = _countGapIcons();
-    final oversize = oversizeWarning(encoded.length, gapCount);
+    // Size limit chosen from the connected board. The advertised name is used ONLY as a size
+    // hint, never as a protocol decision: Spec 7 is explicit that the name is "a label for
+    // humans, not a protocol constant", and this respects that because being wrong is safe in
+    // both directions. Guess too small and we refuse a document the device would have taken --
+    // the user sees a message and can retry after trimming. Guess too large and the device
+    // refuses it itself via the M6 RX bounds, which surfaces through the same retry path. Neither
+    // corrupts anything, and the default is the conservative number.
+    final isRoomyBoard = (connectedDevice?.platformName ?? '').toLowerCase().contains('mini');
+    final oversize = oversizeWarning(
+      encoded.length,
+      gapCount,
+      maxBytes: isRoomyBoard ? kMaxDocumentBytesM5Dial : kMaxDocumentBytes,
+      hasGlyphList: deviceGlyphs != null,
+    );
     if (oversize != null) {
       _log('[ERR] save_profiles aborted: ${encoded.length} bytes, $gapCount gap icons');
       lastSaveFailure = oversize;
