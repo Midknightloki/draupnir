@@ -144,6 +144,17 @@ private:
 // above), so stripping here is a bandwidth/latency saving, not the String-fragmentation
 // stability fix it was on the M5Dial -- that heap-pressure history does not apply to this sink
 // and is not why this exists.
+// DO NOT add icon_bmp48 to this filter without first adding a matching arm to the icon merge
+// below (search: "If the incoming macro HAS an icon_xbm").
+//
+// M12 added an optional icon_bmp48 field -- a 48x48 bitmap for icon names this firmware has
+// no compiled glyph for. The app writes it ONLY for the macro being edited, so every other
+// macro keeps its own copy solely because this filter strips icon_xbm and nothing else, and
+// icon_bmp48 therefore round-trips through the app's in-memory document untouched.
+//
+// Stripping it here to save bandwidth -- the obvious next optimisation, and the reason this
+// comment exists -- would wipe every unedited macro's 48x48 on the next save. They would
+// silently degrade to the upscaled 18x18 path with no error anywhere.
 static const char ICON_XBM_MARKER[] = ",\"icon_xbm\":\"";
 
 class IconXbmFilterSink : public Print {
@@ -316,6 +327,11 @@ static void handleBleCommand(char *cmdStr) {
         for (JsonObject incomingMacro : incomingMacros) {
           // If the incoming macro HAS an icon_xbm, it wins -- never overwrite a bitmap the
           // client actually sent.
+          //
+          // There is deliberately NO icon_bmp48 arm here: nothing strips that field, so it
+          // always arrives intact and has nothing to merge back. If a future change adds
+          // icon_bmp48 to IconXbmFilterSink, this merge needs the matching arm FIRST -- see
+          // the comment on ICON_XBM_MARKER.
           if (!incomingMacro["icon_xbm"].isNull()) continue;
           int pos = incomingMacro["pos"] | -1;
           if (pos < 0) continue;
