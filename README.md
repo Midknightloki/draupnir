@@ -18,12 +18,21 @@ live in the device's own flash; you edit them over Bluetooth from the Companion 
 
 One puck. No key pad, no second device, no cable between components.
 
-| | Primary target | Second target |
+| | The product | Retired *(2026-09-23)* |
 |---|---|---|
 | Board | Waveshare ESP32-S3 knob | M5Stack Dial v1.1 |
 | Screen | 1.8" round AMOLED, 360x360 (SH8601, QSPI) | 1.28" round IPS, 240x240 (GC9A01) |
 | Touch | CST816 | FT3267 |
 | Input | Rotary encoder | Rotary encoder + knob button |
+
+**The Waveshare knob is the only board that ships.** The M5Dial was a supported second target and
+is now **officially retired** — not sold, not supported, no further work. It remains frozen and
+working for the author's own use, which is why the schema, BLE protocol and Companion App stay
+backward-compatible: a frozen device gets no firmware updates, so shared-layer changes are
+additive only.
+
+The decision was economics, not capability — the Waveshare is self-contained and orderable
+wholesale; the M5Dial is neither cheap to build nor practical to ship at scale.
 
 Both boards run the same macro engine, the same `profiles.json` schema, and the same Companion
 App — only the display/input layer differs.
@@ -31,6 +40,20 @@ App — only the display/input layer differs.
 A 16-key RGB pad (Adafruit NeoTrellis or NeoKey) is an **optional future expansion**, not part of
 the base device. Earlier versions of this project made it central; field testing showed the knob
 carries the interaction on its own.
+
+### What is actually on the board
+
+Waveshare's product page does not publish a pinout, and the board has more on it than is obvious
+— a second MCU wired to the first over UART, a 4-bit SDMMC card slot, an LRA haptic driver
+sharing the touch I2C bus, a PDM microphone, an I2S DAC and a battery socket. Working that out
+from scratch costs an afternoon.
+
+- [**Hardware reference**](docs/Waveshare_Hardware_Reference.md) — the full GPIO map, transcribed
+  from the manufacturer's schematic, with the parts that are easy to get wrong called out.
+- [Schematic](docs/hardware/waveshare-schematic/) — the five sheets themselves, archived here so
+  the reference can be checked against its source.
+- [Waveshare's wiki page](https://www.waveshare.com/wiki/ESP32-S3-Knob-Touch-LCD-1.8) — upstream,
+  and where the schematic came from. Their copyright; the archived copy is unmodified.
 
 ## Usage
 
@@ -79,6 +102,8 @@ The Flutter Companion App is in `companion_app/`.
 ## Documentation
 
 - [**Full spec**](docs/Draupnir_Spec.md) — concept, hardware, data model, BLE protocol, milestones.
+- [**Hardware reference**](docs/Waveshare_Hardware_Reference.md) — GPIO map transcribed from the
+  schematic. Read before wiring anything or guessing what a pin does.
 - [P1 Polish Spec](docs/P1_Polish_Spec.md) — open UI/UX findings from field testing.
 - [BLE Profile Fetch Debugging](docs/BLE_Profile_Fetch_Debugging.md) — the chunked-transport war story.
 

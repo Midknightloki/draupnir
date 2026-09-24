@@ -29,9 +29,11 @@ propose the M6 change set before touching code.
 
 - **Untracked work.** Chunks of the Waveshare firmware may still be untracked. Check
   `git status` and commit before anything destructive.
-- **Primary board** is the Waveshare ESP32-S3 knob (`firmware/Waveshare_LVGL_Test/`). The
-  M5Dial (`firmware/M5_M6_config/`) is a supported second target and still contains the
-  legacy web server + token pairing that v3 removes.
+- **The board** is the Waveshare ESP32-S3 knob (`firmware/Waveshare_LVGL_Test/`) — the only
+  one that ships. The M5Dial (`firmware/M5_M6_config/`) is **retired and frozen** *(2026-09-23)*:
+  it works, it stays on the current schema, and it is not to be extended. Its web server and
+  token pairing were removed in the 2026-09-06 security gate. Because it will never be updated
+  again, **shared-layer changes must be additive** — see `CLAUDE.md`.
 - **Repo bootstrap**, if starting from a bare copy:
   `.\scripts\bootstrap_repo.ps1 -Remote "https://github.com/<you>/draupnir.git"`
   (omit `-Remote` to just commit locally).

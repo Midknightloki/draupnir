@@ -33,7 +33,11 @@ app); configured from a **BLE Companion App** (Flutter); macros stored in flash.
 Full brief: `docs/Draupnir_Spec.md` (v3). Read it before design work.
 
 ## Decisions locked
-- **Boards:** Waveshare ESP32-S3 knob = **primary**; M5Dial = **supported second target.** They
+- **Boards:** Waveshare ESP32-S3 knob = **the product, and the only board that ships.** The
+  M5Dial is **officially retired** *(2026-09-23)* — it is not sold, not supported, and no longer
+  a target. It stays **frozen for the owner's personal use**: the build in `firmware/M5_M6_config/`
+  works, stays on the current schema, and is not to be extended. The Waveshare is self-contained
+  and orderable wholesale; the M5Dial is neither economical to build nor to ship at scale. They
   share the schema, BLE protocol, macro engine, and app — only the display/input layer differs.
 - **Firmware:** Arduino framework. Waveshare = LVGL + `esp_lcd_sh8601` + CST816. M5Dial =
   M5Unified/M5GFX. Both: TinyUSB HID, LittleFS, ArduinoJson.
@@ -79,8 +83,10 @@ FQBNs in use — **full detail and the reasoning behind every option is in
 
 **Two Waveshare quirks that will waste your time if you meet them cold:**
 - **The USB-C plug orientation picks which MCU you reach.** The board has two (ESP32-S3R8 and
-  ESP32-U4WDH) behind one port, switched by a CH445P. If esptool reports `ESP32-U4WDH` / 4 MB
-  flash / VID `0x1A86`, the plug is upside down — rotate it 180°. The S3 shows VID `0x303A`.
+  ESP32-U4WDH). USB-C carries two D+/D- pairs and connector CN1 wires one to each chip, so
+  flipping the plug physically changes which one the cable contacts — no switch involved. If
+  esptool reports `ESP32-U4WDH` / 4 MB flash / VID `0x1A86`, the plug is upside down — rotate it
+  180°. The S3 shows VID `0x303A`. Full pinout: `docs/Waveshare_Hardware_Reference.md`.
 - **Auto-reset does not work.** The running TinyUSB CDC ignores esptool's DTR/RTS reset, so
   `No serial data received` means "hold BOOT and replug", not "the board is broken".
 
@@ -89,8 +95,9 @@ See also `docs/M0_Setup_and_BringUp.md`.
 ## Firmware trees
 - `firmware/Waveshare_LVGL_Test/` — **primary.** Ring UI + BLE + macro engine, factored into
   `macro_engine.*` / `ble_engine.*`. This factoring is the model to converge on.
-- `firmware/M5_M6_config/` — M5Dial target. Still monolithic; contains the legacy web server and
-  token pairing, both slated for removal.
+- `firmware/M5_M6_config/` — M5Dial. **Retired and frozen** *(2026-09-23)*: still monolithic,
+  still builds, still works, and deliberately left alone. Touch it only to keep it compiling; do
+  not add features. Its security gate and export/import work shipped and are complete.
 - `firmware/Waveshare_Knob_Config/` — Adafruit_GFX port, superseded. Delete once nothing is owed to it.
 - `firmware/M0_bringup/`, `firmware/M1_usb_hid_hello/` — historical bring-up sketches.
 
@@ -103,12 +110,17 @@ See also `docs/M0_Setup_and_BringUp.md`.
 - **Stop all running macros before reloading profiles** — the engine holds `JsonObject` refs into
   the profile document, which reloading invalidates.
 
-## Work order: Waveshare first, then M5Dial
-Both boards stay in the product — the owner uses both, for different use cases and form factors.
-But they are worked **in sequence**: get the Waveshare knob polished and presentable (through
-M10), *then* bring the M5Dial up to spec. Deferring the M5Dial's **UI** work is fine; baking
-Waveshare assumptions into the **shared** layer (schema, BLE protocol, macro engine, app) is not —
-that turns the catch-up from a port into a rewrite. See `docs/Draupnir_Spec.md` §3.
+## Work order: Waveshare only *(2026-09-23)*
+The M5Dial is retired and frozen — see "Decisions locked". New work targets the Waveshare, and
+there is **no port owed to the M5Dial, ever.** The old "Waveshare first, then bring the M5Dial up
+to spec" sequencing is void.
+
+What survives is one rule, and it is now a **compatibility** rule rather than a scheduling one:
+**changes to the shared layer — schema, BLE protocol, macro engine, exported files — must be
+additive.** The frozen M5Dial build still reads `profiles.json` and still speaks the current BLE
+protocol, so removing or repurposing a field breaks a device the owner actually uses, with no
+firmware update coming to rescue it. Add fields; never take them away. `icon_xbm` is the worked
+example — see `docs/superpowers/specs/2026-09-23-waveshare-icon-rendering-design.md` §2.1.
 
 ## Current status
 Working on hardware: USB HID, macro engine (combos/text/consumer/mouse/delays), ring UI with
@@ -116,25 +128,39 @@ dynamic wedges and tap-to-fire, LittleFS profile store, BLE transport + Companio
 
 **Done and hardware-verified:** M6 config hardening · M7 NVS persistence · M8 on-device profile
 switching · M9 icons + dial orientation + rotary mode · M8b uncapped `pos` (schema v3) · the
-**M5Dial security gate** (2026-09-06 — BLE pairing/bonding and GATT permission flags on that board
-too, atomic writes, and Wi-Fi plus the LAN-reachable web API deleted outright).
+**M5Dial security gate** (2026-09-06) · **M10 profile export/import** (2026-09-08) ·
+**M11 UI/UX polish** (2026-09-23, PR #16).
 
 Both boards' gates are proven by **refusal**, not just acceptance — hostile-central tests passed on
 the Waveshare 2026-08-07 and the M5Dial 2026-09-07. Nothing security-related is outstanding.
 
-**Profile export/import is done and verified on the M5Dial** (2026-09-08) — `include_icons` on
-`get_profiles`, an enveloped JSON file, share-sheet export, and an undo that survives an app
-restart. Its one open criterion is the **cross-device** transfer, the only test that proves custom
-icons travel; it needs both boards.
+**M11 highlights worth knowing**, because each was a bug class rather than a one-off: the M5Dial
+encoder was being decoded in software on `loop()`'s cadence (the PJRC library's ESP32 interrupt
+table stops at GPIO 39; the dial is on 40/41, so it silently fell back to polling) — now counted
+by PCNT. A Waveshare swipe could fire a macro into the host, because a tap was defined as "LVGL
+did not call it a gesture" rather than "the finger did not move". And the app's BLE permission
+gate was unsatisfiable on Android 12+, hidden because only a *clean* install clears the stale
+location grant — which is what every Play Store user gets and what no upgrade-in-place test does.
 
-**Next = M10's remaining half, haptics — currently tabled.** Before debugging the CST816 conflict,
-run the `i2c_scan()` already sitting in `haptics_init()`: nobody has confirmed a DRV2605 is on the
-Waveshare's bus at all, and `haptics.cpp` says the address is an assumption from a datasheet rather
-than a verified schematic. If only `0x15` answers there is nothing to debug.
+**Next = M12, crisp icon rendering on the Waveshare.** Design approved and written up in
+`docs/superpowers/specs/2026-09-23-waveshare-icon-rendering-design.md` (PR #17); no code yet. The
+app rasterises icons to 18×18 and the Waveshare upscales 2.5× by nearest neighbour, which is why
+detailed glyphs are unreadable there and fine on the M5Dial. Fix is a Lucide subset compiled as a
+48px LVGL font, drawn from the `icon` name, with an app-supplied 48×48 covering names the firmware
+lacks. **M13 (OTA firmware update from the app)** is on the roadmap behind it and is what makes
+M12's compiled-in glyph set acceptable.
 
-**Testing note:** `companion_app` now has real unit tests (`flutter test`, 16 cases covering the
-transfer envelope). Dart logic is testable and should be tested; the firmware still has no host
-test framework, and its gate remains `arduino-cli compile` plus hardware.
+**Haptics — the hardware question is now answered.** Waveshare's own wiki for this board lists a
+**vibration motor driven by a DRV2605 over I2C**, so the driver is real and `haptics.cpp`'s address
+is no longer an assumption. That does not reopen the milestone: the motor was driven successfully
+with `DIAG_RESULT=1` and `OC_DETECT=1` and never buzzed on any of three attempts, which is an
+open-circuit fault on that specific unit. Configuration was proven correct by register readback.
+Implemented, unconfirmed, hardware-faulted — not a software defect. The blind `i2c_scan()` that
+once sat in `haptics_init()` was **deleted**: it probed the CST816 at 0x15 and broke touch.
+
+**Testing note:** `companion_app` has real unit tests (`flutter test`, 27 cases — the transfer
+envelope plus the icon-set invariants). Dart logic is testable and should be tested; the firmware
+still has no host test framework, and its gate remains `arduino-cli compile` plus hardware.
 
 ## Working style
 Incremental milestones, each verified **on hardware** before advancing. You compile/upload

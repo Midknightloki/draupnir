@@ -118,12 +118,14 @@ is the authority if a datasheet disagrees.
 | Controller | **ESP32-S3R8** (QFN56, rev v0.2), native USB (OTG/CDC) |
 | Flash | **16 MB**, quad (4 data lines) per eFuse, 3.3 V |
 | PSRAM | **8 MB embedded** (AP_3v3, octal) — **present but currently unused**, see below |
-| Second MCU | **ESP32-U4WDH** (4 MB flash) also on the board, sharing the single USB-C port |
+| microSD | **TF-018, 4-bit SDMMC** — GPIO 2/3/4/5/6/42. Not SPI; use `SD_MMC`. Unused by the firmware |
+| Haptics | **DRV2605L** driving an **LRA** via pads PP1/PP2, on the touch I2C bus. See `docs/Waveshare_Hardware_Reference.md` §5 |
+| Second MCU | **ESP32-U4WDH** (4 MB flash), own antenna, crystal and USB-UART bridge. **Connected to the S3 by a dedicated UART** — S3 GPIO48/38 to U4WDH IO23/IO18. Owns the board's second encoder. Unused by Draupnir |
 | Display | 1.8" round AMOLED, **360x360**, **SH8601** over **QSPI**, 16 bpp |
 | LCD pins | CS 14, PCLK 13, D0-D3 15/16/17/18, RST 21, backlight 47 (LEDC PWM) |
-| Touch | **CST816**, I2C addr **0x15**, SDA 11 / SCL 12 |
+| Touch | **CST816**, I2C addr **0x15**, SDA 11 / SCL 12 — **shared with the DRV2605 haptic driver** |
 | Encoder | Rotary, A = **GPIO 8**, B = **GPIO 7** |
-| Encoder button | **Not wired in firmware** — `knob_config_t` exposes A/B only. Confirm whether the hardware has a push action before relying on it. |
+| Encoder button | **None exists.** SW2 is an SSCM110100 — a four-pin encoder with no shaft switch (schematic sheet 1). A "press the knob" gesture must use the touchscreen. |
 | UI stack | LVGL + `esp_lcd_sh8601` |
 | FQBN | See `docs/Toolchain_arduino-cli.md` — generic `esp32:esp32:esp32s3`, Espressif core required |
 
@@ -134,12 +136,23 @@ constraint** — unlike the M5Dial, where it is a hard limit. Enabling `PSRAM=op
 relief valve for the BLE reassembly buffer and the profile `JsonDocument` once M6 is stable.
 
 **Two board quirks that cost real time if met cold** (both detailed in the toolchain doc):
-the **USB-C plug orientation** selects, via a CH445P analog switch, which of the two MCUs the
-single USB port reaches — plug it the wrong way and you are talking to the ESP32-U4WDH, not the
-S3. And **auto-reset does not work**: the running firmware's TinyUSB CDC ignores esptool's
+the **USB-C plug orientation** selects which of the two MCUs the single USB port reaches — plug
+it the wrong way and you are talking to the ESP32-U4WDH, not the S3. The mechanism is passive:
+USB-C carries two D+/D- pairs and CN1 wires one to each chip. *(Previously documented here as a
+CH445P analog switch; that part switches I2S audio — see
+`docs/Waveshare_Hardware_Reference.md` §7.)* And **auto-reset does not work**: the running firmware's TinyUSB CDC ignores esptool's
 DTR/RTS reset, so download mode requires a manual BOOT press.
 
-### Second target — M5Stack Dial v1.1
+### Retired target — M5Stack Dial v1.1 *(retired 2026-09-23)*
+
+**Not a shipping target.** The M5Dial is not sold, not supported, and receives no further work.
+It is **frozen for the owner's personal use**: `firmware/M5_M6_config/` builds, runs, and stays on
+the current schema. The Waveshare is self-contained and orderable wholesale; the M5Dial is neither
+economical to build nor to ship at scale, which is what decided it.
+
+Frozen is not the same as gone, and the difference is load-bearing: a device the owner still uses
+receives no firmware updates, so **every shared-layer change must be additive** (see below).
+
 
 | Item | Detail |
 |---|---|
@@ -150,32 +163,30 @@ DTR/RTS reset, so download mode requires a manual BOOT press.
 | Extras | Buzzer, RTC; PORT.A (Grove I2C, G13/G15), PORT.B (GPIO, G2/G1) |
 | Download mode | Hold **G0** on the back Stamp, plug USB-C, release |
 
-### Sequencing: Waveshare to polish first, then M5Dial *(decided 2026-07-26)*
+### Sequencing: Waveshare only *(decided 2026-07-26, superseded 2026-09-23)*
 
-Both boards stay in the product — the owner uses **both, for different use cases and form
-factors**, so the M5Dial is not a legacy target being wound down. But they are worked in order:
+**Superseded.** The original plan was to polish the Waveshare through M10, then circle back and
+bring the M5Dial up to spec. The M5Dial is now retired (above), so step 2 never happens and **no
+port is owed.** New work targets the Waveshare.
 
-1. **Waveshare knob to a finished, polished, presentable state.** Everything through M10:
-   hardening, persistence, on-device profile switching, icons, and the visual polish that makes it
-   demoable rather than merely functional.
-2. **Then circle back and bring the M5Dial up to spec.** It currently lags: still monolithic,
-   still carrying the removed web-server and token-pairing code, and (see §13) with no
-   cryptographic gate on its BLE config channel.
+What survives the retirement is the rule that sequencing was there to protect, reframed from a
+scheduling constraint into a **compatibility** one:
 
-The reason for sequencing rather than parallelising: every shared-core change would otherwise be
-written and verified twice on hardware, which doubles the slowest part of the loop. Polishing one
-board first also forces the shared/board-specific boundary below to be genuinely correct, so the
-M5Dial catch-up becomes mostly a display/input port rather than a re-implementation.
+> **Shared-layer changes must be additive.** The schema, the BLE protocol, the macro engine and
+> the exported file format are still read by a frozen M5Dial that will never be updated. Removing
+> a field, repurposing one, or changing what an existing value means breaks a device in daily use
+> with no fix available to it. Add; do not take away.
 
-**This does not license Waveshare-only shortcuts.** Anything in the shared layer — schema, BLE
-protocol, macro engine, app — must still be written board-agnostically. Deferring the M5Dial's
-*UI* work is fine; baking Waveshare assumptions into the shared core is not, and would turn step 2
-from a port into a rewrite.
+`icon_xbm` is the worked example: M12 adds a higher-resolution icon path for the Waveshare and
+keeps sending the old 18×18 bitmap untouched, precisely because the frozen board consumes it. See
+`docs/superpowers/specs/2026-09-23-waveshare-icon-rendering-design.md` §2.1.
 
-### Supporting two boards without forking the product
+### The shared/board-specific boundary
 
-Both targets must share the schema, the BLE protocol, the macro engine, and the Companion App.
-Only the display/input/driver layer differs. Concretely, the boundary is:
+Written when two boards were shipping; still the right boundary, and now the thing that keeps the
+frozen M5Dial working. The shared layer — schema, BLE protocol, macro engine, Companion App — is
+consumed by both, so it stays board-agnostic and additive. Only the display/input/driver layer is
+Waveshare-specific, and that is where M12's glyph rendering lives. Concretely, the boundary is:
 
 - **Shared, board-agnostic:** macro engine, profile store, BLE command handling, action types.
   These are already factored out on the Waveshare side (`macro_engine.*`, `ble_engine.*`) and
@@ -560,6 +571,24 @@ Honest status, not aspiration.
 | M5Dial security gate | **Close the second board's config channel** — BLE pairing/bonding + GATT permission flags, delete Wi-Fi and the LAN-reachable web API, atomic profile write, passkey screen | **Done (2026-09-06)**, verified on hardware — positive path 2026-09-06, hostile-central negative test 2026-09-07 (§7) |
 | M10 (export/import) | **Profile export/import** — `include_icons`, an enveloped JSON file, whole-config restore and single-profile share, pre-import snapshot with undo | **Done (2026-09-08)**, verified on hardware — M5Dial only; the cross-device transfer is **not** yet verified (§4 of HANDOFF) |
 | M10 (haptics) | Buzzer/haptic feedback | **Tabled** — check whether a DRV2605 is on the Waveshare bus at all before debugging the CST816 conflict; see `docs/HANDOFF.md` §6 |
+| M11 (UI/UX polish) | **Pre-publish polish** — M5Dial PCNT encoder, Waveshare swipe-vs-tap, hub compass caret, save-path feedback, icon picker defects, macro icon vocabulary, colour palettes, text-label fallback | **Done (2026-09-23)**, verified on hardware — both boards; PR #16 |
+| M12 (icon rendering) | **Crisp icons on the Waveshare** — curated glyph set compiled in and drawn from the `icon` name, with an app-supplied higher-resolution bitmap covering names the firmware does not know | **Next** — design in progress |
+| M13 (OTA) | **Firmware update from the Companion App** — check for, transfer and apply a firmware image over BLE, with rollback | **Planned** — see note below |
+
+**M13 (OTA)** is a prerequisite for the product being maintainable in the field, and it is also
+what makes M12's design affordable. M12 deliberately compiles its glyph set into the firmware
+rather than loading a font pushed over BLE — a loader would mean a filesystem driver in LVGL, a
+resumable bulk transfer, PSRAM enabled (currently disabled on purpose, §3), and an
+attacker-supplied binary parsed inside the render loop, immediately before a public release. The
+hybrid avoids all of that by letting the app supply a bitmap for any glyph the firmware lacks, so
+new icons work everywhere immediately and a firmware release merely *promotes* them to crisp.
+That trade only stays comfortable if shipping firmware is routine, which is what M13 buys.
+
+The board is already provisioned: the `default_8MB` partition table carries `app0` and `app1` OTA
+slots of 0x330000 each, so no layout change is needed. Open questions are transfer rate over the
+existing 100-byte chunked transport (a ~1 MB image is ~10,000 chunks), resumability across a
+disconnect, signature verification, and the rollback trigger — `esp_ota_mark_app_valid_cancel_
+rollback()` exists for this but needs a health check to gate it.
 
 **M6:** done-criterion was the H1 negative test, which passed on hardware 2026-08-07 — an
 unbonded central wrote to the RX characteristic and the command handler never received the bytes,
