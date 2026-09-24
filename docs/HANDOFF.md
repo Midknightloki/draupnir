@@ -24,6 +24,7 @@ or the owner. It assumes **no prior context**.
 | `.superpowers/sdd/2026-08-20-m9-icons-orientation-rotary/progress.md` | The full execution ledger for M9 — every task, review finding, hardware round, and owner decision, in order. §3–§4 below summarise it; the ledger is the source of truth. |
 | `.superpowers/sdd/2026-08-07-m7-m8-persistence/progress.md` | The equivalent ledger for the previous milestone (M7/M8), still relevant background. |
 | `docs/Toolchain_arduino-cli.md` | **Read before touching hardware.** Board quirks below will otherwise cost you hours. |
+| `docs/Waveshare_Hardware_Reference.md` | **Pinout, transcribed from the manufacturer's schematic** (archived in `docs/hardware/`). Answers what is wired where, and corrects three things this repo previously had wrong. |
 
 ---
 

@@ -92,7 +92,10 @@ RX reassembly buffer and the profile `JsonDocument` far more headroom than inter
 ### The USB-C orientation trick — read this before debugging a "wrong chip"
 
 The board carries **two** MCUs — the **ESP32-S3R8** (main, ours) and an **ESP32-U4WDH**
-(secondary, 4 MB flash) — behind a **single USB-C port**. A **CH445P 4-SPDT analog switch** routes
+(secondary, 4 MB flash) — behind a **single USB-C port**. USB-C carries two D+/D- pairs and
+connector CN1 wires one pair to each chip, so the plug's orientation decides which you reach.
+*(Earlier revisions of this doc credited a CH445P analog switch. That part exists but switches
+I2S audio, not USB — see `docs/Waveshare_Hardware_Reference.md` §7.)* The orientation routes
 the USB-to-UART bridge to one chip or the other, **selected by the Type-C plug orientation.**
 
 Symptoms of the wrong orientation:

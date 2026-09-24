@@ -83,8 +83,10 @@ FQBNs in use — **full detail and the reasoning behind every option is in
 
 **Two Waveshare quirks that will waste your time if you meet them cold:**
 - **The USB-C plug orientation picks which MCU you reach.** The board has two (ESP32-S3R8 and
-  ESP32-U4WDH) behind one port, switched by a CH445P. If esptool reports `ESP32-U4WDH` / 4 MB
-  flash / VID `0x1A86`, the plug is upside down — rotate it 180°. The S3 shows VID `0x303A`.
+  ESP32-U4WDH). USB-C carries two D+/D- pairs and connector CN1 wires one to each chip, so
+  flipping the plug physically changes which one the cable contacts — no switch involved. If
+  esptool reports `ESP32-U4WDH` / 4 MB flash / VID `0x1A86`, the plug is upside down — rotate it
+  180°. The S3 shows VID `0x303A`. Full pinout: `docs/Waveshare_Hardware_Reference.md`.
 - **Auto-reset does not work.** The running TinyUSB CDC ignores esptool's DTR/RTS reset, so
   `No serial data received` means "hold BOOT and replug", not "the board is broken".
 

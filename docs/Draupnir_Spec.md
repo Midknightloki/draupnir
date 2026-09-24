@@ -118,12 +118,14 @@ is the authority if a datasheet disagrees.
 | Controller | **ESP32-S3R8** (QFN56, rev v0.2), native USB (OTG/CDC) |
 | Flash | **16 MB**, quad (4 data lines) per eFuse, 3.3 V |
 | PSRAM | **8 MB embedded** (AP_3v3, octal) — **present but currently unused**, see below |
-| Second MCU | **ESP32-U4WDH** (4 MB flash) also on the board, sharing the single USB-C port |
+| microSD | **TF-018, 4-bit SDMMC** — GPIO 2/3/4/5/6/42. Not SPI; use `SD_MMC`. Unused by the firmware |
+| Haptics | **DRV2605L** driving an **LRA** via pads PP1/PP2, on the touch I2C bus. See `docs/Waveshare_Hardware_Reference.md` §5 |
+| Second MCU | **ESP32-U4WDH** (4 MB flash), own antenna, crystal and USB-UART bridge. **Connected to the S3 by a dedicated UART** — S3 GPIO48/38 to U4WDH IO23/IO18. Owns the board's second encoder. Unused by Draupnir |
 | Display | 1.8" round AMOLED, **360x360**, **SH8601** over **QSPI**, 16 bpp |
 | LCD pins | CS 14, PCLK 13, D0-D3 15/16/17/18, RST 21, backlight 47 (LEDC PWM) |
-| Touch | **CST816**, I2C addr **0x15**, SDA 11 / SCL 12 |
+| Touch | **CST816**, I2C addr **0x15**, SDA 11 / SCL 12 — **shared with the DRV2605 haptic driver** |
 | Encoder | Rotary, A = **GPIO 8**, B = **GPIO 7** |
-| Encoder button | **Not wired in firmware** — `knob_config_t` exposes A/B only. Confirm whether the hardware has a push action before relying on it. |
+| Encoder button | **None exists.** SW2 is an SSCM110100 — a four-pin encoder with no shaft switch (schematic sheet 1). A "press the knob" gesture must use the touchscreen. |
 | UI stack | LVGL + `esp_lcd_sh8601` |
 | FQBN | See `docs/Toolchain_arduino-cli.md` — generic `esp32:esp32:esp32s3`, Espressif core required |
 
@@ -134,9 +136,11 @@ constraint** — unlike the M5Dial, where it is a hard limit. Enabling `PSRAM=op
 relief valve for the BLE reassembly buffer and the profile `JsonDocument` once M6 is stable.
 
 **Two board quirks that cost real time if met cold** (both detailed in the toolchain doc):
-the **USB-C plug orientation** selects, via a CH445P analog switch, which of the two MCUs the
-single USB port reaches — plug it the wrong way and you are talking to the ESP32-U4WDH, not the
-S3. And **auto-reset does not work**: the running firmware's TinyUSB CDC ignores esptool's
+the **USB-C plug orientation** selects which of the two MCUs the single USB port reaches — plug
+it the wrong way and you are talking to the ESP32-U4WDH, not the S3. The mechanism is passive:
+USB-C carries two D+/D- pairs and CN1 wires one to each chip. *(Previously documented here as a
+CH445P analog switch; that part switches I2S audio — see
+`docs/Waveshare_Hardware_Reference.md` §7.)* And **auto-reset does not work**: the running firmware's TinyUSB CDC ignores esptool's
 DTR/RTS reset, so download mode requires a manual BOOT press.
 
 ### Retired target — M5Stack Dial v1.1 *(retired 2026-09-23)*
