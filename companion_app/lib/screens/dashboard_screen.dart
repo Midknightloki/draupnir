@@ -12,6 +12,7 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import '../state/draupnir_state.dart';
 import '../services/profile_transfer.dart';
 import '../theme.dart';
+import '../widgets/palette_picker.dart';
 import 'editor_panel.dart';
 
 class DashboardScreen extends StatefulWidget {
@@ -636,29 +637,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     decoration: const InputDecoration(labelText: 'Profile Name'),
                   ),
                   const SizedBox(height: 16),
-                  const Text('Profile Color', style: TextStyle(fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 8),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: AppTheme.cyberpunkPalette.map((color) {
-                      final isSelected = currentColor == color;
-                      return InkWell(
-                        onTap: () => setDialogState(() => currentColor = color),
-                        child: Container(
-                          width: 32,
-                          height: 32,
-                          decoration: BoxDecoration(
-                            color: color,
-                            shape: BoxShape.circle,
-                            border: Border.all(
-                              color: isSelected ? Colors.white : Colors.transparent,
-                              width: 3,
-                            ),
-                          ),
-                        ),
-                      );
-                    }).toList(),
+                  PalettePicker(
+                    label: 'Profile Color',
+                    selected: currentColor,
+                    onChanged: (c) => setDialogState(() => currentColor = c),
                   ),
                 ],
               ),

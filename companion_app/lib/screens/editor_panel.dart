@@ -8,6 +8,7 @@ import 'dart:convert';
 import '../state/draupnir_state.dart';
 import '../theme.dart';
 import '../utils/macro_icons.dart';
+import '../widgets/palette_picker.dart';
 import '../utils/icon_generator.dart';
 
 class EditorPanel extends StatefulWidget {
@@ -455,34 +456,10 @@ class _EditorPanelState extends State<EditorPanel> {
   }
 
   Widget _buildColorSection() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Text('Key Color', style: TextStyle(fontWeight: FontWeight.bold)),
-        const SizedBox(height: 8),
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: AppTheme.cyberpunkPalette.map((color) {
-            final isSelected = _selectedColor == color;
-            return InkWell(
-              onTap: () => setState(() => _selectedColor = color),
-              child: Container(
-                width: 32,
-                height: 32,
-                decoration: BoxDecoration(
-                  color: color,
-                  shape: BoxShape.circle,
-                  border: Border.all(
-                    color: isSelected ? Colors.white : Colors.transparent,
-                    width: 3,
-                  ),
-                ),
-              ),
-            );
-          }).toList(),
-        ),
-      ],
+    return PalettePicker(
+      label: 'Key Color',
+      selected: _selectedColor,
+      onChanged: (c) => setState(() => _selectedColor = c),
     );
   }
 
