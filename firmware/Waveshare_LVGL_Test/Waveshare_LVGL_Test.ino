@@ -10,6 +10,7 @@
 #include "ble_engine.h"
 #include "haptics.h"
 #include "trace.h"
+#include "icon_names.h"
 
 #define ENCODER_ECA_PIN 8
 #define ENCODER_ECB_PIN 7
@@ -356,6 +357,12 @@ static void rebuild_ring_layout(void) {
 #define ICON_DST_STRIDE ((ICON_DST_PX + 7) / 8)             /* 6 */
 #define ICON_DST_BYTES  (ICON_DST_STRIDE * ICON_DST_PX)     /* 270 */
 
+// The app-supplied fallback, for names this firmware has no glyph for. Drawn 1:1 -- the whole
+// point is that nothing is upscaled.
+#define ICON_BMP48_PX     48
+#define ICON_BMP48_STRIDE ((ICON_BMP48_PX + 7) / 8)              /* 6   */
+#define ICON_BMP48_BYTES  (ICON_BMP48_STRIDE * ICON_BMP48_PX)    /* 288 */
+
 // The app renders each Feather icon to an 18x18 monochrome bitmap and stores it as `icon_xbm`:
 // 108 hex characters = 54 bytes = 3 bytes per row. Returns false unless the string is exactly
 // that, so a malformed or absent value falls back to the name rather than drawing garbage.
@@ -380,6 +387,28 @@ static bool wedge_icon_decode(const char *hex, uint8_t *out54) {
     x = (uint8_t)(((x & 0xCC) >> 2) | ((x & 0x33) << 2));
     x = (uint8_t)(((x & 0xAA) >> 1) | ((x & 0x55) << 1));
     out54[b] = x;
+  }
+  return true;
+}
+
+// Decode a 48x48 1bpp XBM hex string. Mirrors wedge_icon_decode(), including the per-byte bit
+// reversal -- the app emits LSB-first (XBM convention) and LV_IMG_CF_ALPHA_1BIT reads MSB-first.
+//
+// Deliberately a separate function rather than a size parameter on wedge_icon_decode(): that one
+// carries a static_assert tying it to a bare uint8_t[54] at its call site, and widening it would
+// weaken the check that stops the 18x18 path from overrunning.
+static bool icon_bmp48_decode(const char *hex, uint8_t *out) {
+  if (hex == nullptr || strlen(hex) != (size_t)(ICON_BMP48_BYTES * 2)) return false;
+  for (int b = 0; b < ICON_BMP48_BYTES; b++) {
+    char pair[3] = { hex[b * 2], hex[b * 2 + 1], '\0' };
+    char *end = nullptr;
+    long v = strtol(pair, &end, 16);
+    if (end != pair + 2) return false;      // non-hex character
+    uint8_t x = (uint8_t)v;
+    x = (uint8_t)(((x & 0xF0) >> 4) | ((x & 0x0F) << 4));
+    x = (uint8_t)(((x & 0xCC) >> 2) | ((x & 0x33) << 2));
+    x = (uint8_t)(((x & 0xAA) >> 1) | ((x & 0x55) << 1));
+    out[b] = x;
   }
   return true;
 }
@@ -410,6 +439,48 @@ static void icon_scale(const uint8_t *src, uint8_t *dst) {
       }
     }
   }
+}
+
+// Name -> glyph codepoint, or 0 when this firmware has no glyph for that name.
+//
+// Binary search over ICON_NAMES, which the generator emits in strcmp order. A name we do not
+// know is the NORMAL case for an icon added to the app after this firmware shipped -- the caller
+// falls back to the app-supplied bitmap rather than treating it as an error.
+static uint32_t icon_codepoint(const char *name) {
+  if (name == nullptr || *name == '\0') return 0;
+  int lo = 0, hi = ICON_NAMES_COUNT - 1;
+  while (lo <= hi) {
+    int mid = lo + (hi - lo) / 2;
+    int c = strcmp(name, ICON_NAMES[mid].name);
+    if (c == 0) return ICON_NAMES[mid].cp;
+    if (c < 0) hi = mid - 1;
+    else       lo = mid + 1;
+  }
+  return 0;
+}
+
+// Encode one codepoint as UTF-8 into `out` (at least 5 bytes), NUL-terminated. Returns the byte
+// count, excluding the terminator.
+//
+// Hand-rolled rather than using LVGL's _lv_txt_unicode_to_utf8, which is an internal symbol that
+// has moved between LVGL versions. Lucide's glyphs live in the private use area (0xE000-0xF8FF),
+// so the three-byte branch is the one that actually runs; the others are here so the function is
+// correct rather than merely sufficient.
+static int icon_utf8(uint32_t cp, char *out) {
+  if (cp < 0x80) {
+    out[0] = (char)cp;                                    out[1] = '\0'; return 1;
+  } else if (cp < 0x800) {
+    out[0] = (char)(0xC0 | (cp >> 6));
+    out[1] = (char)(0x80 | (cp & 0x3F));                  out[2] = '\0'; return 2;
+  } else if (cp < 0x10000) {
+    out[0] = (char)(0xE0 | (cp >> 12));
+    out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[2] = (char)(0x80 | (cp & 0x3F));                  out[3] = '\0'; return 3;
+  }
+  out[0] = (char)(0xF0 | (cp >> 18));
+  out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+  out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+  out[3] = (char)(0x80 | (cp & 0x3F));                    out[4] = '\0'; return 4;
 }
 
 // Draws the donut wedges directly on the screen every repaint (selection change, layout
@@ -448,9 +519,79 @@ static void ring_draw_event_cb(lv_event_t *e) {
       float rad = center * (float)M_PI / 180.0f;
       lv_coord_t lx = (lv_coord_t)(EXAMPLE_LCD_H_RES / 2.0f + RING_MID_R * cosf(rad));
       lv_coord_t ly = (lv_coord_t)(EXAMPLE_LCD_V_RES / 2.0f + RING_MID_R * sinf(rad));
+      // FOUR-TIER ICON CHAIN. Declarations first: the tiers are an if/else-if chain, and C++ has
+      // nowhere to put a declaration between branches.
+      //
+      //   1  a glyph this firmware has           -> crisp, antialiased, no payload
+      //   2  an app-supplied 48x48               -> a name added after this firmware shipped
+      //   3  the 18x18 icon_xbm, upscaled        -> unchanged; what older profiles carry
+      //   4  the macro's name as text            -> unchanged
+      //
+      // Order is load-bearing and invisible to the compiler: get it wrong and icons render
+      // blocky, which looks exactly like the bug this milestone fixes.
       uint8_t iconbits[54];
-      const char *ixbm = macro.isNull() ? nullptr : (const char *)(macro["icon_xbm"] | (const char *)nullptr);
-      if (wedge_icon_decode(ixbm, iconbits)) {
+      const char *iname = macro.isNull() ? nullptr : (const char *)(macro["icon"]       | (const char *)nullptr);
+      const char *ixbm  = macro.isNull() ? nullptr : (const char *)(macro["icon_xbm"]   | (const char *)nullptr);
+      uint32_t icp = icon_codepoint(iname);
+      // `static` because 288 bytes is a lot for the LVGL task's 4 KB stack, and this callback
+      // only ever runs on that one task (LV_EVENT_DRAW_MAIN_END is dispatched from
+      // lv_timer_handler), so a single shared buffer is safe -- no reentrancy.
+      static uint8_t icon48[ICON_BMP48_BYTES];
+      const char *ib48  = macro.isNull() ? nullptr : (const char *)(macro["icon_bmp48"] | (const char *)nullptr);
+
+      if (icp != 0) {
+        // TIER 1 -- drawn at the font's native 48px, with no scaling anywhere.
+        //
+        // Two passes: a one-pixel offset shadow in the opposite contrast colour, then the glyph.
+        // Same treatment the bitmap path uses and for the same reason -- picking black-or-white
+        // by luminance alone tops out near 4.6:1 on a mid-tone wedge, so the shadow is what
+        // guarantees a hard edge on ANY user-chosen colour.
+        char gbuf[5];
+        icon_utf8(icp, gbuf);
+
+        lv_draw_label_dsc_t gl;
+        lv_draw_label_dsc_init(&gl);
+        gl.font  = &lucide_48;
+        gl.opa   = LV_OPA_COVER;
+        gl.align = LV_TEXT_ALIGN_CENTER;
+
+        // lv_area_t bounds are inclusive, so a 48px span is c-24 .. c+23.
+        lv_area_t ga = { (lv_coord_t)(lx - 24), (lv_coord_t)(ly - 24),
+                         (lv_coord_t)(lx + 23), (lv_coord_t)(ly + 23) };
+        lv_area_t gs = { (lv_coord_t)(ga.x1 + 1), (lv_coord_t)(ga.y1 + 1),
+                         (lv_coord_t)(ga.x2 + 1), (lv_coord_t)(ga.y2 + 1) };
+
+        gl.color = contrast_shadow_on(color);
+        lv_draw_label(draw_ctx, &gl, &gs, gbuf, NULL);
+        gl.color = contrast_on(color);
+        lv_draw_label(draw_ctx, &gl, &ga, gbuf, NULL);
+      } else if (icon_bmp48_decode(ib48, icon48)) {
+        // TIER 2 -- the app supplied a 48x48 for a name this firmware has no glyph for. Drawn
+        // 1:1, so it is sharper than the upscaled 18x18 even though it is still 1bpp and
+        // therefore aliased.
+        lv_img_dsc_t idata;
+        idata.header.cf          = LV_IMG_CF_ALPHA_1BIT;
+        idata.header.always_zero = 0;
+        idata.header.reserved    = 0;
+        idata.header.w           = ICON_BMP48_PX;
+        idata.header.h           = ICON_BMP48_PX;
+        idata.data_size          = ICON_BMP48_BYTES;
+        idata.data               = icon48;
+
+        lv_draw_img_dsc_t idsc;
+        lv_draw_img_dsc_init(&idsc);
+        idsc.recolor_opa = LV_OPA_COVER;
+
+        lv_area_t ia = { (lv_coord_t)(lx - 24), (lv_coord_t)(ly - 24),
+                         (lv_coord_t)(lx + 23), (lv_coord_t)(ly + 23) };
+        lv_area_t sa = { (lv_coord_t)(ia.x1 + 1), (lv_coord_t)(ia.y1 + 1),
+                         (lv_coord_t)(ia.x2 + 1), (lv_coord_t)(ia.y2 + 1) };
+
+        idsc.recolor = contrast_shadow_on(color);
+        lv_draw_img(draw_ctx, &idsc, &sa, &idata);
+        idsc.recolor = contrast_on(color);
+        lv_draw_img(draw_ctx, &idsc, &ia, &idata);
+      } else if (wedge_icon_decode(ixbm, iconbits)) {
         // ALPHA_1BIT supplies alpha only; the colour comes from recolor/recolor_opa
         // (lv_draw_img.h:38). 18x18 is load-bearing: it is the interchange size shared with the
         // app and the M5Dial, AND LV_IMG_BUF_SIZE_ALPHA_1BIT ((w/8)+1)*h disagrees with the

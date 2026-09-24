@@ -219,7 +219,11 @@ CI, and its output is checked in — consistent with how `orbitron_*.c` already 
    glyphs M11 predicted would fail — `gitPullRequest`, `alignLeft`, `listOrdered`, `braces` — are
    legible at ring size.
 4. A macro whose name is not in the firmware's table draws the app-supplied 48×48.
-5. A profile saved before M12 renders exactly as it did before (tier 3), verified by loading one.
+5. A profile saved before M12 still renders, and needs no re-save. It renders at **tier 1**, not
+   tier 3: the app has always written `icon`, so those names resolve and the font path wins —
+   which is the desirable outcome (existing profiles get crisp icons for free). Tier 3 is
+   reachable only for an absent, unknown, or legacy-alias `icon` name and must be forced with
+   one of those to be tested at all.
 6. A macro with no icon still draws its name (tier 4).
 7. The M5Dial, unflashed, continues to load and render the same profiles.
 8. The app never sends `icon_bmp48` to a device that does not answer `get_glyphs`.

@@ -6,6 +6,7 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/profile_transfer.dart';
+import '../utils/icon_generator.dart';
 
 class DraupnirState extends ChangeNotifier {
   bool isLoading = false;
@@ -38,6 +39,17 @@ class DraupnirState extends ChangeNotifier {
   // [needsConfigMode] this is an event, not a state: the caller shows it in place and it is
   // cleared on the next save attempt. See [saveProfiles].
   String? lastSaveFailure;
+
+  // Which icon names the connected device can draw from its own glyph set.
+  //
+  // NULL means "unknown", and is the state for every device that does not answer get_glyphs --
+  // the retired M5Dial, and any Waveshare on firmware older than M12. That is deliberately the
+  // same state as "not asked yet", because both lead to the same behaviour: send no icon_bmp48
+  // at all, and let the device fall back to the 18x18 icon_xbm it has always received.
+  Set<String>? deviceGlyphs;
+
+  // The device's glyph-set version, for logging and for a future cache. Null when unknown.
+  String? deviceGlyphSet;
 
   // True once connected over BLE. BLE is now the only transport (the Wi-Fi/HTTP client half of
   // the cut web UI is gone), so this doubles as "connected".
@@ -446,11 +458,16 @@ class DraupnirState extends ChangeNotifier {
           connectedDevice = null;
           rxChar = null;
           txChar = null;
+          deviceGlyphs = null;
+          deviceGlyphSet = null;
           error = 'Bluetooth disconnected';
           notifyListeners();
         }
       });
 
+      // Before the profiles, so the first save after connecting already knows which icons need a
+      // bitmap. Cheap (~2 KB, once per connection) and never fatal.
+      await fetchGlyphs();
       await fetchProfiles();
 
     } catch (e) {
@@ -481,6 +498,8 @@ class DraupnirState extends ChangeNotifier {
     }
     rxChar = null;
     txChar = null;
+    deviceGlyphs = null;
+    deviceGlyphSet = null;
     profilesData = null;
     notifyListeners();
   }
@@ -510,6 +529,31 @@ class DraupnirState extends ChangeNotifier {
   // sketch and is not a contract either side promises to keep.
   bool _looksLikeConfigModeRefusal(Object? message) =>
       message != null && message.toString().toLowerCase().contains('config mode');
+
+  /// Asks the device which icon names it can draw. Safe to call against any device.
+  ///
+  /// Never throws and never sets [error]: a device without the command is not a fault, it is the
+  /// common case for older firmware, and treating it as an error would put a red screen in front
+  /// of someone whose knob works perfectly.
+  Future<void> fetchGlyphs() async {
+    try {
+      final response = await _sendBleRequest({'cmd': 'get_glyphs'});
+      if (response['status'] == 'ok' && response['glyphs'] is List) {
+        deviceGlyphs = (response['glyphs'] as List).map((e) => e.toString()).toSet();
+        deviceGlyphSet = response['set']?.toString();
+        _log('[glyphs] device knows ${deviceGlyphs!.length} icons (set=$deviceGlyphSet)');
+      } else {
+        deviceGlyphs = null;
+        deviceGlyphSet = null;
+        _log('[glyphs] device has no glyph list; icon_bmp48 will not be sent');
+      }
+    } catch (e) {
+      deviceGlyphs = null;
+      deviceGlyphSet = null;
+      _log('[glyphs] get_glyphs failed: $e');
+    }
+    notifyListeners();
+  }
 
   Future<void> fetchProfiles() async {
     isLoading = true;
@@ -640,8 +684,8 @@ class DraupnirState extends ChangeNotifier {
     }
 
     notifyListeners();
-    await saveProfiles();
-    if (error != null) return false;
+    final saved = await saveProfiles();
+    if (!saved) return false;
 
     // Re-read so the UI reflects what the device actually stored, including any icon merge it
     // performed on the way in.
@@ -652,16 +696,16 @@ class DraupnirState extends ChangeNotifier {
   /// Re-sends the config captured immediately before the last import.
   Future<bool> undoImport() async {
     final prefs = await SharedPreferences.getInstance();
-    final saved = prefs.getString(_snapshotKey);
-    if (saved == null) {
+    final snapshot = prefs.getString(_snapshotKey);
+    if (snapshot == null) {
       error = 'There is no pre-import snapshot to restore.';
       notifyListeners();
       return false;
     }
-    profilesData = Map<String, dynamic>.from(jsonDecode(saved) as Map);
+    profilesData = Map<String, dynamic>.from(jsonDecode(snapshot) as Map);
     notifyListeners();
-    await saveProfiles();
-    if (error != null) return false;
+    final saved = await saveProfiles();
+    if (!saved) return false;
     await fetchProfiles();
     return error == null;
   }
@@ -707,6 +751,32 @@ class DraupnirState extends ChangeNotifier {
     lastSaveFailure = null;
     notifyListeners();
 
+    // Checked before sending rather than after refusal: the device's rejection is safe but says
+    // only that the message was too big, and the user cannot act on that.
+    final encoded = jsonEncode(profilesData);
+    final gapCount = _countGapIcons();
+    // Size limit chosen from the connected board. The advertised name is used ONLY as a size
+    // hint, never as a protocol decision: Spec 7 is explicit that the name is "a label for
+    // humans, not a protocol constant", and this respects that because being wrong is safe in
+    // both directions. Guess too small and we refuse a document the device would have taken --
+    // the user sees a message and can retry after trimming. Guess too large and the device
+    // refuses it itself via the M6 RX bounds, which surfaces through the same retry path. Neither
+    // corrupts anything, and the default is the conservative number.
+    final isRoomyBoard = (connectedDevice?.platformName ?? '').toLowerCase().contains('mini');
+    final oversize = oversizeWarning(
+      encoded.length,
+      gapCount,
+      maxBytes: isRoomyBoard ? kMaxDocumentBytesM5Dial : kMaxDocumentBytes,
+      hasGlyphList: deviceGlyphs != null,
+    );
+    if (oversize != null) {
+      _log('[ERR] save_profiles aborted: ${encoded.length} bytes, $gapCount gap icons');
+      lastSaveFailure = oversize;
+      isLoading = false;
+      notifyListeners();
+      return false;
+    }
+
     bool saved = false;
     try {
       final response = await _sendBleRequest({
@@ -737,6 +807,26 @@ class DraupnirState extends ChangeNotifier {
     isLoading = false;
     notifyListeners();
     return saved;
+  }
+
+  /// Macros carrying an icon_bmp48, i.e. icons this device's firmware has no glyph for.
+  ///
+  /// Walks `profilesData`, which is untyped JSON off the wire -- a missing `profiles` key, a
+  /// null `macros`, or a macro that isn't a Map must all count as zero, not throw, since this
+  /// runs on the path a user reaches just by pressing Save.
+  int _countGapIcons() {
+    final doc = profilesData;
+    if (doc == null) return 0;
+    int n = 0;
+    for (final p in (doc['profiles'] as List? ?? const [])) {
+      if (p is! Map) continue;
+      for (final m in (p['macros'] as List? ?? const [])) {
+        if (m is! Map) continue;
+        final bmp = m['icon_bmp48'];
+        if (bmp is String && bmp.isNotEmpty) n++;
+      }
+    }
+    return n;
   }
 
   Future<void> triggerMacro(int macroIdx) async {
