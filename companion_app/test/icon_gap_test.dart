@@ -60,4 +60,24 @@ void main() {
       expect(hex, matches(hexPattern));
     });
   });
+
+  group('oversizeWarning', () {
+    test('null for a document that fits', () {
+      expect(oversizeWarning(2000, 0), isNull);
+    });
+
+    test('explains the cause when gap icons are what made it too big', () {
+      final msg = oversizeWarning(9000, 12);
+      expect(msg, isNotNull);
+      expect(msg, contains('12'));
+      expect(msg!.toLowerCase(), contains('firmware'));
+    });
+
+    test('still warns when the document is too big with no gap icons', () {
+      // Not the expected cause, so the message must not blame icons that are not there.
+      final msg = oversizeWarning(9000, 0);
+      expect(msg, isNotNull);
+      expect(msg!.contains('0 icon'), isFalse);
+    });
+  });
 }

@@ -87,3 +87,28 @@ bool needsBmp48(String? iconName, Set<String>? deviceGlyphs) {
   if (deviceGlyphs == null) return false;
   return !deviceGlyphs.contains(iconName);
 }
+
+/// The device refuses a message larger than its BLE receive buffer. BLE_RX_BUFFER_SIZE is 8192
+/// on the Waveshare; this leaves headroom for the command wrapper and chunk framing.
+const int kMaxDocumentBytes = 7500;
+
+/// A specific, actionable message when the serialised document is too large, or null when it
+/// fits.
+///
+/// The device already refuses oversized messages safely (M6 RX bounds) and the refusal surfaces
+/// through the save-retry path, so this is not a safety net -- it is the difference between "the
+/// device refused the save" and knowing WHY, which for a document full of gap icons is a thing
+/// the user can actually act on by updating the firmware.
+String? oversizeWarning(int documentBytes, int gapIconCount) {
+  if (documentBytes <= kMaxDocumentBytes) return null;
+  if (gapIconCount > 0) {
+    return 'This profile is too large to send ('
+        '${(documentBytes / 1024).toStringAsFixed(1)} KB). '
+        '$gapIconCount of its icons are newer than the device\'s firmware, so the app has to '
+        'send each one as an image. Updating the firmware, or choosing icons the device already '
+        'has, will fix both the size and how sharp they look.';
+  }
+  return 'This profile is too large to send ('
+      '${(documentBytes / 1024).toStringAsFixed(1)} KB). '
+      'Try removing a few macros or shortening their text actions.';
+}

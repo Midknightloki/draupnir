@@ -6,6 +6,7 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/profile_transfer.dart';
+import '../utils/icon_generator.dart';
 
 class DraupnirState extends ChangeNotifier {
   bool isLoading = false;
@@ -750,6 +751,19 @@ class DraupnirState extends ChangeNotifier {
     lastSaveFailure = null;
     notifyListeners();
 
+    // Checked before sending rather than after refusal: the device's rejection is safe but says
+    // only that the message was too big, and the user cannot act on that.
+    final encoded = jsonEncode(profilesData);
+    final gapCount = _countGapIcons();
+    final oversize = oversizeWarning(encoded.length, gapCount);
+    if (oversize != null) {
+      _log('[ERR] save_profiles aborted: ${encoded.length} bytes, $gapCount gap icons');
+      lastSaveFailure = oversize;
+      isLoading = false;
+      notifyListeners();
+      return false;
+    }
+
     bool saved = false;
     try {
       final response = await _sendBleRequest({
@@ -780,6 +794,26 @@ class DraupnirState extends ChangeNotifier {
     isLoading = false;
     notifyListeners();
     return saved;
+  }
+
+  /// Macros carrying an icon_bmp48, i.e. icons this device's firmware has no glyph for.
+  ///
+  /// Walks `profilesData`, which is untyped JSON off the wire -- a missing `profiles` key, a
+  /// null `macros`, or a macro that isn't a Map must all count as zero, not throw, since this
+  /// runs on the path a user reaches just by pressing Save.
+  int _countGapIcons() {
+    final doc = profilesData;
+    if (doc == null) return 0;
+    int n = 0;
+    for (final p in (doc['profiles'] as List? ?? const [])) {
+      if (p is! Map) continue;
+      for (final m in (p['macros'] as List? ?? const [])) {
+        if (m is! Map) continue;
+        final bmp = m['icon_bmp48'];
+        if (bmp is String && bmp.isNotEmpty) n++;
+      }
+    }
+    return n;
   }
 
   Future<void> triggerMacro(int macroIdx) async {
