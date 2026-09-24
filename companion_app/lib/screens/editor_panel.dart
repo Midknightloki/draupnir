@@ -99,11 +99,17 @@ class _EditorPanelState extends State<EditorPanel> {
     final messenger = ScaffoldMessenger.of(context);
     final colorHex = _selectedColor.value.toRadixString(16).padLeft(8, '0').substring(2).toUpperCase();
 
-    // Generate XBM string if it's a feather icon
+    // icon_xbm is ALWAYS sent: it is what the retired M5Dial consumes and what makes older
+    // Waveshare firmware degrade rather than break. icon_bmp48 is additional, and only when the
+    // device told us it has no glyph for this name.
     String iconXbm = "";
+    String iconBmp48 = "";
     final glyph = resolveIcon(_selectedIcon);
     if (glyph != null) {
       iconXbm = await generateXbmHexForIcon(glyph);
+      if (needsBmp48(_selectedIcon, state.deviceGlyphs)) {
+        iconBmp48 = await generateXbmHex(glyph, size: 48);
+      }
     }
 
     setState(() => _isSaving = true);
@@ -119,6 +125,7 @@ class _EditorPanelState extends State<EditorPanel> {
       'mode': _mode,
       'icon': _selectedIcon,
       'icon_xbm': iconXbm,
+      if (iconBmp48.isNotEmpty) 'icon_bmp48': iconBmp48,
       'actions': _actions,
     });
 
