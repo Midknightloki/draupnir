@@ -1,5 +1,6 @@
 #include "ble_engine.h"
 #include "macro_engine.h"
+#include "icon_names.h"
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLESecurity.h>
@@ -407,6 +408,32 @@ static void handleBleCommand(char *cmdStr) {
     profilesDirty = true;
     Serial.println("[ble] save_profiles: written; reload deferred to the display task");
     sendBleMessage("{\"status\":\"ok\"}");
+  } else if (cmd == "get_glyphs") {
+    // Which icon names this firmware can draw, so the app only pays the icon_bmp48 cost for the
+    // ones it cannot (see the M12 design 4.1). Roughly 2 KB; streamed through the chunk sink
+    // rather than built in a String, because the whole point of the sink is to avoid holding the
+    // full response in heap at once.
+    //
+    // A device without this command answers "Unknown command" below, and the app treats ANY
+    // non-success as "no glyph list" and stops sending icon_bmp48 entirely. That single rule is
+    // the whole backward-compatibility story -- do not make this branch clever.
+    bleSendPreamble();
+    BleChunkSink sink;
+    sink.print("{\"status\":\"ok\",\"set\":\"" ICON_SET_VERSION "\",\"glyphs\":[");
+    for (int i = 0; i < ICON_NAMES_COUNT; i++) {
+      if (i) sink.print(",");
+      sink.print("\"");
+      sink.print(ICON_NAMES[i].name);
+      sink.print("\"");
+    }
+    sink.print("]}\n");
+    if (sink.flushRemainder()) {
+      Serial.printf("[ble] get_glyphs: streamed %u bytes (%d names)\n",
+                    (unsigned)sink.totalSent, ICON_NAMES_COUNT);
+    } else {
+      Serial.println("[ble] get_glyphs: send aborted (ack retries exhausted)");
+      sendBleMessage("{\"status\":\"error\",\"message\":\"Send failed\"}");
+    }
   } else if (cmd == "trigger") {
     // Waveshare has no profile-switching UI yet (only one profile is ever "active" at a time),
     // so unlike M5Dial's trigger handler this doesn't honor an arbitrary req["profile"] index --
