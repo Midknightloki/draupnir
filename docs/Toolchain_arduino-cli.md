@@ -3,7 +3,9 @@
 The agent can build and flash directly. This is the fast path; the Arduino IDE GUI
 (see `M0_Setup_and_BringUp.md`) is a fallback.
 
-Draupnir has **two board targets**. Waveshare is primary; M5Dial is a supported second target.
+Draupnir ships **one board**: the Waveshare ESP32-S3 knob. The M5Dial is **retired**
+*(2026-09-23)* and frozen for the owner's personal use — its toolchain notes are kept here
+because that build still has to compile and flash, not because it is a target for new work.
 
 ---
 

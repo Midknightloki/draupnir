@@ -29,6 +29,13 @@ or the owner. It assumes **no prior context**.
 
 ## 2. The goal
 
+> **Board status changed 2026-09-23.** The **Waveshare ESP32-S3 knob is the only board that
+> ships.** The M5Dial is **officially retired** — not sold, not supported, no further work — and
+> **frozen for the owner's personal use**: it still builds, runs, and reads the current schema.
+> Because a frozen device receives no firmware updates, **every shared-layer change (schema, BLE
+> protocol, macro engine, export format) must be additive.** Dated entries below that describe the
+> M5Dial as a supported second target were accurate when written; read them as history.
+
 Draupnir is a **USB-HID macro controller in a knob** — round touch screen plus rotary encoder,
 driverless over USB HID, configured from a Flutter phone app over BLE. Macros show as a ring of
 colored wedges; rotate to select, tap center or tap a wedge to fire.
@@ -486,10 +493,19 @@ proposed Visual Studio reinstall that would have fixed nothing.
 
 ## 6. What to do next, in order
 
+> **Stale as of 2026-09-23.** The steps below were written before M10 (export/import), M11
+> (UI/UX polish, PR #16) and the M12 design (PR #17) landed, and reference PRs that have since
+> merged. The current next step is **M12 — crisp icon rendering on the Waveshare**; its approved
+> design is `docs/superpowers/specs/2026-09-23-waveshare-icon-rendering-design.md`, and **M13
+> (OTA firmware update from the app)** sits behind it. Treat this section as history until it is
+> rewritten.
+
 **Security work is closed.** The M5Dial security gate landed on `feat/m5dial-security-gate` (PR #6)
 and is verified on hardware — positive path 2026-09-06, hostile-central negative test 2026-09-07.
-Both supported boards now enforce pairing, bonding and GATT permission flags, and both claims are
-backed by a real refusal test rather than by inference. Nothing security-related is outstanding.
+Both boards enforce pairing, bonding and GATT permission flags, and both claims are backed by a
+real refusal test rather than by inference. Nothing security-related is outstanding. (The M5Dial
+has since been retired — §2 — but shipped with its gate closed, which is why it is safe to leave
+frozen rather than withdraw.)
 
 ### Step 1 — Land the rebrand
 

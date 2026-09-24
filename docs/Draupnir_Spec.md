@@ -139,7 +139,16 @@ single USB port reaches — plug it the wrong way and you are talking to the ESP
 S3. And **auto-reset does not work**: the running firmware's TinyUSB CDC ignores esptool's
 DTR/RTS reset, so download mode requires a manual BOOT press.
 
-### Second target — M5Stack Dial v1.1
+### Retired target — M5Stack Dial v1.1 *(retired 2026-09-23)*
+
+**Not a shipping target.** The M5Dial is not sold, not supported, and receives no further work.
+It is **frozen for the owner's personal use**: `firmware/M5_M6_config/` builds, runs, and stays on
+the current schema. The Waveshare is self-contained and orderable wholesale; the M5Dial is neither
+economical to build nor to ship at scale, which is what decided it.
+
+Frozen is not the same as gone, and the difference is load-bearing: a device the owner still uses
+receives no firmware updates, so **every shared-layer change must be additive** (see below).
+
 
 | Item | Detail |
 |---|---|
@@ -150,32 +159,30 @@ DTR/RTS reset, so download mode requires a manual BOOT press.
 | Extras | Buzzer, RTC; PORT.A (Grove I2C, G13/G15), PORT.B (GPIO, G2/G1) |
 | Download mode | Hold **G0** on the back Stamp, plug USB-C, release |
 
-### Sequencing: Waveshare to polish first, then M5Dial *(decided 2026-07-26)*
+### Sequencing: Waveshare only *(decided 2026-07-26, superseded 2026-09-23)*
 
-Both boards stay in the product — the owner uses **both, for different use cases and form
-factors**, so the M5Dial is not a legacy target being wound down. But they are worked in order:
+**Superseded.** The original plan was to polish the Waveshare through M10, then circle back and
+bring the M5Dial up to spec. The M5Dial is now retired (above), so step 2 never happens and **no
+port is owed.** New work targets the Waveshare.
 
-1. **Waveshare knob to a finished, polished, presentable state.** Everything through M10:
-   hardening, persistence, on-device profile switching, icons, and the visual polish that makes it
-   demoable rather than merely functional.
-2. **Then circle back and bring the M5Dial up to spec.** It currently lags: still monolithic,
-   still carrying the removed web-server and token-pairing code, and (see §13) with no
-   cryptographic gate on its BLE config channel.
+What survives the retirement is the rule that sequencing was there to protect, reframed from a
+scheduling constraint into a **compatibility** one:
 
-The reason for sequencing rather than parallelising: every shared-core change would otherwise be
-written and verified twice on hardware, which doubles the slowest part of the loop. Polishing one
-board first also forces the shared/board-specific boundary below to be genuinely correct, so the
-M5Dial catch-up becomes mostly a display/input port rather than a re-implementation.
+> **Shared-layer changes must be additive.** The schema, the BLE protocol, the macro engine and
+> the exported file format are still read by a frozen M5Dial that will never be updated. Removing
+> a field, repurposing one, or changing what an existing value means breaks a device in daily use
+> with no fix available to it. Add; do not take away.
 
-**This does not license Waveshare-only shortcuts.** Anything in the shared layer — schema, BLE
-protocol, macro engine, app — must still be written board-agnostically. Deferring the M5Dial's
-*UI* work is fine; baking Waveshare assumptions into the shared core is not, and would turn step 2
-from a port into a rewrite.
+`icon_xbm` is the worked example: M12 adds a higher-resolution icon path for the Waveshare and
+keeps sending the old 18×18 bitmap untouched, precisely because the frozen board consumes it. See
+`docs/superpowers/specs/2026-09-23-waveshare-icon-rendering-design.md` §2.1.
 
-### Supporting two boards without forking the product
+### The shared/board-specific boundary
 
-Both targets must share the schema, the BLE protocol, the macro engine, and the Companion App.
-Only the display/input/driver layer differs. Concretely, the boundary is:
+Written when two boards were shipping; still the right boundary, and now the thing that keeps the
+frozen M5Dial working. The shared layer — schema, BLE protocol, macro engine, Companion App — is
+consumed by both, so it stays board-agnostic and additive. Only the display/input/driver layer is
+Waveshare-specific, and that is where M12's glyph rendering lives. Concretely, the boundary is:
 
 - **Shared, board-agnostic:** macro engine, profile store, BLE command handling, action types.
   These are already factored out on the Waveshare side (`macro_engine.*`, `ble_engine.*`) and

@@ -36,11 +36,14 @@ It receives no part of this milestone and no port is owed later.
 change here is additive.** `icon_xbm` stays on the wire, keeps its meaning, and is still always
 sent. Nothing may be removed or repurposed.
 
-> **Follow-up owed elsewhere.** `CLAUDE.md` and `AGENTS.md` still describe the M5Dial as a
-> "supported second target" with a Waveshare-then-M5Dial work order, and `Draupnir_Spec.md` §3
-> warns against baking Waveshare assumptions into shared layers. Those remain accurate for the
-> *shared* layer — this design honours them — but if the M5Dial is retired outright, all three
-> need updating together. Not done here, because that decision is not final.
+> **Resolved 2026-09-23.** The M5Dial is now **officially retired** — not sold, not supported,
+> shipping to nobody — while staying frozen and working for the owner personally. `CLAUDE.md`,
+> `AGENTS.md`, `README.md`, `KICKOFF_PROMPT.md`, `Draupnir_Spec.md` §3 and the toolchain doc were
+> updated together in this change.
+>
+> Retirement makes the additive-only rule *more* binding, not less. A retired-but-in-use board
+> receives no firmware updates ever, so it can never be brought forward to meet a breaking
+> change. "Frozen" is what makes `icon_xbm` permanent.
 
 ### 2.2 Built-in library only
 

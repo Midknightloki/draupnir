@@ -18,12 +18,21 @@ live in the device's own flash; you edit them over Bluetooth from the Companion 
 
 One puck. No key pad, no second device, no cable between components.
 
-| | Primary target | Second target |
+| | The product | Retired *(2026-09-23)* |
 |---|---|---|
 | Board | Waveshare ESP32-S3 knob | M5Stack Dial v1.1 |
 | Screen | 1.8" round AMOLED, 360x360 (SH8601, QSPI) | 1.28" round IPS, 240x240 (GC9A01) |
 | Touch | CST816 | FT3267 |
 | Input | Rotary encoder | Rotary encoder + knob button |
+
+**The Waveshare knob is the only board that ships.** The M5Dial was a supported second target and
+is now **officially retired** — not sold, not supported, no further work. It remains frozen and
+working for the author's own use, which is why the schema, BLE protocol and Companion App stay
+backward-compatible: a frozen device gets no firmware updates, so shared-layer changes are
+additive only.
+
+The decision was economics, not capability — the Waveshare is self-contained and orderable
+wholesale; the M5Dial is neither cheap to build nor practical to ship at scale.
 
 Both boards run the same macro engine, the same `profiles.json` schema, and the same Companion
 App — only the display/input layer differs.
