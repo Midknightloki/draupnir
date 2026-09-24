@@ -1116,7 +1116,10 @@ Work through §8 of the design doc. Each needs an explicit observation, not an i
 2. Firmware compiles, flash within budget — record the figure.
 3. **Known icons are crisp.** Specifically check `gitPullRequest`, `alignLeft`, `listOrdered`, `braces` — the glyphs M11 predicted would be unreadable. They are the reason this milestone exists.
 4. **An unknown name draws the app's 48×48.** Force this: temporarily remove one name from `macroIcons`, regenerate, reflash — or bind a macro while the app is connected to firmware built before Task 1.
-5. **A profile saved before M12 renders exactly as before** (tier 3). Load one that predates this work.
+5. **A profile saved before M12 still renders, and needs no re-save.** It will render at
+   **tier 1**, not tier 3 — the app has always written `icon`, so the name resolves and the
+   font path wins. That is the desired outcome. To exercise tier 3 you must force it with a
+   macro whose `icon` is absent, unknown to this firmware, or a legacy alias.
 6. **A macro with no icon draws its name** (tier 4).
 7. **The retired M5Dial, unflashed, still loads and renders the same profiles.** This is the additive-only constraint's only real test.
 8. **The app sends no `icon_bmp48` to a device that does not answer `get_glyphs`** — check the debug log for `[glyphs] device has no glyph list`.
