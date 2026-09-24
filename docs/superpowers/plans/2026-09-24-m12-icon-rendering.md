@@ -29,7 +29,7 @@ Every task's requirements implicitly include these.
 
 **Created:**
 - `design/generate_icon_font.py` — the generator. Reads the app's icon map, emits the font and the name table.
-- `tools/fonts/Lucide.ttf` — the font input, vendored beside the existing `Orbitron.ttf` so builds do not depend on a pub cache.
+- `tools/fonts/Lucide.ttf` — the font input, placed beside the existing `Orbitron.ttf`. **Gitignored**, matching the repo's standing policy that TTFs are build inputs and the generated `.c` table is what ships.
 - `firmware/Waveshare_LVGL_Test/lucide_48.c` — generated LVGL font. Never hand-edited.
 - `firmware/Waveshare_LVGL_Test/icon_names.h` — generated sorted name→codepoint table plus set version. Never hand-edited.
 - `companion_app/test/icon_gap_test.dart` — tests for the gap/size logic.
@@ -48,7 +48,7 @@ Every task's requirements implicitly include these.
 
 **Files:**
 - Create: `design/generate_icon_font.py`
-- Create: `tools/fonts/Lucide.ttf` (copied from the pub cache)
+- Create: `tools/fonts/Lucide.ttf` (copied from the pub cache; **gitignored, not committed** — see Step 2)
 - Create: `firmware/Waveshare_LVGL_Test/icon_names.h` (generated)
 - Create: `firmware/Waveshare_LVGL_Test/lucide_48.c` (generated)
 
@@ -75,7 +75,9 @@ cp "$HOME/AppData/Local/Pub/Cache/hosted/pub.dev/lucide_icons_flutter-3.1.15/ass
 ls -l tools/fonts/Lucide.ttf
 ```
 
-This is the family named `Lucide` in the package's `pubspec.yaml` — the one `LucideIcons.<name>` resolves to. Vendoring it matches how `Orbitron.ttf` is already handled and stops the build depending on a pub cache path.
+This is the family named `Lucide` in the package's `pubspec.yaml` — the one `LucideIcons.<name>` resolves to.
+
+**It is deliberately NOT committed.** `.gitignore:44-46` ignores `tools/fonts/` with an explicit policy: *"The generated LVGL .c font tables are what get committed; the source TTF is a build input, not source."* `Orbitron.ttf` has never been tracked either. Anyone regenerating obtains the TTF by re-running this step from their own pub cache; the generated `lucide_48.c` is what the build and the repo actually depend on.
 
 - [ ] **Step 3: Write the generator**
 
@@ -264,7 +266,7 @@ Expected: the count matches Step 4, and the assertions pass. Sort order is load-
 - [ ] **Step 7: Commit**
 
 ```bash
-git add design/generate_icon_font.py tools/fonts/Lucide.ttf \
+git add design/generate_icon_font.py \
         firmware/Waveshare_LVGL_Test/icon_names.h firmware/Waveshare_LVGL_Test/lucide_48.c
 git commit -m "feat(m12): generate the firmware glyph set from the app's icon map"
 ```
