@@ -41,6 +41,20 @@ A 16-key RGB pad (Adafruit NeoTrellis or NeoKey) is an **optional future expansi
 the base device. Earlier versions of this project made it central; field testing showed the knob
 carries the interaction on its own.
 
+### What is actually on the board
+
+Waveshare's product page does not publish a pinout, and the board has more on it than is obvious
+— a second MCU wired to the first over UART, a 4-bit SDMMC card slot, an LRA haptic driver
+sharing the touch I2C bus, a PDM microphone, an I2S DAC and a battery socket. Working that out
+from scratch costs an afternoon.
+
+- [**Hardware reference**](docs/Waveshare_Hardware_Reference.md) — the full GPIO map, transcribed
+  from the manufacturer's schematic, with the parts that are easy to get wrong called out.
+- [Schematic](docs/hardware/waveshare-schematic/) — the five sheets themselves, archived here so
+  the reference can be checked against its source.
+- [Waveshare's wiki page](https://www.waveshare.com/wiki/ESP32-S3-Knob-Touch-LCD-1.8) — upstream,
+  and where the schematic came from. Their copyright; the archived copy is unmodified.
+
 ## Usage
 
 1. **Plug in.** Connect the board to your computer with a data-capable USB-C cable. It enumerates
@@ -88,6 +102,8 @@ The Flutter Companion App is in `companion_app/`.
 ## Documentation
 
 - [**Full spec**](docs/Draupnir_Spec.md) — concept, hardware, data model, BLE protocol, milestones.
+- [**Hardware reference**](docs/Waveshare_Hardware_Reference.md) — GPIO map transcribed from the
+  schematic. Read before wiring anything or guessing what a pin does.
 - [P1 Polish Spec](docs/P1_Polish_Spec.md) — open UI/UX findings from field testing.
 - [BLE Profile Fetch Debugging](docs/BLE_Profile_Fetch_Debugging.md) — the chunked-transport war story.
 
