@@ -34,6 +34,11 @@ class DraupnirState extends ChangeNotifier {
   // fix it; the app's job is to say which gesture to make.
   bool needsConfigMode = false;
 
+  // Set when a save failed for a reason the user can simply retry. Unlike [needsPairing] and
+  // [needsConfigMode] this is an event, not a state: the caller shows it in place and it is
+  // cleared on the next save attempt. See [saveProfiles].
+  String? lastSaveFailure;
+
   // True once connected over BLE. BLE is now the only transport (the Wi-Fi/HTTP client half of
   // the cut web UI is gone), so this doubles as "connected".
   bool isBluetooth = false;
@@ -267,16 +272,40 @@ class DraupnirState extends ChangeNotifier {
       }
 
       if (Platform.isAndroid) {
-        Map<Permission, PermissionStatus> statuses = await [
+        // Two eras of Android BLE permissions, and the app supports both.
+        //
+        // API 31+: BLUETOOTH_SCAN and BLUETOOTH_CONNECT. Location is NOT required and must not
+        // be demanded -- the manifest declares BLUETOOTH_SCAN with neverForLocation and bounds
+        // ACCESS_FINE_LOCATION to maxSdkVersion=30 precisely so this app never asks for
+        // location on a modern phone.
+        //
+        // API 30 and below: BLUETOOTH/BLUETOOTH_ADMIN are install-time, and a BLE scan returns
+        // nothing without ACCESS_FINE_LOCATION granted at runtime.
+        //
+        // So the gate accepts EITHER set, and requiring both is a bug: this check used to AND
+        // location into the condition, which made it unsatisfiable on API 31+. ACCESS_FINE_
+        // LOCATION is not in the merged manifest there, so permission_handler can only ever
+        // report it denied, and every connection attempt failed with "Permissions denied" while
+        // both Bluetooth permissions sat granted. It hid for a while because Android remembers
+        // a grant from a build whose manifest did declare location; a clean install is what
+        // surfaces it.
+        final statuses = await [
           Permission.bluetoothScan,
           Permission.bluetoothConnect,
           Permission.location,
         ].request();
 
-        if (statuses[Permission.bluetoothScan]?.isDenied == true ||
-            statuses[Permission.bluetoothConnect]?.isDenied == true ||
-            statuses[Permission.location]?.isDenied == true) {
-          throw Exception('Permissions denied. Enable Bluetooth and Location in Settings.');
+        final modern = statuses[Permission.bluetoothScan]?.isGranted == true &&
+            statuses[Permission.bluetoothConnect]?.isGranted == true;
+        final legacy = statuses[Permission.location]?.isGranted == true;
+
+        if (!modern && !legacy) {
+          _log('[ERR] permissions: scan=${statuses[Permission.bluetoothScan]} '
+              'connect=${statuses[Permission.bluetoothConnect]} '
+              'location=${statuses[Permission.location]}');
+          throw Exception(
+              'Draupnir needs permission to find nearby Bluetooth devices. '
+              'Grant it in Settings > Apps > Draupnir Forge > Permissions.');
         }
       }
 
@@ -426,7 +455,7 @@ class DraupnirState extends ChangeNotifier {
 
     } catch (e) {
       _log('[ERR] connectBluetooth: $e');
-      error = 'Bluetooth connection failed: $e';
+      error = "Couldn't connect to the Draupnir. Check it's powered on and in range.";
       isBluetooth = false;
       if (connectedDevice != null) {
         try {
@@ -497,7 +526,8 @@ class DraupnirState extends ChangeNotifier {
         needsConfigMode = true;
         error = configModeRequiredMessage;
       } else {
-        error = 'Failed to load profiles: ${response['message']}';
+        _log('[ERR] get_profiles refused: ${response['message']}');
+        error = 'The device refused the request.';
       }
     } catch (e) {
       // A write/subscribe rejected for insufficient authentication surfaces here as a platform
@@ -507,7 +537,8 @@ class DraupnirState extends ChangeNotifier {
         needsPairing = true;
         error = pairingRequiredMessage;
       } else {
-        error = 'Bluetooth request failed: $e';
+        _log('[ERR] get_profiles failed: $e');
+        error = "Couldn't reach the device. Check it's powered on and in range.";
       }
     }
 
@@ -538,14 +569,16 @@ class DraupnirState extends ChangeNotifier {
         needsConfigMode = true;
         error = configModeRequiredMessage;
       } else {
-        error = 'Failed to read profiles for export: ${response['message']}';
+        _log('[ERR] export read refused: ${response['message']}');
+        error = 'The device refused the request.';
       }
     } catch (e) {
       if (_looksLikeAuthFailure(e)) {
         needsPairing = true;
         error = pairingRequiredMessage;
       } else {
-        error = 'Bluetooth request failed: $e';
+        _log('[ERR] export read failed: $e');
+        error = "Couldn't reach the device. Check it's powered on and in range.";
       }
     }
 
@@ -646,36 +679,64 @@ class DraupnirState extends ChangeNotifier {
         s.contains('bond');
   }
 
-  Future<void> saveProfiles() async {
-    if (profilesData == null) return;
+  /// Writes the current document to the device. Returns true if the device accepted it.
+  ///
+  /// Two kinds of failure, deliberately reported differently.
+  ///
+  /// Pairing and Config Mode are STATES: nothing can be saved until the user does something
+  /// away from this screen, so they raise [needsPairing] / [needsConfigMode] and the dashboard
+  /// hands over to a screen that says which gesture to make.
+  ///
+  /// Everything else is an EVENT -- a dropped write, a timeout, a device-side refusal. The deck
+  /// is still valid, the document is still in memory, and retrying is one tap. Those return
+  /// false with [lastSaveFailure] set, and the caller reports them in place. They deliberately
+  /// do NOT set [error]: the dashboard renders `error != null` as a full-screen takeover, so
+  /// routing a transient write failure through it used to wipe the deck off the screen and
+  /// leave the user staring at a reconnect button with a perfectly healthy link.
+  Future<bool> saveProfiles() async {
+    if (profilesData == null) return false;
 
+    // Clear stale state on entry, the way fetchProfiles() does. Without this a single failed
+    // save left `error` set forever: nothing on the save path ever cleared it, so every LATER
+    // save -- including successful ones -- still rendered the error screen, and the only way
+    // out was a refresh or a reconnect.
     isLoading = true;
+    error = null;
+    needsPairing = false;
+    needsConfigMode = false;
+    lastSaveFailure = null;
     notifyListeners();
 
+    bool saved = false;
     try {
       final response = await _sendBleRequest({
         'cmd': 'save_profiles',
         'profiles': profilesData,
       });
-      if (response['status'] != 'ok') {
-        if (_looksLikeConfigModeRefusal(response['message'])) {
-          needsConfigMode = true;
-          error = configModeRequiredMessage;
-        } else {
-          error = 'Failed to save profiles: ${response['message']}';
-        }
+      if (response['status'] == 'ok') {
+        saved = true;
+      } else if (_looksLikeConfigModeRefusal(response['message'])) {
+        needsConfigMode = true;
+        error = configModeRequiredMessage;
+      } else {
+        _log('[ERR] save_profiles refused: ${response['message']}');
+        lastSaveFailure = 'The device refused the save.';
       }
     } catch (e) {
       if (_looksLikeAuthFailure(e)) {
         needsPairing = true;
         error = pairingRequiredMessage;
       } else {
-        error = 'Failed to save profiles: $e';
+        // The raw exception is a PlatformException dump. It belongs in the debug log, which
+        // already exists and is already copyable, not in front of the user.
+        _log('[ERR] save_profiles failed: $e');
+        lastSaveFailure = "Couldn't reach the device. Check it's powered on and in range.";
       }
     }
 
     isLoading = false;
     notifyListeners();
+    return saved;
   }
 
   Future<void> triggerMacro(int macroIdx) async {
@@ -739,21 +800,23 @@ class DraupnirState extends ChangeNotifier {
     return -1;
   }
 
-  Future<void> deleteMacro(int pos) async {
-    if (profilesData == null) return;
+  Future<bool> deleteMacro(int pos) async {
+    if (profilesData == null) return false;
     List profiles = profilesData!['profiles'] as List;
-    if (activeProfileIdx >= profiles.length) return;
+    if (activeProfileIdx >= profiles.length) return false;
 
     List macros = profiles[activeProfileIdx]['macros'] ?? [];
     macros.removeWhere((m) => m['pos'] == pos);
     profiles[activeProfileIdx]['macros'] = macros;
-    await saveProfiles();
+    return await saveProfiles();
   }
 
-  Future<void> updateMacro(int pos, Map<String, dynamic> macroData) async {
-    if (profilesData == null) return;
+  /// Writes one macro into the document and pushes it. Returns the device's verdict, so the
+  /// caller can confirm the save rather than assume it.
+  Future<bool> updateMacro(int pos, Map<String, dynamic> macroData) async {
+    if (profilesData == null) return false;
     List profiles = profilesData!['profiles'] as List;
-    if (activeProfileIdx >= profiles.length) return;
+    if (activeProfileIdx >= profiles.length) return false;
     
     List macros = profiles[activeProfileIdx]['macros'] ?? [];
     
@@ -768,6 +831,6 @@ class DraupnirState extends ChangeNotifier {
     }
     
     profiles[activeProfileIdx]['macros'] = macros;
-    await saveProfiles();
+    return await saveProfiles();
   }
 }

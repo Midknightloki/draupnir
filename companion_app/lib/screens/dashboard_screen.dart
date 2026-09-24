@@ -12,6 +12,7 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import '../state/draupnir_state.dart';
 import '../services/profile_transfer.dart';
 import '../theme.dart';
+import '../widgets/palette_picker.dart';
 import 'editor_panel.dart';
 
 class DashboardScreen extends StatefulWidget {
@@ -66,6 +67,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
       ),
     );
   }
+
+  /// Whether the macro editor panel is currently on screen. Single source of truth for the two
+  /// places that care: the panel's own visibility, and hiding the FAB so it cannot land on the
+  /// panel's SAVE TO DEVICE button. Duplicating the condition is how those two drift apart.
+  bool _isEditorPanelOpen(DraupnirState state) =>
+      state.isEditorMode && _editingKeyIdx != null;
 
   Future<void> _exportConfig(DraupnirState state) async {
     final doc = await state.fetchProfilesForExport();
@@ -358,7 +365,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
           const SizedBox(width: 8),
         ],
       ),
-      floatingActionButton: state.profilesData != null
+      // Hidden while the macro editor is open: the FAB floats over the body, and it was landing
+      // directly on top of the editor's SAVE TO DEVICE button. Padding the panel would leave a
+      // dead gap whenever the panel is closed, so the button that does not belong on this screen
+      // is the one that goes.
+      //
+      // Mid-edit, the mode toggle is not what you want -- saving is -- and leaving it reachable
+      // invites toggling out of editor mode with unsaved changes on screen.
+      floatingActionButton: state.profilesData != null && !_isEditorPanelOpen(state)
           ? FloatingActionButton.extended(
               onPressed: () => state.toggleEditorMode(),
               backgroundColor: state.isEditorMode ? AppTheme.surfaceHighlight : AppTheme.accent,
@@ -501,7 +515,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               child: Row(
                 children: [
                   Expanded(child: _buildVirtualDeck(state)),
-                  if (state.isEditorMode && _editingKeyIdx != null)
+                  if (_isEditorPanelOpen(state))
                     EditorPanel(
                       position: _editingKeyIdx!,
                       onClose: () => setState(() => _editingKeyIdx = null),
@@ -623,29 +637,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     decoration: const InputDecoration(labelText: 'Profile Name'),
                   ),
                   const SizedBox(height: 16),
-                  const Text('Profile Color', style: TextStyle(fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 8),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: AppTheme.cyberpunkPalette.map((color) {
-                      final isSelected = currentColor == color;
-                      return InkWell(
-                        onTap: () => setDialogState(() => currentColor = color),
-                        child: Container(
-                          width: 32,
-                          height: 32,
-                          decoration: BoxDecoration(
-                            color: color,
-                            shape: BoxShape.circle,
-                            border: Border.all(
-                              color: isSelected ? Colors.white : Colors.transparent,
-                              width: 3,
-                            ),
-                          ),
-                        ),
-                      );
-                    }).toList(),
+                  PalettePicker(
+                    label: 'Profile Color',
+                    selected: currentColor,
+                    onChanged: (c) => setDialogState(() => currentColor = c),
                   ),
                 ],
               ),
@@ -886,23 +881,36 @@ class _DashboardScreenState extends State<DashboardScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          // The profile name is user-supplied and unbounded, at 24pt. Unconstrained it pushed the
+          // edit pencil and the editor hint off the right edge -- "Select key to edit" rendered
+          // as "Select key to" with the rest clipped by the screen.
+          //
+          // Expanded + ellipsis makes the name yield instead of the controls: whatever the name's
+          // length, the pencil stays reachable and the hint stays whole. The hint keeps its
+          // intrinsic width because it is the fixed-size element; the variable-length one is what
+          // should give.
           Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.center,
-                children: [
-                  Text(
-                    profileName,
-                    style: GoogleFonts.orbitron(fontSize: 24, fontWeight: FontWeight.bold, color: profileColor),
-                  ),
-                  if (state.profilesData != null)
-                    IconButton(
-                      icon: const Icon(Icons.edit, color: Colors.grey, size: 20),
-                      tooltip: 'Edit current profile',
-                      onPressed: () => _showEditProfileDialog(state),
+              Expanded(
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    Flexible(
+                      child: Text(
+                        profileName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: GoogleFonts.orbitron(fontSize: 24, fontWeight: FontWeight.bold, color: profileColor),
+                      ),
                     ),
-                ],
+                    if (state.profilesData != null)
+                      IconButton(
+                        icon: const Icon(Icons.edit, color: Colors.grey, size: 20),
+                        tooltip: 'Edit current profile',
+                        onPressed: () => _showEditProfileDialog(state),
+                      ),
+                  ],
+                ),
               ),
               if (state.isEditorMode)
                 Text(
@@ -944,16 +952,22 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       onTap: () async {
                         final pos = state.lowestFreePos;
                         if (pos < 0) return;
-                        await state.updateMacro(pos, {
+                        final created = await state.updateMacro(pos, {
                           'name': 'New Macro',
                           'color': '#30C060',
                           'mode': 'play_once',
                           'actions': [],
                         });
-                        // Drop straight into the editor for the macro just created -- an empty
-                        // macro the user has to go find and open is not a useful outcome.
-                        if (context.mounted) {
+                        if (!context.mounted) return;
+                        // Only open the editor on a macro the device actually has. Opening one
+                        // the save never created would edit a macro that exists on this screen
+                        // and nowhere else.
+                        if (created) {
+                          // Drop straight into the editor for the macro just created -- an empty
+                          // macro the user has to go find and open is not a useful outcome.
                           setState(() => _editingKeyIdx = pos);
+                        } else {
+                          _reportSaveFailure(state, "Couldn't add the macro.");
                         }
                       },
                       child: const Center(
@@ -1046,6 +1060,20 @@ class _DashboardScreenState extends State<DashboardScreen> {
     // Close the editor if it was open on the macro just deleted, or it would sit there editing
     // something that no longer exists.
     if (_editingKeyIdx == pos) setState(() => _editingKeyIdx = null);
-    await state.deleteMacro(pos);
+    final deleted = await state.deleteMacro(pos);
+    if (!mounted || deleted) return;
+    _reportSaveFailure(state, "Couldn't delete the macro.");
+  }
+
+  /// Reports a retryable write failure in place, leaving the deck on screen.
+  ///
+  /// Pairing and Config Mode are deliberately excluded: those raise their own full-screen
+  /// guidance from the state layer, and a snackbar on top of it would just repeat it.
+  void _reportSaveFailure(DraupnirState state, String fallback) {
+    if (state.needsPairing || state.needsConfigMode) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(state.lastSaveFailure ?? fallback),
+      duration: const Duration(seconds: 6),
+    ));
   }
 }

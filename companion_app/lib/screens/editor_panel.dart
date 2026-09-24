@@ -7,7 +7,8 @@ import 'dart:convert';
 
 import '../state/draupnir_state.dart';
 import '../theme.dart';
-import '../utils/feather_icons_map.dart';
+import '../utils/macro_icons.dart';
+import '../widgets/palette_picker.dart';
 import '../utils/icon_generator.dart';
 
 class EditorPanel extends StatefulWidget {
@@ -88,17 +89,31 @@ class _EditorPanelState extends State<EditorPanel> {
     _actions = List.from(macro['actions'] ?? []).map((e) => Map<String,dynamic>.from(e)).toList();
   }
 
+  // True while the write to the device is in flight, so the button can show progress and
+  // refuse a second tap.
+  bool _isSaving = false;
+
   Future<void> _saveMacro() async {
+    if (_isSaving) return;
     final state = context.read<DraupnirState>();
+    final messenger = ScaffoldMessenger.of(context);
     final colorHex = _selectedColor.value.toRadixString(16).padLeft(8, '0').substring(2).toUpperCase();
-    
+
     // Generate XBM string if it's a feather icon
     String iconXbm = "";
-    if (featherIconsMap.containsKey(_selectedIcon)) {
-      iconXbm = await generateXbmHexForIcon(featherIconsMap[_selectedIcon]!);
+    final glyph = resolveIcon(_selectedIcon);
+    if (glyph != null) {
+      iconXbm = await generateXbmHexForIcon(glyph);
     }
 
-    state.updateMacro(widget.position, {
+    setState(() => _isSaving = true);
+
+    // Awaited, and the panel closes only on success. This used to be fire-and-forget: the call
+    // was not awaited and onClose() ran immediately, so the panel was gone before the write
+    // finished. A save that failed reported itself on a screen the user had already left, and a
+    // save that succeeded looked identical to one that never happened -- which is why a
+    // transferred profile appeared to need an edit-and-resave before its icon showed up.
+    final saved = await state.updateMacro(widget.position, {
       'name': _nameController.text,
       'color': colorHex,
       'mode': _mode,
@@ -106,8 +121,31 @@ class _EditorPanelState extends State<EditorPanel> {
       'icon_xbm': iconXbm,
       'actions': _actions,
     });
-    
-    widget.onClose();
+
+    if (!mounted) return;
+    setState(() => _isSaving = false);
+
+    if (saved) {
+      messenger.showSnackBar(const SnackBar(
+        content: Text('Saved to device.'),
+        duration: Duration(seconds: 2),
+      ));
+      widget.onClose();
+      return;
+    }
+
+    // Pairing and Config Mode take over the dashboard with their own guidance, so closing is
+    // right for those -- the user needs to see it. A retryable failure keeps the panel open so
+    // the edit is still there to retry.
+    if (state.needsPairing || state.needsConfigMode) {
+      widget.onClose();
+      return;
+    }
+    messenger.showSnackBar(SnackBar(
+      content: Text(state.lastSaveFailure ?? "Couldn't save to the device."),
+      action: SnackBarAction(label: 'RETRY', onPressed: _saveMacro),
+      duration: const Duration(seconds: 6),
+    ));
   }
 
   Future<void> _importSynapseXML() async {
@@ -266,11 +304,12 @@ class _EditorPanelState extends State<EditorPanel> {
   }
 
   Widget _buildIconSection() {
-    IconData currentIcon = Icons.help_outline;
-    if (_selectedIcon == 'hammer') currentIcon = Icons.build;
-    else if (_selectedIcon == 'text') currentIcon = Icons.text_fields;
-    else if (_selectedIcon == 'mic') currentIcon = Icons.mic;
-    else if (featherIconsMap.containsKey(_selectedIcon)) currentIcon = featherIconsMap[_selectedIcon]!;
+    // Same resolution the save path uses, so the preview cannot disagree with what the device
+    // is sent. A null glyph is the NO-ICON state, not an error: the firmware falls through to
+    // drawing the macro's name on the wedge when icon_xbm is empty, which is often what you
+    // want -- "Mute Mic" is clearer than any 18px glyph of a crossed-out microphone.
+    final IconData? currentIcon = resolveIcon(_selectedIcon);
+    final hasIcon = currentIcon != null;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -280,23 +319,71 @@ class _EditorPanelState extends State<EditorPanel> {
         Row(
           children: [
             Container(
-              padding: const EdgeInsets.all(12),
+              width: 58,
+              height: 58,
+              alignment: Alignment.center,
               decoration: BoxDecoration(
                 color: AppTheme.accent.withOpacity(0.2),
                 border: Border.all(color: AppTheme.accent),
                 borderRadius: BorderRadius.circular(8),
               ),
-              child: Icon(currentIcon, color: AppTheme.accent, size: 32),
+              // With no icon the tile previews what the wedge will actually show -- the name,
+              // not a question mark. A placeholder glyph here would misrepresent the device.
+              child: hasIcon
+                  ? Icon(currentIcon, color: AppTheme.accent, size: 32)
+                  : Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                      child: Text(
+                        _nameController.text.isEmpty ? 'Name' : _nameController.text,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                            color: AppTheme.accent, fontSize: 10, fontWeight: FontWeight.bold),
+                      ),
+                    ),
             ),
             const SizedBox(width: 16),
             ElevatedButton.icon(
               icon: const Icon(Icons.search),
-              label: const Text('Select Icon'),
+              label: Text(hasIcon ? 'Change Icon' : 'Select Icon'),
               onPressed: () => _showIconPickerModal(),
             ),
+            // Only offered when there is something to clear, so the control does not sit there
+            // implying the macro has an icon when it does not.
+            if (hasIcon)
+              TextButton(
+                onPressed: () => setState(() => _selectedIcon = ''),
+                child: const Text('Use name'),
+              ),
           ],
         ),
       ],
+    );
+  }
+
+  /// One selectable glyph in the picker. Factored out because the grid is now built per
+  /// category rather than from a single flat index, so the cell is rendered from several
+  /// places and must look identical in all of them.
+  Widget _buildIconCell(BuildContext dialogCtx, String iconName) {
+    final selected = _selectedIcon == iconName;
+    return InkWell(
+      onTap: () {
+        setState(() => _selectedIcon = iconName);
+        Navigator.pop(dialogCtx);
+      },
+      borderRadius: BorderRadius.circular(8),
+      child: Tooltip(
+        message: iconName,
+        child: Container(
+          decoration: BoxDecoration(
+            color: selected ? AppTheme.accent.withOpacity(0.3) : AppTheme.surface,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: selected ? AppTheme.accent : Colors.transparent),
+          ),
+          child: Icon(macroIcons[iconName], color: Colors.white),
+        ),
+      ),
     );
   }
 
@@ -307,7 +394,22 @@ class _EditorPanelState extends State<EditorPanel> {
         String searchQuery = "";
         return StatefulBuilder(
           builder: (context, setModalState) {
-            final filteredKeys = featherIconsMap.keys.where((k) => k.toLowerCase().contains(searchQuery.toLowerCase())).toList();
+            final query = searchQuery.trim().toLowerCase();
+
+            // Searching flattens the categories: when you are hunting for a specific glyph the
+            // headings are noise, and a match in "Other" should surface as readily as one in
+            // Media. With no query the sections are the point -- a macro vocabulary browsed by
+            // what you are binding, rather than 190 icons in one alphabetical wall.
+            final List<MapEntry<String, List<String>>> sections = query.isEmpty
+                ? iconCategories
+                : [
+                    MapEntry(
+                      'Results',
+                      macroIcons.keys.where((k) => k.toLowerCase().contains(query)).toList(),
+                    )
+                  ];
+            final bool noResults = sections.every((s) => s.value.isEmpty);
+
             return AlertDialog(
               title: const Text('Select Icon'),
               backgroundColor: AppTheme.surfaceHighlight,
@@ -326,42 +428,89 @@ class _EditorPanelState extends State<EditorPanel> {
                     ),
                     const SizedBox(height: 16),
                     Expanded(
-                      child: GridView.builder(
-                        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                          crossAxisCount: 5,
-                          crossAxisSpacing: 8,
-                          mainAxisSpacing: 8,
-                        ),
-                        itemCount: filteredKeys.length + 3, // +3 for defaults
-                        itemBuilder: (context, idx) {
-                          String iconName;
-                          IconData iconData;
-                          if (idx == 0 && "hammer".contains(searchQuery.toLowerCase())) { iconName = 'hammer'; iconData = Icons.build; }
-                          else if (idx == 1 && "text".contains(searchQuery.toLowerCase())) { iconName = 'text'; iconData = Icons.text_fields; }
-                          else if (idx == 2 && "mic".contains(searchQuery.toLowerCase())) { iconName = 'mic'; iconData = Icons.mic; }
-                          else {
-                            int mapIdx = idx - 3;
-                            if (mapIdx < 0 || mapIdx >= filteredKeys.length) return const SizedBox.shrink();
-                            iconName = filteredKeys[mapIdx];
-                            iconData = featherIconsMap[iconName]!;
-                          }
-
-                          return InkWell(
-                            onTap: () {
-                              setState(() => _selectedIcon = iconName);
-                              Navigator.pop(ctx);
-                            },
-                            child: Container(
-                              decoration: BoxDecoration(
-                                color: _selectedIcon == iconName ? AppTheme.accent.withOpacity(0.3) : AppTheme.surface,
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(color: _selectedIcon == iconName ? AppTheme.accent : Colors.transparent),
+                      child: noResults
+                          ? Center(
+                              child: Text(
+                                'No icon matches "${searchQuery.trim()}".',
+                                style: const TextStyle(color: Colors.grey),
+                                textAlign: TextAlign.center,
                               ),
-                              child: Icon(iconData, color: Colors.white),
+                            )
+                          : ListView(
+                              children: [
+                                // The no-icon escape hatch, first and full width rather than a
+                                // cell in the grid: it is not one more glyph to choose between,
+                                // it is the choice not to use one. Before this there was no way
+                                // back to a text label once an icon had been set -- the editor
+                                // could change which icon, never whether.
+                                if (query.isEmpty)
+                                  Padding(
+                                    padding: const EdgeInsets.only(bottom: 12),
+                                    child: InkWell(
+                                      onTap: () {
+                                        setState(() => _selectedIcon = '');
+                                        Navigator.pop(ctx);
+                                      },
+                                      borderRadius: BorderRadius.circular(8),
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(
+                                            horizontal: 12, vertical: 10),
+                                        decoration: BoxDecoration(
+                                          color: _selectedIcon.isEmpty
+                                              ? AppTheme.accent.withOpacity(0.3)
+                                              : AppTheme.surface,
+                                          borderRadius: BorderRadius.circular(8),
+                                          border: Border.all(
+                                            color: _selectedIcon.isEmpty
+                                                ? AppTheme.accent
+                                                : Colors.transparent,
+                                          ),
+                                        ),
+                                        child: const Row(
+                                          children: [
+                                            Icon(Icons.text_fields,
+                                                color: Colors.white, size: 20),
+                                            SizedBox(width: 10),
+                                            Expanded(
+                                              child: Text(
+                                                'No icon — show the macro name',
+                                                style: TextStyle(fontSize: 13),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                for (final section in sections)
+                                  if (section.value.isNotEmpty) ...[
+                                    Padding(
+                                      padding: const EdgeInsets.only(top: 4, bottom: 8),
+                                      child: Text(
+                                        section.key.toUpperCase(),
+                                        style: const TextStyle(
+                                          fontSize: 11,
+                                          letterSpacing: 1.2,
+                                          fontWeight: FontWeight.bold,
+                                          color: Colors.grey,
+                                        ),
+                                      ),
+                                    ),
+                                    GridView.count(
+                                      crossAxisCount: 5,
+                                      crossAxisSpacing: 8,
+                                      mainAxisSpacing: 8,
+                                      shrinkWrap: true,
+                                      physics: const NeverScrollableScrollPhysics(),
+                                      children: [
+                                        for (final iconName in section.value)
+                                          _buildIconCell(ctx, iconName),
+                                      ],
+                                    ),
+                                    const SizedBox(height: 12),
+                                  ],
+                              ],
                             ),
-                          );
-                        },
-                      ),
                     ),
                   ],
                 ),
@@ -377,34 +526,10 @@ class _EditorPanelState extends State<EditorPanel> {
   }
 
   Widget _buildColorSection() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Text('Key Color', style: TextStyle(fontWeight: FontWeight.bold)),
-        const SizedBox(height: 8),
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: AppTheme.cyberpunkPalette.map((color) {
-            final isSelected = _selectedColor == color;
-            return InkWell(
-              onTap: () => setState(() => _selectedColor = color),
-              child: Container(
-                width: 32,
-                height: 32,
-                decoration: BoxDecoration(
-                  color: color,
-                  shape: BoxShape.circle,
-                  border: Border.all(
-                    color: isSelected ? Colors.white : Colors.transparent,
-                    width: 3,
-                  ),
-                ),
-              ),
-            );
-          }).toList(),
-        ),
-      ],
+    return PalettePicker(
+      label: 'Key Color',
+      selected: _selectedColor,
+      onChanged: (c) => setState(() => _selectedColor = c),
     );
   }
 
@@ -731,8 +856,14 @@ class _EditorPanelState extends State<EditorPanel> {
         mainAxisAlignment: MainAxisAlignment.end,
         children: [
           ElevatedButton(
-            onPressed: _saveMacro,
-            child: const Text('SAVE TO DEVICE'),
+            onPressed: _isSaving ? null : _saveMacro,
+            child: _isSaving
+                ? const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Text('SAVE TO DEVICE'),
           ),
         ],
       ),
