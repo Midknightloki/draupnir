@@ -305,8 +305,11 @@ class _EditorPanelState extends State<EditorPanel> {
 
   Widget _buildIconSection() {
     // Same resolution the save path uses, so the preview cannot disagree with what the device
-    // is sent.
-    final IconData currentIcon = resolveIcon(_selectedIcon) ?? Icons.help_outline;
+    // is sent. A null glyph is the NO-ICON state, not an error: the firmware falls through to
+    // drawing the macro's name on the wedge when icon_xbm is empty, which is often what you
+    // want -- "Mute Mic" is clearer than any 18px glyph of a crossed-out microphone.
+    final IconData? currentIcon = resolveIcon(_selectedIcon);
+    final hasIcon = currentIcon != null;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -316,20 +319,43 @@ class _EditorPanelState extends State<EditorPanel> {
         Row(
           children: [
             Container(
-              padding: const EdgeInsets.all(12),
+              width: 58,
+              height: 58,
+              alignment: Alignment.center,
               decoration: BoxDecoration(
                 color: AppTheme.accent.withOpacity(0.2),
                 border: Border.all(color: AppTheme.accent),
                 borderRadius: BorderRadius.circular(8),
               ),
-              child: Icon(currentIcon, color: AppTheme.accent, size: 32),
+              // With no icon the tile previews what the wedge will actually show -- the name,
+              // not a question mark. A placeholder glyph here would misrepresent the device.
+              child: hasIcon
+                  ? Icon(currentIcon, color: AppTheme.accent, size: 32)
+                  : Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 4),
+                      child: Text(
+                        _nameController.text.isEmpty ? 'Name' : _nameController.text,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                            color: AppTheme.accent, fontSize: 10, fontWeight: FontWeight.bold),
+                      ),
+                    ),
             ),
             const SizedBox(width: 16),
             ElevatedButton.icon(
               icon: const Icon(Icons.search),
-              label: const Text('Select Icon'),
+              label: Text(hasIcon ? 'Change Icon' : 'Select Icon'),
               onPressed: () => _showIconPickerModal(),
             ),
+            // Only offered when there is something to clear, so the control does not sit there
+            // implying the macro has an icon when it does not.
+            if (hasIcon)
+              TextButton(
+                onPressed: () => setState(() => _selectedIcon = ''),
+                child: const Text('Use name'),
+              ),
           ],
         ),
       ],
@@ -412,6 +438,50 @@ class _EditorPanelState extends State<EditorPanel> {
                             )
                           : ListView(
                               children: [
+                                // The no-icon escape hatch, first and full width rather than a
+                                // cell in the grid: it is not one more glyph to choose between,
+                                // it is the choice not to use one. Before this there was no way
+                                // back to a text label once an icon had been set -- the editor
+                                // could change which icon, never whether.
+                                if (query.isEmpty)
+                                  Padding(
+                                    padding: const EdgeInsets.only(bottom: 12),
+                                    child: InkWell(
+                                      onTap: () {
+                                        setState(() => _selectedIcon = '');
+                                        Navigator.pop(ctx);
+                                      },
+                                      borderRadius: BorderRadius.circular(8),
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(
+                                            horizontal: 12, vertical: 10),
+                                        decoration: BoxDecoration(
+                                          color: _selectedIcon.isEmpty
+                                              ? AppTheme.accent.withOpacity(0.3)
+                                              : AppTheme.surface,
+                                          borderRadius: BorderRadius.circular(8),
+                                          border: Border.all(
+                                            color: _selectedIcon.isEmpty
+                                                ? AppTheme.accent
+                                                : Colors.transparent,
+                                          ),
+                                        ),
+                                        child: const Row(
+                                          children: [
+                                            Icon(Icons.text_fields,
+                                                color: Colors.white, size: 20),
+                                            SizedBox(width: 10),
+                                            Expanded(
+                                              child: Text(
+                                                'No icon — show the macro name',
+                                                style: TextStyle(fontSize: 13),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  ),
                                 for (final section in sections)
                                   if (section.value.isNotEmpty) ...[
                                     Padding(
