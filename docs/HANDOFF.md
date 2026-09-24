@@ -435,6 +435,36 @@ here.
 
 ---
 
+### Verified on hardware during M12 — Waveshare, 2026-09-24
+
+Flashed `feat/m12-icon-rendering` to the Waveshare (COM10) at 1,177,270 bytes / 35%, and
+installed the matching release APK.
+
+- **Icons are legible at ring size.** The glyphs M11 predicted would fail at 18x18 --
+  `gitPullRequest`, `alignLeft`, `listOrdered`, `braces` -- now render as 46px antialiased font
+  glyphs. This was the entire point of the milestone.
+- **Existing profiles were crisp with no re-save**, confirming tier 1 wins for any macro whose
+  `icon` name the firmware knows. (Design criterion 5 originally said these would render at tier
+  3; that was wrong and was corrected before testing -- the app has always written `icon`, so
+  the font path claims them.)
+- **No blank wedges.** A wedge rendering nothing is the one failure the four-tier chain cannot
+  recover from, and the generator's cmap cross-check exists to prevent it.
+- App and device both behaved correctly in ordinary use.
+
+**Still open on the hardware gate:**
+
+- **Design criterion 7 -- the retired M5Dial, unflashed, still loading the same profiles.** This
+  is the only real test of the additive-only rule: a board that will never be updated reading a
+  document that now contains `icon_bmp48` keys it has never heard of. Not yet confirmed.
+- **Tier 2 (the app-supplied 48x48) has never been exercised on glass.** Reaching it requires an
+  `icon` name the firmware lacks, which now means deliberately adding one to the app's map. The
+  stride algebra agrees in all three places and the length is pinned by tests, but only the
+  panel proves the ALPHA_1BIT draw at w=48.
+- **An oversized import fails correctly but silently** -- nothing on the import path renders
+  `lastSaveFailure`. Surfacing it is new UI and was deliberately left out of the fix round.
+- **No scoped re-review ran on the final fix round** (account rate limit). Each fix was verified
+  in place by the controller instead, which is weaker than a fresh reviewer.
+
 ## 5. Hardware — read before plugging anything in
 
 The board is a **Waveshare ESP32-S3 knob**: ESP32-S3 rev v0.2, 16 MB quad flash, 8 MB PSRAM
