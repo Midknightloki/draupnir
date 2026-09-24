@@ -351,9 +351,14 @@ static int icon_utf8(uint32_t cp, char *out) {
 }
 ```
 
-- [ ] **Step 4: Add the tier-1 branch**
+- [ ] **Step 4: Restructure the wedge icon block into a four-tier chain**
 
-In `ring_draw_event_cb()`, find the wedge icon block. It currently begins:
+This step rewrites the block rather than inserting into it, because the tiers cannot be chained
+any other way: `else` must be followed by a single statement or block, and the existing code
+declares variables (`uint8_t iconbits[54]`, the `const char *` lookups) between what would be the
+branches. **Hoist every declaration above the chain, then chain cleanly.**
+
+Find the block in `ring_draw_event_cb()` that currently begins:
 
 ```c
       uint8_t iconbits[54];
@@ -361,18 +366,33 @@ In `ring_draw_event_cb()`, find the wedge icon block. It currently begins:
       if (wedge_icon_decode(ixbm, iconbits)) {
 ```
 
-Insert a tier-1 branch immediately **before** that, so the font path is tried first:
+Replace those three lines with the declarations and the tier-1 branch below. **Leave the body of
+the existing `wedge_icon_decode` branch and its trailing `else` (the text-label path) exactly as
+they are** — they become tiers 3 and 4 unchanged.
 
 ```c
-      // TIER 1 -- a glyph this firmware has, drawn at its native 48px with no scaling.
+      // FOUR-TIER ICON CHAIN. Declarations first: the tiers are an if/else-if chain, and C++ has
+      // nowhere to put a declaration between branches.
       //
-      // The label is drawn twice: a one-pixel offset shadow in the contrast colour's opposite,
-      // then the glyph. Same two-pass treatment the bitmap path uses, and for the same reason --
-      // picking black-or-white by luminance alone tops out near 4.6:1 on a mid-tone wedge, so
-      // the shadow is what guarantees a hard edge on ANY user-chosen colour.
-      const char *iname = macro.isNull() ? nullptr : (const char *)(macro["icon"] | (const char *)nullptr);
+      //   1  a glyph this firmware has           -> crisp, antialiased, no payload
+      //   2  an app-supplied 48x48               -> a name added after this firmware shipped
+      //   3  the 18x18 icon_xbm, upscaled        -> unchanged; what older profiles carry
+      //   4  the macro's name as text            -> unchanged
+      //
+      // Order is load-bearing and invisible to the compiler: get it wrong and icons render
+      // blocky, which looks exactly like the bug this milestone fixes.
+      uint8_t iconbits[54];
+      const char *iname = macro.isNull() ? nullptr : (const char *)(macro["icon"]       | (const char *)nullptr);
+      const char *ixbm  = macro.isNull() ? nullptr : (const char *)(macro["icon_xbm"]   | (const char *)nullptr);
       uint32_t icp = icon_codepoint(iname);
+
       if (icp != 0) {
+        // TIER 1 -- drawn at the font's native 48px, with no scaling anywhere.
+        //
+        // Two passes: a one-pixel offset shadow in the opposite contrast colour, then the glyph.
+        // Same treatment the bitmap path uses and for the same reason -- picking black-or-white
+        // by luminance alone tops out near 4.6:1 on a mid-tone wedge, so the shadow is what
+        // guarantees a hard edge on ANY user-chosen colour.
         char gbuf[5];
         icon_utf8(icp, gbuf);
 
@@ -382,7 +402,7 @@ Insert a tier-1 branch immediately **before** that, so the font path is tried fi
         gl.opa   = LV_OPA_COVER;
         gl.align = LV_TEXT_ALIGN_CENTER;
 
-        // 48px glyph, so a 48px box centred on the wedge's midpoint. lv_area_t is inclusive.
+        // lv_area_t bounds are inclusive, so a 48px span is c-24 .. c+23.
         lv_area_t ga = { (lv_coord_t)(lx - 24), (lv_coord_t)(ly - 24),
                          (lv_coord_t)(lx + 23), (lv_coord_t)(ly + 23) };
         lv_area_t gs = { (lv_coord_t)(ga.x1 + 1), (lv_coord_t)(ga.y1 + 1),
@@ -392,10 +412,10 @@ Insert a tier-1 branch immediately **before** that, so the font path is tried fi
         lv_draw_label(draw_ctx, &gl, &gs, gbuf, NULL);
         gl.color = contrast_on(color);
         lv_draw_label(draw_ctx, &gl, &ga, gbuf, NULL);
-      } else
+      } else if (wedge_icon_decode(ixbm, iconbits)) {
 ```
 
-The trailing `else` chains into the existing `if (wedge_icon_decode(...))`, so tiers 2–4 keep their current order underneath.
+Task 3 inserts tier 2 between these two branches.
 
 > **Verified:** both helpers exist with these exact signatures — `contrast_on(uint32_t bg)` at `Waveshare_LVGL_Test.ino:239` and `contrast_shadow_on(uint32_t bg)` at `:244`, each returning `lv_color_t`.
 
@@ -465,17 +485,32 @@ static bool icon_bmp48_decode(const char *hex, uint8_t *out) {
 
 - [ ] **Step 2: Add the tier-2 branch**
 
-Between Task 2's tier-1 `else` and the existing `if (wedge_icon_decode(...))`:
+Task 2 left a chain of `if (icp != 0) { ... } else if (wedge_icon_decode(...)) { ... } else { ... }`.
+Tier 2 goes **between** the first two branches.
+
+First add the two declarations alongside the ones Task 2 hoisted, above the chain:
 
 ```c
-      // TIER 2 -- the app supplied a 48x48 for a name we have no glyph for. Drawn 1:1, so it is
-      // sharper than the 18x18 path even though it is still 1bpp and therefore aliased.
-      //
-      // `static` for the same reason the scaled buffer is: 288 bytes is a lot for the LVGL
-      // task's 4 KB stack, and this callback only ever runs on that one task.
-      const char *ib48 = macro.isNull() ? nullptr : (const char *)(macro["icon_bmp48"] | (const char *)nullptr);
+      // `static` because 288 bytes is a lot for the LVGL task's 4 KB stack, and this callback
+      // only ever runs on that one task (LV_EVENT_DRAW_MAIN_END is dispatched from
+      // lv_timer_handler), so a single shared buffer is safe -- no reentrancy.
       static uint8_t icon48[ICON_BMP48_BYTES];
-      if (icon_bmp48_decode(ib48, icon48)) {
+      const char *ib48  = macro.isNull() ? nullptr : (const char *)(macro["icon_bmp48"] | (const char *)nullptr);
+```
+
+Then change the line that currently reads:
+
+```c
+      } else if (wedge_icon_decode(ixbm, iconbits)) {
+```
+
+into the tier-2 branch followed by that same line:
+
+```c
+      } else if (icon_bmp48_decode(ib48, icon48)) {
+        // TIER 2 -- the app supplied a 48x48 for a name this firmware has no glyph for. Drawn
+        // 1:1, so it is sharper than the upscaled 18x18 even though it is still 1bpp and
+        // therefore aliased.
         lv_img_dsc_t idata;
         idata.header.cf          = LV_IMG_CF_ALPHA_1BIT;
         idata.header.always_zero = 0;
@@ -489,7 +524,6 @@ Between Task 2's tier-1 `else` and the existing `if (wedge_icon_decode(...))`:
         lv_draw_img_dsc_init(&idsc);
         idsc.recolor_opa = LV_OPA_COVER;
 
-        // Inclusive bounds, so a 48px span is c-24 .. c+23.
         lv_area_t ia = { (lv_coord_t)(lx - 24), (lv_coord_t)(ly - 24),
                          (lv_coord_t)(lx + 23), (lv_coord_t)(ly + 23) };
         lv_area_t sa = { (lv_coord_t)(ia.x1 + 1), (lv_coord_t)(ia.y1 + 1),
@@ -499,7 +533,7 @@ Between Task 2's tier-1 `else` and the existing `if (wedge_icon_decode(...))`:
         lv_draw_img(draw_ctx, &idsc, &sa, &idata);
         idsc.recolor = contrast_on(color);
         lv_draw_img(draw_ctx, &idsc, &ia, &idata);
-      } else
+      } else if (wedge_icon_decode(ixbm, iconbits)) {
 ```
 
 - [ ] **Step 3: Compile**
@@ -857,11 +891,17 @@ Replace with:
     }
 ```
 
-and add the field to the macro map passed to `state.updateMacro`, after `'icon_xbm': iconXbm,`:
+and add the field to the macro map passed to `state.updateMacro`, after `'icon_xbm': iconXbm,`
+— **only when it has content**:
 
 ```dart
-      'icon_bmp48': iconBmp48,
+      if (iconBmp48.isNotEmpty) 'icon_bmp48': iconBmp48,
 ```
+
+The collection-`if` matters. `updateMacro` replaces the whole macro object, so omitting the key
+is what *removes* a stale bitmap once the firmware gains that glyph. Writing `''` instead would
+leave a dead key on every macro forever, spending document bytes against the 8 KB receive buffer
+that Task 7 exists to protect.
 
 - [ ] **Step 6: Analyze, test, commit**
 
