@@ -585,33 +585,6 @@ static void ring_draw_event_cb(lv_event_t *e) {
     }
   }
 
-  // Fixed selection caret at 12 o'clock.
-  //
-  // The RING rotates and the selection does not: since the M7/M8 ring rework the selected wedge
-  // always eases to the top, so this marker never needs to move or animate. That is what makes a
-  // static mark the right answer here -- it costs one arc, cannot drift out of sync with the
-  // selection, and unlike a colour wash it cannot be lost against a user-chosen wedge hue. The
-  // wash says "this one is brighter"; the caret says "this one", which is the part that was
-  // missing.
-  //
-  // Geometry, all of it load-bearing. lv_draw_arc's `radius` is the OUTER edge and `width`
-  // extends INWARD, so this spans r = 178-7 = 171 to 178: one pixel over RING_OUTER_R (172) so
-  // it visually touches the ring, and 2px clear of the 180px panel edge so it cannot clip.
-  // Wedge labels and icons sit at RING_MID_R (132), so nothing is obscured -- the outermost band
-  // of the ring is empty by construction.
-  //
-  // 270 degrees is 12 o'clock in lv_draw_arc's angle units; see wedge_center_angle(), whose
-  // +270.0f offset is the same fact. The 14-degree span is narrow enough to read as a tick
-  // rather than a ring segment.
-  if (active_count > 0) {
-    lv_draw_arc_dsc_t caret;
-    lv_draw_arc_dsc_init(&caret);
-    caret.color = lv_color_white();
-    caret.opa   = LV_OPA_COVER;
-    caret.width = 7;
-    lv_draw_arc(draw_ctx, &caret, &center_pt, RING_OUTER_R + 6, 263, 277);
-  }
-
   // Tinted bloom -- fakes a glow with stacked arcs, since LVGL 8 has no blur. Colour follows the
   // SELECTED macro so the centre text and the top wedge read as one object.
   if (active_count > 0) {
@@ -636,26 +609,53 @@ static void ring_draw_event_cb(lv_event_t *e) {
     }
   }
 
-  // Drawn in the active profile's own colour, and only when a profile exists in that direction.
-  // screen_click_cb() gates its hot zones on the same condition, so at either end of the list a
-  // tap there falls through and fires instead of switching.
+  // THE THREE HUB CHEVRONS. Left and right point at the neighbouring profiles; up points at the
+  // selected wedge, which is the one the centre tap fires. One glyph, one font, one colour, one
+  // radius, three directions -- so the hub reads as a single compass rather than three unrelated
+  // marks, and the top one inherits the side pair's draw order as well as their styling. That
+  // ordering matters: this block runs AFTER the centre bloom, so the chevrons sit on top of the
+  // halo instead of being washed out by it.
+  //
+  // A real FontAwesome chevron glyph, not hand-drawn strokes -- three iterations of tuning
+  // lv_draw_line stroke width/length/caps failed to read as a ❯; a typeface glyph has shaping
+  // two straight lines do not. LV_SYMBOL_LEFT/RIGHT/UP are already compiled into
+  // lv_font_montserrat_28 (LV_FONT_MONTSERRAT_28 enabled in lv_conf.h for task 8).
+  const lv_coord_t cx = EXAMPLE_LCD_H_RES / 2;
+  const lv_coord_t cy = EXAMPLE_LCD_V_RES / 2;
   int pcount = profiles_count();
   int pidx   = profiles_active_index();
+
+  lv_draw_label_dsc_t sym;
+  lv_draw_label_dsc_init(&sym);
+  sym.font  = &lv_font_montserrat_28;
+  sym.color = lv_color_hex(parse_hex_color(profiles_active_color(), 0xFFFFFF));
+  sym.opa   = LV_OPA_COVER;
+  sym.align = LV_TEXT_ALIGN_CENTER;
+
+  // Selection caret. The RING rotates and the selection does not -- since the M7/M8 rework the
+  // selected wedge always eases to the top -- so this never moves or animates, and it cannot
+  // drift out of sync with the selection.
+  //
+  // It replaced, in order, a 14-degree arc segment just outside the ring and then a small
+  // triangle in the same place. The arc failed review because an arc is a bracket: symmetric
+  // about both axes, marking a SPAN, carrying no direction, so it drew the eye without telling
+  // it anything. The triangle pointed correctly but read as too small against the 360px panel.
+  // Matching the profile chevrons fixes both at once and costs nothing, because the hub already
+  // had the vertical room: centre_macro sits at cy-12 in a 24pt face, so its top edge is around
+  // cy-27, leaving this glyph at cy-72 with roughly 45px of clearance.
+  //
+  // Unconditional where the side pair is gated, because it marks the fire target rather than a
+  // neighbouring profile -- with one profile loaded there is still a wedge to fire.
+  if (active_count > 0) {
+    lv_area_t a = { (lv_coord_t)(cx - 20), (lv_coord_t)(cy - INDICATOR_CX - 20),
+                    (lv_coord_t)(cx + 20), (lv_coord_t)(cy - INDICATOR_CX + 20) };
+    lv_draw_label(draw_ctx, &sym, &a, LV_SYMBOL_UP, NULL);
+  }
+
+  // Drawn only when a profile exists in that direction. screen_click_cb() gates its hot zones on
+  // the same condition, so at either end of the list a tap there falls through and fires instead
+  // of switching.
   if (pcount > 1) {
-    // A real FontAwesome chevron glyph, not hand-drawn strokes -- three iterations of tuning
-    // lv_draw_line stroke width/length/caps failed to read as a ❯; a typeface glyph has shaping
-    // two straight lines do not. LV_SYMBOL_LEFT/RIGHT are already compiled into
-    // lv_font_montserrat_28 (LV_FONT_MONTSERRAT_28 enabled in lv_conf.h for task 8).
-    const lv_coord_t cx = EXAMPLE_LCD_H_RES / 2;
-    const lv_coord_t cy = EXAMPLE_LCD_V_RES / 2;
-
-    lv_draw_label_dsc_t sym;
-    lv_draw_label_dsc_init(&sym);
-    sym.font  = &lv_font_montserrat_28;
-    sym.color = lv_color_hex(parse_hex_color(profiles_active_color(), 0xFFFFFF));
-    sym.opa   = LV_OPA_COVER;
-    sym.align = LV_TEXT_ALIGN_CENTER;
-
     if (pidx > 0) {
       lv_area_t a = { (lv_coord_t)(cx - INDICATOR_CX - 20), (lv_coord_t)(cy - 20),
                       (lv_coord_t)(cx - INDICATOR_CX + 20), (lv_coord_t)(cy + 20) };
@@ -881,6 +881,22 @@ static void ui_mode_set(ui_mode_t next) {
   if (mode_def()->enter) mode_def()->enter();
 }
 
+// Where the current touch went down, captured on PRESS so the release can tell a tap from a
+// swipe. See screen_click_cb() for why a tap has to prove it did not travel.
+static lv_point_t touch_press_pt;
+
+static void screen_press_cb(lv_event_t *e) {
+  (void)e;
+  lv_indev_t *indev = lv_indev_get_act();
+  if (!indev) return;
+  lv_indev_get_point(indev, &touch_press_pt);
+}
+
+// A tap must travel less than this, in pixels, or it is treated as an unrecognised swipe and
+// does nothing. Deliberately equal to lcd_bsp.c's indev_drv.gesture_limit so the two partition
+// the space cleanly with no dead band: at or under this, a tap; over it, a gesture.
+#define TAP_MAX_TRAVEL_PX 25
+
 // Dispatches to the active mode's on_tap handler; the per-mode tap semantics (what "inner
 // radius", "ring band", etc. mean) live with each handler -- see ring_on_tap()/settings_on_tap().
 static void screen_click_cb(lv_event_t *e) {
@@ -889,6 +905,35 @@ static void screen_click_cb(lv_event_t *e) {
   if (!indev) return;
   lv_point_t p;
   lv_indev_get_point(indev, &p);
+
+  // A tap has to PROVE it is a tap.
+  //
+  // Everything here used to rest on a negative: a touch was a tap because LVGL had not called
+  // it a gesture. That is not the same claim. LVGL accumulates gesture travel inside its PRESS
+  // processing, so movement between the last press poll and the lift is never counted, and a
+  // quick flick can release having accumulated less than gesture_limit. It then arrives as
+  // LV_EVENT_CLICKED and, on the ring, fires whatever wedge the finger happened to be over --
+  // a macro sent to the host from a gesture meant to change profiles. Reported from hardware:
+  // a swipe between profiles executed the macro under the finger instead.
+  //
+  // Tuning the thresholds cannot close this. lcd_bsp.c has already moved gesture_min_velocity
+  // and gesture_limit once each for this same class of bug; every such fix narrows the window
+  // without removing it, because the window is created by WHEN LVGL measures, not by what it
+  // measures against. Requiring the finger to have stayed put is a different kind of claim and
+  // closes the class.
+  //
+  // The asymmetry is deliberate. A swipe LVGL misses now does nothing, where it used to fire a
+  // macro. A dropped profile switch is a nuisance the user repeats; an unrequested keystroke
+  // sent to whatever has focus is not recoverable by repeating it.
+  const int32_t dx = (int32_t)p.x - (int32_t)touch_press_pt.x;
+  const int32_t dy = (int32_t)p.y - (int32_t)touch_press_pt.y;
+  if (dx * dx + dy * dy > (int32_t)TAP_MAX_TRAVEL_PX * TAP_MAX_TRAVEL_PX) {
+    TRACE("[tap] REJECTED: travelled %d px, not a tap
+",
+          (int)lroundf(sqrtf((float)(dx * dx + dy * dy))));
+    return;
+  }
+
   const ui_mode_def_t *m = mode_def();
   if (m->on_tap) m->on_tap(p.x, p.y);
   // No default. A tap no mode consumes does NOTHING -- firing a macro is ring-specific and
@@ -1423,6 +1468,10 @@ static void build_ring_ui(void) {
   lv_obj_t *scr = lv_scr_act();
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
   lv_obj_add_event_cb(scr, ring_draw_event_cb, LV_EVENT_DRAW_MAIN_END, NULL);
+  // PRESSED must be registered too, not just CLICKED: screen_click_cb compares the release
+  // point against where the touch went down, and without this it would compare against stale
+  // coordinates from the previous touch.
+  lv_obj_add_event_cb(scr, screen_press_cb, LV_EVENT_PRESSED, NULL);
   lv_obj_add_event_cb(scr, screen_click_cb, LV_EVENT_CLICKED, NULL);
   lv_obj_add_event_cb(scr, screen_gesture_cb, LV_EVENT_GESTURE, NULL);
 
