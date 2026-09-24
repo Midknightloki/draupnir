@@ -193,11 +193,35 @@ def write_names_header(ordered, digest):
         "",
         "static const icon_name_entry_t ICON_NAMES[ICON_NAMES_COUNT] = {",
     ]
-    width = max(len(n) for n, _ in ordered) + 3
+    width = max(len(n) for n, _ in ordered) + 4
     for name, cp in ordered:
-        lines.append(f'  {{ {(chr(34) + name + chr(34)):<{width}} 0x{cp:04X} }},')
+        # The comma between the two fields is load-bearing and easy to lose inside the
+        # padding: without it a row reads `{ "activity"  0xE038 }`, which is a C syntax error
+        # rather than anything that degrades. verify_header() exists because that shipped once.
+        field = f'{chr(34)}{name}{chr(34)},'
+        lines.append(f'  {{ {field:<{width}} 0x{cp:04X} }},')
     lines += ["};", ""]
-    OUT_NAMES.write_text("\n".join(lines), encoding="utf-8", newline="\n")
+    text = "\n".join(lines)
+    verify_header(text, len(ordered))
+    OUT_NAMES.write_text(text, encoding="utf-8", newline="\n")
+
+
+ROW = re.compile(r'^\s*\{\s*"[^"]+"\s*,\s*0x[0-9A-Fa-f]+\s*\},$')
+
+
+def verify_header(text, expected):
+    """Check the emitted table is valid C before it reaches disk.
+
+    Nothing else in this milestone parses or compiles this file until Task 2 includes it, so a
+    malformed row would otherwise surface as a firmware build failure several tasks downstream,
+    with the generator -- the actual culprit -- long since reviewed and accepted.
+    """
+    rows = [ln for ln in text.splitlines() if ln.strip().startswith('{ "')]
+    bad = [ln for ln in rows if not ROW.match(ln)]
+    if bad:
+        die("generated rows are not valid C initializers; first offender:\n  " + bad[0])
+    if len(rows) != expected:
+        die(f"emitted {len(rows)} table rows but resolved {expected} icons")
 
 
 def run_font_conv(codepoints):
@@ -247,6 +271,11 @@ git diff --stat firmware/Waveshare_LVGL_Test/icon_names.h firmware/Waveshare_LVG
 Expected: **no diff.** A second run must produce byte-identical output — otherwise every rebuild churns the repo and real changes get lost in the noise. If `lucide_48.c` differs between runs, check whether `lv_font_conv` is embedding a timestamp and strip it in `run_font_conv`.
 
 - [ ] **Step 6: Sanity-check the table**
+
+`verify_header()` now checks every row's shape inside the generator, on every run. This step
+independently re-derives sort order and uniqueness — the two properties the generator cannot
+check about itself — and re-checks the row shape, so a bug in `verify_header` cannot also hide
+the class of defect it was added to catch.
 
 ```bash
 head -30 firmware/Waveshare_LVGL_Test/icon_names.h
