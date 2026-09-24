@@ -560,6 +560,24 @@ Honest status, not aspiration.
 | M5Dial security gate | **Close the second board's config channel** — BLE pairing/bonding + GATT permission flags, delete Wi-Fi and the LAN-reachable web API, atomic profile write, passkey screen | **Done (2026-09-06)**, verified on hardware — positive path 2026-09-06, hostile-central negative test 2026-09-07 (§7) |
 | M10 (export/import) | **Profile export/import** — `include_icons`, an enveloped JSON file, whole-config restore and single-profile share, pre-import snapshot with undo | **Done (2026-09-08)**, verified on hardware — M5Dial only; the cross-device transfer is **not** yet verified (§4 of HANDOFF) |
 | M10 (haptics) | Buzzer/haptic feedback | **Tabled** — check whether a DRV2605 is on the Waveshare bus at all before debugging the CST816 conflict; see `docs/HANDOFF.md` §6 |
+| M11 (UI/UX polish) | **Pre-publish polish** — M5Dial PCNT encoder, Waveshare swipe-vs-tap, hub compass caret, save-path feedback, icon picker defects, macro icon vocabulary, colour palettes, text-label fallback | **Done (2026-09-23)**, verified on hardware — both boards; PR #16 |
+| M12 (icon rendering) | **Crisp icons on the Waveshare** — curated glyph set compiled in and drawn from the `icon` name, with an app-supplied higher-resolution bitmap covering names the firmware does not know | **Next** — design in progress |
+| M13 (OTA) | **Firmware update from the Companion App** — check for, transfer and apply a firmware image over BLE, with rollback | **Planned** — see note below |
+
+**M13 (OTA)** is a prerequisite for the product being maintainable in the field, and it is also
+what makes M12's design affordable. M12 deliberately compiles its glyph set into the firmware
+rather than loading a font pushed over BLE — a loader would mean a filesystem driver in LVGL, a
+resumable bulk transfer, PSRAM enabled (currently disabled on purpose, §3), and an
+attacker-supplied binary parsed inside the render loop, immediately before a public release. The
+hybrid avoids all of that by letting the app supply a bitmap for any glyph the firmware lacks, so
+new icons work everywhere immediately and a firmware release merely *promotes* them to crisp.
+That trade only stays comfortable if shipping firmware is routine, which is what M13 buys.
+
+The board is already provisioned: the `default_8MB` partition table carries `app0` and `app1` OTA
+slots of 0x330000 each, so no layout change is needed. Open questions are transfer rate over the
+existing 100-byte chunked transport (a ~1 MB image is ~10,000 chunks), resumability across a
+disconnect, signature verification, and the rollback trigger — `esp_ota_mark_app_valid_cancel_
+rollback()` exists for this but needs a health check to gate it.
 
 **M6:** done-criterion was the H1 negative test, which passed on hardware 2026-08-07 — an
 unbonded central wrote to the RX characteristic and the command handler never received the bytes,
