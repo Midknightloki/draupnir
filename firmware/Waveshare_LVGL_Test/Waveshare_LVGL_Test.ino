@@ -357,6 +357,12 @@ static void rebuild_ring_layout(void) {
 #define ICON_DST_STRIDE ((ICON_DST_PX + 7) / 8)             /* 6 */
 #define ICON_DST_BYTES  (ICON_DST_STRIDE * ICON_DST_PX)     /* 270 */
 
+// The app-supplied fallback, for names this firmware has no glyph for. Drawn 1:1 -- the whole
+// point is that nothing is upscaled.
+#define ICON_BMP48_PX     48
+#define ICON_BMP48_STRIDE ((ICON_BMP48_PX + 7) / 8)              /* 6   */
+#define ICON_BMP48_BYTES  (ICON_BMP48_STRIDE * ICON_BMP48_PX)    /* 288 */
+
 // The app renders each Feather icon to an 18x18 monochrome bitmap and stores it as `icon_xbm`:
 // 108 hex characters = 54 bytes = 3 bytes per row. Returns false unless the string is exactly
 // that, so a malformed or absent value falls back to the name rather than drawing garbage.
@@ -381,6 +387,28 @@ static bool wedge_icon_decode(const char *hex, uint8_t *out54) {
     x = (uint8_t)(((x & 0xCC) >> 2) | ((x & 0x33) << 2));
     x = (uint8_t)(((x & 0xAA) >> 1) | ((x & 0x55) << 1));
     out54[b] = x;
+  }
+  return true;
+}
+
+// Decode a 48x48 1bpp XBM hex string. Mirrors wedge_icon_decode(), including the per-byte bit
+// reversal -- the app emits LSB-first (XBM convention) and LV_IMG_CF_ALPHA_1BIT reads MSB-first.
+//
+// Deliberately a separate function rather than a size parameter on wedge_icon_decode(): that one
+// carries a static_assert tying it to a bare uint8_t[54] at its call site, and widening it would
+// weaken the check that stops the 18x18 path from overrunning.
+static bool icon_bmp48_decode(const char *hex, uint8_t *out) {
+  if (hex == nullptr || strlen(hex) != (size_t)(ICON_BMP48_BYTES * 2)) return false;
+  for (int b = 0; b < ICON_BMP48_BYTES; b++) {
+    char pair[3] = { hex[b * 2], hex[b * 2 + 1], '\0' };
+    char *end = nullptr;
+    long v = strtol(pair, &end, 16);
+    if (end != pair + 2) return false;      // non-hex character
+    uint8_t x = (uint8_t)v;
+    x = (uint8_t)(((x & 0xF0) >> 4) | ((x & 0x0F) << 4));
+    x = (uint8_t)(((x & 0xCC) >> 2) | ((x & 0x33) << 2));
+    x = (uint8_t)(((x & 0xAA) >> 1) | ((x & 0x55) << 1));
+    out[b] = x;
   }
   return true;
 }
@@ -505,6 +533,11 @@ static void ring_draw_event_cb(lv_event_t *e) {
       const char *iname = macro.isNull() ? nullptr : (const char *)(macro["icon"]       | (const char *)nullptr);
       const char *ixbm  = macro.isNull() ? nullptr : (const char *)(macro["icon_xbm"]   | (const char *)nullptr);
       uint32_t icp = icon_codepoint(iname);
+      // `static` because 288 bytes is a lot for the LVGL task's 4 KB stack, and this callback
+      // only ever runs on that one task (LV_EVENT_DRAW_MAIN_END is dispatched from
+      // lv_timer_handler), so a single shared buffer is safe -- no reentrancy.
+      static uint8_t icon48[ICON_BMP48_BYTES];
+      const char *ib48  = macro.isNull() ? nullptr : (const char *)(macro["icon_bmp48"] | (const char *)nullptr);
 
       if (icp != 0) {
         // TIER 1 -- drawn at the font's native 48px, with no scaling anywhere.
@@ -532,6 +565,32 @@ static void ring_draw_event_cb(lv_event_t *e) {
         lv_draw_label(draw_ctx, &gl, &gs, gbuf, NULL);
         gl.color = contrast_on(color);
         lv_draw_label(draw_ctx, &gl, &ga, gbuf, NULL);
+      } else if (icon_bmp48_decode(ib48, icon48)) {
+        // TIER 2 -- the app supplied a 48x48 for a name this firmware has no glyph for. Drawn
+        // 1:1, so it is sharper than the upscaled 18x18 even though it is still 1bpp and
+        // therefore aliased.
+        lv_img_dsc_t idata;
+        idata.header.cf          = LV_IMG_CF_ALPHA_1BIT;
+        idata.header.always_zero = 0;
+        idata.header.reserved    = 0;
+        idata.header.w           = ICON_BMP48_PX;
+        idata.header.h           = ICON_BMP48_PX;
+        idata.data_size          = ICON_BMP48_BYTES;
+        idata.data               = icon48;
+
+        lv_draw_img_dsc_t idsc;
+        lv_draw_img_dsc_init(&idsc);
+        idsc.recolor_opa = LV_OPA_COVER;
+
+        lv_area_t ia = { (lv_coord_t)(lx - 24), (lv_coord_t)(ly - 24),
+                         (lv_coord_t)(lx + 23), (lv_coord_t)(ly + 23) };
+        lv_area_t sa = { (lv_coord_t)(ia.x1 + 1), (lv_coord_t)(ia.y1 + 1),
+                         (lv_coord_t)(ia.x2 + 1), (lv_coord_t)(ia.y2 + 1) };
+
+        idsc.recolor = contrast_shadow_on(color);
+        lv_draw_img(draw_ctx, &idsc, &sa, &idata);
+        idsc.recolor = contrast_on(color);
+        lv_draw_img(draw_ctx, &idsc, &ia, &idata);
       } else if (wedge_icon_decode(ixbm, iconbits)) {
         // ALPHA_1BIT supplies alpha only; the colour comes from recolor/recolor_opa
         // (lv_draw_img.h:38). 18x18 is load-bearing: it is the interchange size shared with the
