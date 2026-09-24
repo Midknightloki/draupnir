@@ -272,16 +272,40 @@ class DraupnirState extends ChangeNotifier {
       }
 
       if (Platform.isAndroid) {
-        Map<Permission, PermissionStatus> statuses = await [
+        // Two eras of Android BLE permissions, and the app supports both.
+        //
+        // API 31+: BLUETOOTH_SCAN and BLUETOOTH_CONNECT. Location is NOT required and must not
+        // be demanded -- the manifest declares BLUETOOTH_SCAN with neverForLocation and bounds
+        // ACCESS_FINE_LOCATION to maxSdkVersion=30 precisely so this app never asks for
+        // location on a modern phone.
+        //
+        // API 30 and below: BLUETOOTH/BLUETOOTH_ADMIN are install-time, and a BLE scan returns
+        // nothing without ACCESS_FINE_LOCATION granted at runtime.
+        //
+        // So the gate accepts EITHER set, and requiring both is a bug: this check used to AND
+        // location into the condition, which made it unsatisfiable on API 31+. ACCESS_FINE_
+        // LOCATION is not in the merged manifest there, so permission_handler can only ever
+        // report it denied, and every connection attempt failed with "Permissions denied" while
+        // both Bluetooth permissions sat granted. It hid for a while because Android remembers
+        // a grant from a build whose manifest did declare location; a clean install is what
+        // surfaces it.
+        final statuses = await [
           Permission.bluetoothScan,
           Permission.bluetoothConnect,
           Permission.location,
         ].request();
 
-        if (statuses[Permission.bluetoothScan]?.isDenied == true ||
-            statuses[Permission.bluetoothConnect]?.isDenied == true ||
-            statuses[Permission.location]?.isDenied == true) {
-          throw Exception('Permissions denied. Enable Bluetooth and Location in Settings.');
+        final modern = statuses[Permission.bluetoothScan]?.isGranted == true &&
+            statuses[Permission.bluetoothConnect]?.isGranted == true;
+        final legacy = statuses[Permission.location]?.isGranted == true;
+
+        if (!modern && !legacy) {
+          _log('[ERR] permissions: scan=${statuses[Permission.bluetoothScan]} '
+              'connect=${statuses[Permission.bluetoothConnect]} '
+              'location=${statuses[Permission.location]}');
+          throw Exception(
+              'Draupnir needs permission to find nearby Bluetooth devices. '
+              'Grant it in Settings > Apps > Draupnir Forge > Permissions.');
         }
       }
 
