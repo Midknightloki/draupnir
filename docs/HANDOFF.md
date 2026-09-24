@@ -451,11 +451,14 @@ installed the matching release APK.
   recover from, and the generator's cmap cross-check exists to prevent it.
 - App and device both behaved correctly in ordinary use.
 
+- **Design criterion 7 passed: the retired M5Dial, unflashed, still loads and renders its
+  profiles.** This is the only real test of the additive-only rule -- a board that will never
+  receive another firmware update, reading a document that now contains `icon_bmp48` keys it has
+  never heard of, and ignoring them cleanly. ArduinoJson 7's elastic document absorbs the unknown
+  key and its 16384-byte RX buffer has room to spare.
+
 **Still open on the hardware gate:**
 
-- **Design criterion 7 -- the retired M5Dial, unflashed, still loading the same profiles.** This
-  is the only real test of the additive-only rule: a board that will never be updated reading a
-  document that now contains `icon_bmp48` keys it has never heard of. Not yet confirmed.
 - **Tier 2 (the app-supplied 48x48) has never been exercised on glass.** Reaching it requires an
   `icon` name the firmware lacks, which now means deliberately adding one to the app's map. The
   stride algebra agrees in all three places and the length is pinned by tests, but only the
