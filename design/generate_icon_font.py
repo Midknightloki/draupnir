@@ -108,11 +108,30 @@ def write_names_header(ordered, digest):
         "",
         "static const icon_name_entry_t ICON_NAMES[ICON_NAMES_COUNT] = {",
     ]
-    width = max(len(n) for n, _ in ordered) + 3
+    # Field is the quoted name PLUS the separating comma -- icon_name_entry_t has two members,
+    # so the initializer needs `{ "name", 0xNNNN },`. Padding is applied to this whole field so
+    # the hex column still lines up.
+    width = max(len(n) for n, _ in ordered) + 4
     for name, cp in ordered:
-        lines.append(f'  {{ {(chr(34) + name + chr(34)):<{width}} 0x{cp:04X} }},')
+        field = f'{chr(34)}{name}{chr(34)},'
+        lines.append(f'  {{ {field:<{width}}0x{cp:04X} }},')
     lines += ["};", ""]
     OUT_NAMES.write_text("\n".join(lines), encoding="utf-8", newline="\n")
+    verify_names_header(len(ordered))
+
+
+def verify_names_header(expected_count):
+    # Nothing else in this generator parses or compiles its own output, which is exactly how a
+    # missing comma in the struct initializer shipped undetected: it's a syntax error, but only a
+    # C compiler including this header would ever notice. Enforce the row shape here instead, so
+    # a malformed table fails the generator, not Task 2's build.
+    text = OUT_NAMES.read_text(encoding="utf-8")
+    row_re = re.compile(r'^\s*\{\s*"[^"]+"\s*,\s*0x[0-9A-Fa-f]+\s*\},$', re.M)
+    rows = row_re.findall(text)
+    if len(rows) != expected_count:
+        die(f"{OUT_NAMES} failed verification: {len(rows)} well-formed "
+            f'`{{ "name", 0xNNNN }},` rows found, expected {expected_count} -- '
+            "fix write_names_header and regenerate")
 
 
 def run_font_conv(codepoints):
