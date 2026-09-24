@@ -34,6 +34,20 @@ MAP_ENTRY = re.compile(r"^\s*'([A-Za-z0-9_]+)':\s*LucideIcons\.([A-Za-z0-9_]+)\s
 DECL = re.compile(
     r"static const IconData\s+([A-Za-z0-9_]+)\s*=\s*const IconData\(\s*(\d+)\s*,", re.M
 )
+# The legacyIconAliases map -- "'text': 'type'," -- both sides are macroIcons-style names, not
+# LucideIcons identifiers.
+ALIAS_BLOCK = re.compile(r"legacyIconAliases\s*=\s*\{(.*?)\n\};", re.S)
+ALIAS_ENTRY = re.compile(r"'([A-Za-z0-9_]+)':\s*'([A-Za-z0-9_]+)'")
+
+# lv_font_conv's own cmap, parsed back out of the C it just emitted -- see verify_font_codepoints.
+CMAP_BLOCK = re.compile(
+    r"\{\s*\.range_start\s*=\s*(\d+),\s*\.range_length\s*=\s*(\d+),\s*\.glyph_id_start\s*=\s*\d+,"
+    r"\s*\.unicode_list\s*=\s*([A-Za-z0-9_]+),\s*\.glyph_id_ofs_list\s*=\s*[A-Za-z0-9_]+,"
+    r"\s*\.list_length\s*=\s*(\d+),\s*\.type\s*=\s*([A-Za-z0-9_]+)\s*\}"
+)
+UNICODE_LIST_ARRAY = re.compile(
+    r"static const uint16_t (unicode_list_\d+)\[\]\s*=\s*\{([^}]*)\};", re.S
+)
 
 
 def die(msg):
@@ -49,9 +63,11 @@ def main():
     if not LUCIDE_PKG.exists():
         die(f"cannot find the lucide package at {LUCIDE_PKG}; run `flutter pub get` first")
 
-    entries = MAP_ENTRY.findall(MACRO_ICONS.read_text(encoding="utf-8"))
+    macro_icons_text = MACRO_ICONS.read_text(encoding="utf-8")
+    entries = MAP_ENTRY.findall(macro_icons_text)
     if not entries:
         die("parsed zero icons out of macro_icons.dart -- has the map's format changed?")
+    aliases = parse_legacy_aliases(macro_icons_text)
 
     codepoints = {m[0]: int(m[1]) for m in DECL.findall(LUCIDE_PKG.read_text(encoding="utf-8"))}
 
@@ -67,6 +83,24 @@ def main():
         die("these map entries have no codepoint in the installed package:\n  "
             + "\n  ".join(missing))
 
+    # legacyIconAliases entries (e.g. 'text' -> 'type') add a NAME row pointing at a codepoint
+    # that already exists under its target's own name -- they need no new glyph. Without this, a
+    # macro saved with an alias name never matches a row in ICON_NAMES, icon_codepoint() returns
+    # 0 forever, and the app pays for a 576-byte icon_bmp48 on every save for a glyph the device
+    # has always had (M12 whole-branch review, Minor finding 6).
+    alias_missing = []
+    for alias, target in aliases.items():
+        if alias in resolved:
+            die(f"legacyIconAliases entry '{alias}' collides with a macroIcons name")
+        cp = resolved.get(target)
+        if cp is None:
+            alias_missing.append(f"{alias} -> {target}")
+        else:
+            resolved[alias] = cp
+    if alias_missing:
+        die("these legacyIconAliases entries point at a name absent from macroIcons:\n  "
+            + "\n  ".join(alias_missing))
+
     # Sorted by byte order, because the firmware binary-searches with strcmp().
     ordered = sorted(resolved.items(), key=lambda kv: kv[0].encode("utf-8"))
 
@@ -76,12 +110,30 @@ def main():
         "".join(f"{n}:{c};" for n, c in ordered).encode("utf-8")
     ).hexdigest()[:12]
 
-    write_names_header(ordered, digest)
-    run_font_conv([c for _, c in ordered])
+    # Generate the font FIRST and verify it actually contains every codepoint the table is about
+    # to claim, and only THEN write the header. Previously this ran the other way around: if
+    # lv_font_conv failed partway, die() exited leaving a committed-ready header listing names
+    # whose glyphs are not in lucide_48.c. The firmware would take tier 1 for those names, LVGL
+    # would draw a 1px placeholder box, and tiers 2-4 (icon_bmp48, the name label) would never run
+    # -- the only path in the whole design where a wedge renders nothing usable (M12 whole-branch
+    # review, Important finding 1).
+    unique_codepoints = sorted({cp for _, cp in ordered})
+    run_font_conv(unique_codepoints)
+    verify_font_codepoints(unique_codepoints)
 
-    print(f"generated {len(ordered)} glyphs, set version {digest}")
+    write_names_header(ordered, digest)
+
+    print(f"generated {len(ordered)} names ({len(unique_codepoints)} unique glyphs), "
+          f"set version {digest}")
     print(f"  {OUT_NAMES}")
     print(f"  {OUT_FONT}")
+
+
+def parse_legacy_aliases(macro_icons_text):
+    m = ALIAS_BLOCK.search(macro_icons_text)
+    if not m:
+        die("cannot find legacyIconAliases in macro_icons.dart -- has its format changed?")
+    return dict(ALIAS_ENTRY.findall(m.group(1)))
 
 
 def write_names_header(ordered, digest):
@@ -160,6 +212,61 @@ def run_font_conv(codepoints):
         die("lv_font_conv not found. Install it: npm install -g lv_font_conv")
     except subprocess.CalledProcessError as e:
         die(f"lv_font_conv failed with exit {e.returncode}")
+
+
+def verify_font_codepoints(expected_codepoints):
+    """Confirms lucide_48.c's own cmap actually covers every codepoint we asked for.
+
+    lv_font_conv exiting 0 means it ran, not that every requested codepoint made it into the
+    output -- a codepoint the source TTF doesn't cover is the kind of failure that could still
+    exit clean. This parses the cmap back out of the generated C (rather than trusting the exit
+    code alone) so that case dies here instead of shipping a header/font pair where the header
+    promises a glyph the font doesn't have (M12 whole-branch review, Important finding 1).
+
+    lv_font_conv's cmap comes in two shapes for our purposes: a contiguous range (`.unicode_list
+    = NULL`, every codepoint in [range_start, range_start+range_length) is present), or a sparse
+    list (`.unicode_list = unicode_list_N`, whose entries are OFFSETS from range_start -- one per
+    present codepoint). Multiple cmap blocks are unioned. If lv_font_conv ever changes its output
+    format, the regexes below stop matching and this dies with a clear message rather than
+    silently verifying nothing.
+    """
+    if not OUT_FONT.exists():
+        die(f"{OUT_FONT} does not exist after run_font_conv -- lv_font_conv did not write it")
+    text = OUT_FONT.read_text(encoding="utf-8")
+    if not text.strip():
+        die(f"{OUT_FONT} is empty after run_font_conv")
+
+    arrays = dict(UNICODE_LIST_ARRAY.findall(text))
+
+    blocks = CMAP_BLOCK.findall(text)
+    if not blocks:
+        die(f"{OUT_FONT}: could not parse any cmap block out of the generated font -- "
+            "lv_font_conv's output format may have changed; update CMAP_BLOCK / "
+            "verify_font_codepoints() in design/generate_icon_font.py")
+
+    font_codepoints = set()
+    for range_start, range_length, list_name, list_length, _cmap_type in blocks:
+        range_start = int(range_start)
+        range_length = int(range_length)
+        list_length = int(list_length)
+        if list_name == "NULL":
+            # Contiguous: every codepoint in the range has a glyph.
+            font_codepoints.update(range(range_start, range_start + range_length))
+            continue
+        body = arrays.get(list_name)
+        if body is None:
+            die(f"{OUT_FONT}: cmap references {list_name}, which is not defined in the file")
+        offsets = [int(tok, 0) for tok in re.findall(r"0x[0-9A-Fa-f]+|\d+", body)]
+        if len(offsets) != list_length:
+            die(f"{OUT_FONT}: {list_name} has {len(offsets)} entries but the cmap says "
+                f"list_length={list_length}")
+        font_codepoints.update(range_start + off for off in offsets)
+
+    missing = sorted(cp for cp in expected_codepoints if cp not in font_codepoints)
+    if missing:
+        die(f"{OUT_FONT} is missing {len(missing)} requested codepoint(s) after conversion: "
+            + ", ".join(f"0x{cp:04X}" for cp in missing)
+            + " -- lv_font_conv reported success but the emitted cmap does not cover them")
 
 
 if __name__ == "__main__":

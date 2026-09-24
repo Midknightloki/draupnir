@@ -15,8 +15,8 @@ typedef struct {
   uint32_t    cp;
 } icon_name_entry_t;
 
-#define ICON_SET_VERSION "ea5f01e38ce7"
-#define ICON_NAMES_COUNT 157
+#define ICON_SET_VERSION "1a33791e2b7c"
+#define ICON_NAMES_COUNT 158
 
 static const icon_name_entry_t ICON_NAMES[ICON_NAMES_COUNT] = {
   { "activity",         0xE038 },
@@ -156,6 +156,7 @@ static const icon_name_entry_t ICON_NAMES[ICON_NAMES_COUNT] = {
   { "tag",              0xE17F },
   { "target",           0xE180 },
   { "terminal",         0xE181 },
+  { "text",             0xE198 },
   { "trash",            0xE18D },
   { "trash2",           0xE18E },
   { "tv",               0xE195 },
