@@ -201,9 +201,12 @@ CI, and its output is checked in — consistent with how `orbitron_*.c` already 
 - Any M5Dial change.
 - A loadable/pushable font pack (§2.3).
 - OTA firmware update — that is **M13**, and this design assumes it is coming.
-- The secondary ESP32-U4WDH. It shares the single USB-C port through a CH445P analog switch and
-  has no documented link to the S3, so it is reachable only *instead of* the main MCU, never
-  alongside it. It is not an offload target without someone tracing the board first.
+- The secondary ESP32-U4WDH. **Corrected 2026-09-23** after reading the manufacturer's schematic:
+  an earlier draft of this section claimed it had no link to the S3 and was reachable only
+  *instead of* it. That is wrong — there is a dedicated UART (S3 GPIO48/38 to U4WDH IO23/IO18),
+  and it owns the board's second encoder and a second I2S path. It is a genuinely usable
+  co-processor. It stays out of scope here because M12 does not need it, not because it is
+  unavailable. See `docs/Waveshare_Hardware_Reference.md` §4.
 - Enabling PSRAM. Not needed by this design; still the obvious relief valve if §6's document-size
   edge ever becomes routine.
 
