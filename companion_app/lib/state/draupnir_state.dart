@@ -53,6 +53,13 @@ class DraupnirState extends ChangeNotifier {
   // The device's glyph-set version, for logging and for a future cache. Null when unknown.
   String? deviceGlyphSet;
 
+  // The device's running firmware version, as reported by `get_version`. Null until fetched,
+  // which happens on demand from the "Update Firmware" action rather than on every connect --
+  // unlike deviceGlyphs this has no other consumer during normal use. Used by the update UI to
+  // decide whether to offer an update at all (via ota_transfer.dart's shouldOffer) and whether
+  // that update would be a downgrade.
+  String? deviceVersion;
+
   // True once connected over BLE. BLE is now the only transport (the Wi-Fi/HTTP client half of
   // the cut web UI is gone), so this doubles as "connected".
   bool isBluetooth = false;
@@ -474,6 +481,7 @@ class DraupnirState extends ChangeNotifier {
           txChar = null;
           deviceGlyphs = null;
           deviceGlyphSet = null;
+          deviceVersion = null;
           error = 'Bluetooth disconnected';
           notifyListeners();
         }
@@ -514,6 +522,7 @@ class DraupnirState extends ChangeNotifier {
     txChar = null;
     deviceGlyphs = null;
     deviceGlyphSet = null;
+    deviceVersion = null;
     profilesData = null;
     notifyListeners();
   }
@@ -567,6 +576,28 @@ class DraupnirState extends ChangeNotifier {
       _log('[glyphs] get_glyphs failed: $e');
     }
     notifyListeners();
+  }
+
+  /// Asks the connected device which firmware version it's running. Safe to call against any
+  /// device; like [fetchGlyphs], never throws and never sets [error] -- a device too old to
+  /// answer `get_version` just can't be offered an update, which is not a fault to put a red
+  /// screen in front of.
+  Future<String?> fetchDeviceVersion() async {
+    try {
+      final response = await _sendBleRequest({'cmd': 'get_version'});
+      if (response['status'] == 'ok' && response['version'] != null) {
+        deviceVersion = response['version'].toString();
+        _log('[fw] device reports version=$deviceVersion');
+      } else {
+        deviceVersion = null;
+        _log('[fw] get_version refused: ${response['message'] ?? response['status']}');
+      }
+    } catch (e) {
+      deviceVersion = null;
+      _log('[fw] get_version failed: $e');
+    }
+    notifyListeners();
+    return deviceVersion;
   }
 
   Future<void> fetchProfiles() async {
