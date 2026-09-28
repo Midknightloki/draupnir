@@ -2,6 +2,7 @@
 #include "macro_engine.h"
 #include "icon_names.h"
 #include "version.h"
+#include "ota_engine.h"
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLESecurity.h>
@@ -53,6 +54,11 @@ static BLEServer *pServer = nullptr;
 static BLECharacteristic *pTxCharacteristic = nullptr;
 static QueueHandle_t bleRxQueue = nullptr;   // completed command strings (char*, caller frees)
 static QueueHandle_t bleAckQueue = nullptr;  // acked chunk sequence numbers
+
+// Image bytes handed from the BLE host task to loop(). esp_ota_write() must not run on the BLE
+// task -- same rule as every other write in this file.
+struct OtaChunk { uint8_t *data; size_t len; };
+static QueueHandle_t bleOtaQueue = nullptr;
 
 static volatile bool connected = false;
 static volatile bool pairingActive = false;
@@ -476,6 +482,38 @@ static void handleBleCommand(char *cmdStr) {
              DRAUPNIR_FW_VERSION,
              state == ESP_OTA_IMG_PENDING_VERIFY ? "true" : "false");
     sendBleMessage(resp);
+  } else if (cmd == "ota_begin") {
+    char err[96] = {0};
+    uint32_t size = req["size"] | 0;
+    const char *sha = req["sha256"] | "";
+    const char *sig = req["sig"] | "";
+    if (ota_begin_request(size, sha, sig, err, sizeof(err))) {
+      char resp[64];
+      snprintf(resp, sizeof(resp), "{\"status\":\"ok\",\"offset\":%lu}", (unsigned long)ota_offset());
+      sendBleMessage(resp);
+    } else {
+      char resp[160];
+      snprintf(resp, sizeof(resp), "{\"status\":\"error\",\"message\":\"%s\"}", err);
+      sendBleMessage(resp);
+    }
+  } else if (cmd == "ota_end") {
+    char err[96] = {0};
+    if (ota_finish(err, sizeof(err))) {
+      sendBleMessage("{\"status\":\"ok\",\"rebooting\":true}");
+      delay(200);          // let the notification drain before the reset
+      esp_restart();
+    } else {
+      char resp[160];
+      snprintf(resp, sizeof(resp), "{\"status\":\"error\",\"message\":\"%s\"}", err);
+      sendBleMessage(resp);
+    }
+  } else if (cmd == "ota_abort") {
+    ota_abort();
+    sendBleMessage("{\"status\":\"ok\"}");
+  } else if (cmd == "ota_confirm") {
+    bool ok = ota_confirm();
+    sendBleMessage(ok ? "{\"status\":\"ok\"}"
+                      : "{\"status\":\"error\",\"message\":\"Confirm failed\"}");
   } else {
     sendBleMessage("{\"status\":\"error\",\"message\":\"Unknown command\"}");
   }
@@ -522,6 +560,24 @@ class RxCallbacks : public BLECharacteristicCallbacks {
     if (rxValue.length() == 2 && (uint8_t)rxValue[0] == BLE_CHUNK_ACK_MARKER) {
       uint8_t seq = (uint8_t)rxValue[1];
       xQueueOverwrite(bleAckQueue, &seq);
+      return;
+    }
+
+    // BINARY MODE. Image bytes, not a command -- and deliberately intercepted ABOVE the
+    // duplicate-write guard below.
+    //
+    // That guard drops any write byte-identical to the previous one inside
+    // BLE_RX_DUP_WINDOW_MS. A firmware image is full of identical adjacent chunks (0xFF padding,
+    // zero-filled regions) and pipelined chunks arrive far inside 10ms, so letting binary data
+    // reach the guard would silently discard real payload. The SHA-256 would then fail and the
+    // symptom would be "OTA always fails verification" -- with nothing pointing at the guard.
+    if (ota_active()) {
+      uint8_t *copy = (uint8_t *)malloc(rxValue.length());
+      if (copy != nullptr) {
+        memcpy(copy, rxValue.c_str(), rxValue.length());
+        OtaChunk chunk = { copy, rxValue.length() };
+        if (xQueueSend(bleOtaQueue, &chunk, 0) != pdTRUE) free(copy);   // drop, app re-sends
+      }
       return;
     }
 
@@ -663,6 +719,7 @@ class SecurityCallbacks : public BLESecurityCallbacks {
 void ble_init() {
   bleRxQueue = xQueueCreate(4, sizeof(char *));
   bleAckQueue = xQueueCreate(1, sizeof(uint8_t));
+  bleOtaQueue = xQueueCreate(24, sizeof(OtaChunk));
 
   BLEDevice::init("Draupnir");
   uint32_t heapBefore = ESP.getFreeHeap();
@@ -798,4 +855,24 @@ void ble_update() {
     handleBleCommand(cmdStr); // zero-copy parse; cmdStr must outlive the call
     free(cmdStr);
   }
+
+  // Drain image bytes on the loop() task, and ack every OTA_ACK_EVERY chunks so the app can
+  // pipeline instead of waiting per chunk.
+  {
+    static uint32_t chunksSinceAck = 0;
+    const uint32_t OTA_ACK_EVERY = 16;
+    OtaChunk chunk;
+    while (xQueueReceive(bleOtaQueue, &chunk, 0) == pdTRUE) {
+      bool ok = ota_feed(chunk.data, chunk.len);
+      free(chunk.data);
+      if (!ok) { sendBleMessage("{\"status\":\"error\",\"message\":\"Flash write failed\"}"); break; }
+      if (++chunksSinceAck >= OTA_ACK_EVERY) {
+        chunksSinceAck = 0;
+        char ack[64];
+        snprintf(ack, sizeof(ack), "{\"status\":\"ok\",\"offset\":%lu}", (unsigned long)ota_offset());
+        sendBleMessage(ack);
+      }
+    }
+  }
+  ota_tick();
 }
