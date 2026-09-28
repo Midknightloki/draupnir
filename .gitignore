@@ -44,3 +44,8 @@ companion_app/android/.gradle/
 # Font build inputs (TTF sources for lv_font_conv). The generated LVGL .c font tables are what
 # get committed; the source TTF is a build input, not source.
 tools/fonts/
+
+# OTA signing keys. The PRIVATE key must never be committed -- this repo is public, and anyone
+# holding it can push firmware to every shipped unit. The PUBLIC key is generated into
+# firmware/Waveshare_LVGL_Test/ota_pubkey.h and IS committed, which is the point.
+tools/ota_keys/*.pem
