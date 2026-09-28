@@ -1,6 +1,7 @@
 #include "ble_engine.h"
 #include "macro_engine.h"
 #include "icon_names.h"
+#include "version.h"
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLESecurity.h>
@@ -8,6 +9,7 @@
 #include <LittleFS.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include "esp_ota_ops.h"
 
 #define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -461,6 +463,19 @@ static void handleBleCommand(char *cmdStr) {
     } else {
       sendBleMessage("{\"status\":\"error\",\"message\":\"Macro not found\"}");
     }
+  } else if (cmd == "get_version") {
+    // Deliberately also reports the OTA image state: the app needs to know whether the running
+    // firmware is still on probation (PENDING_VERIFY) so it can send ota_confirm. Without this
+    // the app cannot tell a freshly-updated device from a settled one.
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state = ESP_OTA_IMG_VALID;
+    esp_ota_get_state_partition(running, &state);
+    char resp[160];
+    snprintf(resp, sizeof(resp),
+             "{\"status\":\"ok\",\"version\":\"%s\",\"pending_verify\":%s}",
+             DRAUPNIR_FW_VERSION,
+             state == ESP_OTA_IMG_PENDING_VERIFY ? "true" : "false");
+    sendBleMessage(resp);
   } else {
     sendBleMessage("{\"status\":\"error\",\"message\":\"Unknown command\"}");
   }
