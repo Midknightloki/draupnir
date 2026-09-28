@@ -25,6 +25,7 @@ static mbedtls_sha256_context otaSha;
 
 bool ota_active() { return otaActive; }
 uint32_t ota_offset() { return otaReceived; }
+uint32_t ota_expected() { return otaExpected; }
 
 static int hexbytes(const char *hex, uint8_t *out, size_t outlen) {
   size_t n = strlen(hex);

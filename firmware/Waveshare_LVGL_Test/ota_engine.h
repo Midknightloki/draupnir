@@ -23,6 +23,11 @@ bool ota_feed(const uint8_t *data, size_t len);
 // Bytes accepted so far -- the resume anchor.
 uint32_t ota_offset();
 
+// Total image size for the session in progress, as given to ota_begin_request(). 0 when no
+// session is active. Exists so a UI can render a percentage without reaching into the engine's
+// statics -- see the note on ota_active() above about what's allowed to cross that boundary.
+uint32_t ota_expected();
+
 // Finish: verify hash, verify signature, commit, set boot partition. Returns false and fills
 // `err` on any failure, leaving the device on its existing firmware.
 bool ota_finish(char *err, size_t errlen);
