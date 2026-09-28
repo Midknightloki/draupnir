@@ -23,6 +23,34 @@ static uint8_t                otaSig[80];
 static size_t                 otaSigLen = 0;
 static mbedtls_sha256_context otaSha;
 
+// RECLAIM THE ROLLBACK DECISION FROM THE ARDUINO CORE.
+//
+// This is not optional and it is not defensive -- without it M13's entire second safety net is
+// silently absent, and every claim the design makes about rollback is false.
+//
+// The core's initArduino() (esp32-hal-misc.c, cores/esp32 3.3.11) runs BEFORE setup() and does:
+//
+//     #ifdef CONFIG_APP_ROLLBACK_ENABLE
+//       if (!verifyRollbackLater()) {
+//         ... if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+//           if (verifyOta()) { esp_ota_mark_app_valid_cancel_rollback(); }
+//
+// CONFIG_APP_ROLLBACK_ENABLE IS defined for this target, and both hooks are weak symbols
+// defaulting to verifyRollbackLater() == false and verifyOta() == true. So a freshly-flashed
+// OTA image marks ITSELF valid before a single line of our code runs -- meaning any image that
+// boots far enough to reach initArduino(), which is essentially any image that boots at all,
+// sticks permanently and can never be reverted.
+//
+// Returning true here defers the decision to us. Confirmation then happens only in
+// ota_confirm(), in response to the app reconnecting and asking -- which requires the device to
+// boot, initialise BLE, advertise, pair and serve a command. That round trip is exactly the
+// capability a broken image would have lost, which is the whole point of the net.
+//
+// Found by whole-branch review, not by inspection of this repo: the violation lives in the core,
+// outside the diff, so grepping firmware/ for the confirm call reported "nothing self-confirms"
+// and was wrong.
+extern "C" bool verifyRollbackLater() { return true; }
+
 bool ota_active() { return otaActive; }
 uint32_t ota_offset() { return otaReceived; }
 uint32_t ota_expected() { return otaExpected; }
@@ -91,11 +119,31 @@ bool ota_feed(const uint8_t *data, size_t len) {
   mbedtls_sha256_update(&otaSha, data, len);
   otaReceived += len;
   otaLastFeedMs = millis();
+
+  // LEAVE BINARY MODE THE INSTANT THE LAST BYTE LANDS.
+  //
+  // Without this the feature cannot work at all, and the original design missed it: the RX
+  // intercept routes EVERY write to the image while otaActive is true, so the ota_end command
+  // that is supposed to finish the transfer gets swallowed as image bytes, clamped to zero
+  // length, and discarded. ota_finish() -- the only thing that clears otaActive -- is reachable
+  // only from ota_end. A deadlock: the command needed to exit the mode is eaten by the mode.
+  //
+  // The device knows exactly how many bytes to expect (from ota_begin), so the last byte is an
+  // unambiguous boundary. Everything after it is a command again. otaHandle, the hash and the
+  // expected/received counters all stay live for ota_finish(); only the routing changes.
+  if (otaReceived >= otaExpected) {
+    otaActive = false;
+    Serial.printf("[ota] all %lu bytes received; leaving binary mode, awaiting ota_end\n",
+                  (unsigned long)otaReceived);
+  }
   return true;
 }
 
 bool ota_finish(char *err, size_t errlen) {
-  if (!otaActive) { snprintf(err, errlen, "No update in progress"); return false; }
+  // Deliberately NOT gated on otaActive: ota_feed() clears that as soon as the final byte
+  // arrives, which is what lets this command be delivered at all. otaHandle is the real
+  // liveness signal.
+  if (otaHandle == 0) { snprintf(err, errlen, "No update in progress"); return false; }
 
   if (otaReceived != otaExpected) {
     snprintf(err, errlen, "Got %lu of %lu bytes",
@@ -128,30 +176,37 @@ bool ota_finish(char *err, size_t errlen) {
 
   if (esp_ota_end(otaHandle) != ESP_OK) {
     snprintf(err, errlen, "esp_ota_end failed");
+    otaHandle = 0;                 // consumed by esp_ota_end even on failure
     otaActive = false;
     return false;
   }
   if (esp_ota_set_boot_partition(otaTarget) != ESP_OK) {
     snprintf(err, errlen, "set_boot_partition failed");
+    otaHandle = 0;
     otaActive = false;
     return false;
   }
+  otaHandle = 0;
   otaActive = false;
   Serial.println("[ota] verified and committed; rebooting");
   return true;
 }
 
 void ota_abort() {
-  if (!otaActive) return;
+  if (otaHandle == 0) return;   // not otaActive: a completed-but-unfinished transfer still needs aborting
   esp_ota_abort(otaHandle);
   mbedtls_sha256_free(&otaSha);
+  otaHandle = 0;
   otaActive = false;
   otaReceived = 0;
   Serial.println("[ota] aborted; back to command mode");
 }
 
 void ota_tick() {
-  if (otaActive && (millis() - otaLastFeedMs) > OTA_IDLE_TIMEOUT_MS) {
+  // Guards on otaHandle, not otaActive. Since ota_feed() leaves binary mode on the final byte,
+  // a transfer that completed but never received ota_end -- app crashed, user walked away --
+  // would otherwise hold the partition handle open forever with nothing to reclaim it.
+  if (otaHandle != 0 && (millis() - otaLastFeedMs) > OTA_IDLE_TIMEOUT_MS) {
     Serial.println("[ota] idle timeout");
     ota_abort();
   }
