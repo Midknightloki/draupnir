@@ -49,3 +49,8 @@ tools/fonts/
 # holding it can push firmware to every shipped unit. The PUBLIC key is generated into
 # firmware/Waveshare_LVGL_Test/ota_pubkey.h and IS committed, which is the point.
 tools/ota_keys/*.pem
+
+# Bundled OTA firmware image. This is a build OUTPUT (of *.bin above) but it ships INSIDE the APK
+# on purpose -- see FirmwareSource in companion_app/lib/services/firmware_source.dart -- so it IS
+# committed, unlike every other *.bin in this repo.
+!companion_app/assets/firmware/firmware.bin

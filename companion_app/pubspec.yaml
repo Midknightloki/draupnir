@@ -69,6 +69,8 @@ flutter:
   assets:
     - assets/logo.png
     - assets/glyph.png
+    - assets/firmware/firmware.bin
+    - assets/firmware/manifest.json
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images
