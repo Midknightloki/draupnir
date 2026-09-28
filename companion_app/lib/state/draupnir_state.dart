@@ -5,6 +5,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../services/firmware_source.dart';
+import '../services/ota_transfer.dart';
 import '../services/profile_transfer.dart';
 import '../utils/icon_generator.dart';
 
@@ -58,6 +60,18 @@ class DraupnirState extends ChangeNotifier {
   BluetoothCharacteristic? rxChar;
   BluetoothCharacteristic? txChar;
   bool isScanningBle = false;
+
+  // True for the whole span of [updateFirmware] -- from before the image loads to after
+  // ota_confirm lands, success or failure. A macro firing or a profile save landing mid-transfer
+  // would both be wrong (the device's RX characteristic is in raw-byte OTA mode, not JSON) and
+  // dangerous (a save racing the reboot could land on either the old or the new image). Set
+  // before the first await in [updateFirmware] and cleared in its `finally`, so a thrown
+  // exception can never leave this stuck true.
+  bool otaInProgress = false;
+
+  // 0.0-1.0 through the byte-transfer phase of [updateFirmware]; not meaningful outside it.
+  double otaProgress = 0.0;
+
   Completer<Map<String, dynamic>>? _bleResponseCompleter;
   String _bleBuffer = '';
   int? _lastProcessedSeq;
@@ -740,6 +754,15 @@ class DraupnirState extends ChangeNotifier {
   Future<bool> saveProfiles() async {
     if (profilesData == null) return false;
 
+    // The RX characteristic is in raw-byte OTA mode for the whole span of updateFirmware(), not
+    // JSON -- a save landing in the middle would not even parse as the request it thinks it is,
+    // and if it somehow raced the reboot it could land on whichever image happened to be running.
+    if (otaInProgress) {
+      lastSaveFailure = 'A firmware update is in progress. Try again once it finishes.';
+      notifyListeners();
+      return false;
+    }
+
     // Clear stale state on entry, the way fetchProfiles() does. Without this a single failed
     // save left `error` set forever: nothing on the save path ever cleared it, so every LATER
     // save -- including successful ones -- still rendered the error screen, and the only way
@@ -809,6 +832,156 @@ class DraupnirState extends ChangeNotifier {
     return saved;
   }
 
+  // BLE payload per raw OTA chunk. _sendBleRequest's own JSON chunking uses 180B because it has
+  // to leave room for the seq/ack framing on the wire; raw OTA bytes carry no framing at all, so
+  // this can use most of the negotiated MTU payload (512 requested, 3B ATT overhead) with margin.
+  static const int _otaChunkSize = 509;
+
+  /// Pushes the bundled, signed firmware image to the connected device and confirms it.
+  ///
+  /// Six steps, matching M13 Task 6:
+  ///  1. load the image the APK ships (`BundledFirmwareSource`);
+  ///  2. `ota_begin` with size/sha256/sig, read back the resume offset;
+  ///  3. stream `chunksFor(...)` to [rxChar] -- raw bytes, no JSON, written the same way
+  ///     (`withoutResponse: false`) as every other request on this link;
+  ///  4. update [otaProgress] as bytes land;
+  ///  5. `ota_end`, which tells the device to verify the hash+signature, commit, and reboot;
+  ///  6. wait for the reboot, reconnect to the same device, and send `ota_confirm` -- success is
+  ///     not reported before THAT returns ok, because until it does the new image is on
+  ///     probation and a bare power cycle reverts it. See the module doc on [otaInProgress].
+  ///
+  /// Throws on any failure (no bundled image, a device refusal, a reconnect that never happens,
+  /// a confirm that never lands) rather than returning a bool, because each of those needs a
+  /// different message and the caller is better placed to word it than this method is.
+  /// [otaInProgress] is set before the first await and always cleared, so a thrown exception can
+  /// never leave the app believing an update is still running.
+  Future<void> updateFirmware() async {
+    if (otaInProgress) {
+      throw StateError('A firmware update is already in progress.');
+    }
+    otaInProgress = true;
+    otaProgress = 0.0;
+    notifyListeners();
+
+    try {
+      // 1. Load the signed image bundled in the APK.
+      final bundle = await const BundledFirmwareSource().load();
+      if (bundle == null) {
+        throw Exception('No firmware image is bundled with this build.');
+      }
+
+      final device = connectedDevice;
+      if (device == null || rxChar == null) {
+        throw Exception('Not connected to a Draupnir device.');
+      }
+      final deviceId = device.remoteId;
+
+      // 2. ota_begin -- size, hash and signature so the device can verify before it commits to
+      // anything. The offset it hands back is where to start writing; nonzero only if this is a
+      // retry within the same session that the device already has bytes for.
+      final begin = await _sendBleRequest({
+        'cmd': 'ota_begin',
+        'version': bundle.version,
+        'size': bundle.bytes.length,
+        'sha256': bundle.sha256,
+        'sig': bundle.signature,
+      });
+      if (begin['status'] != 'ok') {
+        throw Exception('Device refused ota_begin: ${begin['message'] ?? begin['status']}');
+      }
+      final offset = (begin['offset'] as num?)?.toInt() ?? 0;
+      _log('[OTA] begin ok, resuming from offset=$offset of ${bundle.bytes.length}');
+
+      // 3+4. Raw bytes, no framing. Every write is awaited (withoutResponse: false, matching the
+      // existing send path), so the GATT write response is already the backpressure -- the
+      // device's own periodic {"status":"ok","offset":N} notify (every 16 chunks) is a resume
+      // anchor for a connection that drops mid-transfer, which this single-attempt flow does not
+      // need to consume to make forward progress.
+      final total = bundle.bytes.length;
+      var sentBytes = offset;
+      var chunkNum = 0;
+      for (final chunk in chunksFor(bundle.bytes, _otaChunkSize, from: offset)) {
+        await rxChar!.write(chunk, withoutResponse: false);
+        sentBytes += chunk.length;
+        chunkNum++;
+        otaProgress = total == 0 ? 1.0 : sentBytes / total;
+        if (chunkNum % 16 == 0) notifyListeners();
+      }
+      otaProgress = 1.0;
+      notifyListeners();
+      _log('[OTA] transfer complete, $sentBytes/$total bytes sent');
+
+      // 5. Verify + commit + reboot.
+      final end = await _sendBleRequest({'cmd': 'ota_end'});
+      if (end['status'] != 'ok') {
+        throw Exception('Device refused ota_end: ${end['message'] ?? end['status']}');
+      }
+      _log('[OTA] end ok, device rebooting');
+
+      // 6. The new image runs on probation until ota_confirm succeeds; an unconfirmed image
+      // rolls back on its own at the next power cycle. Wait for the reboot to drop the link,
+      // give the device a moment to come back up, then reconnect to the SAME board and confirm.
+      await _waitForOtaDisconnect(device);
+      await Future.delayed(const Duration(seconds: 3));
+
+      var reconnected = false;
+      for (var attempt = 0; attempt < 3 && !reconnected; attempt++) {
+        _log('[OTA] reconnect attempt ${attempt + 1}/3');
+        await connectBluetooth(
+          chooseDevice: (results) async {
+            for (final r in results) {
+              if (r.device.remoteId == deviceId) return r.device;
+            }
+            return results.isNotEmpty ? results.first.device : null;
+          },
+        );
+        reconnected = isBluetooth && rxChar != null;
+        if (!reconnected) {
+          await Future.delayed(const Duration(seconds: 2));
+        }
+      }
+      if (!reconnected) {
+        throw Exception(
+            "Update sent, but the device didn't come back after rebooting. It has NOT been "
+            'confirmed and will roll back on its next power cycle -- reconnect and try again.');
+      }
+
+      // ota_confirm cancels the rollback. Nothing before this point may be reported as success.
+      final confirm = await _sendBleRequest({'cmd': 'ota_confirm'});
+      if (confirm['status'] != 'ok') {
+        throw Exception(
+            'Device reconnected but refused ota_confirm: '
+            '${confirm['message'] ?? confirm['status']}. The update is unconfirmed and will '
+            'roll back on the next power cycle.');
+      }
+      _log('[OTA] confirmed');
+    } finally {
+      otaInProgress = false;
+      notifyListeners();
+    }
+  }
+
+  /// Waits for [device] to disconnect (the reboot after ota_end), or gives up after [timeout]
+  /// and lets the caller's own reconnect loop discover whether it actually came back.
+  Future<void> _waitForOtaDisconnect(
+    BluetoothDevice device, {
+    Duration timeout = const Duration(seconds: 20),
+  }) async {
+    if (!isBluetooth || connectedDevice == null) return;
+    final completer = Completer<void>();
+    late final StreamSubscription<BluetoothConnectionState> sub;
+    sub = device.connectionState.listen((state) {
+      if (state == BluetoothConnectionState.disconnected && !completer.isCompleted) {
+        completer.complete();
+      }
+    });
+    try {
+      await completer.future.timeout(timeout, onTimeout: () {});
+    } finally {
+      await sub.cancel();
+    }
+  }
+
   /// Macros carrying an icon_bmp48, i.e. icons this device's firmware has no glyph for.
   ///
   /// Walks `profilesData`, which is untyped JSON off the wire -- a missing `profiles` key, a
@@ -830,6 +1003,10 @@ class DraupnirState extends ChangeNotifier {
   }
 
   Future<void> triggerMacro(int macroIdx) async {
+    // Same reasoning as the guard in saveProfiles(): the RX characteristic is not speaking JSON
+    // while an update is in flight, and firing a macro mid-transfer is both meaningless and a
+    // way to jam the byte stream.
+    if (otaInProgress) return;
     try {
       await _sendBleRequest({
         'cmd': 'trigger',
