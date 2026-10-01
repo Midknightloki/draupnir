@@ -299,7 +299,18 @@ class DraupnirState extends ChangeNotifier {
   // keep listening for a grace period after it to see whether a second board is on the air. One
   // match connects straight through; more than one asks. The grace window is what keeps the
   // common single-board case from paying the full 10s scan.
-  static const Duration _scanGrace = Duration(seconds: 2);
+  //
+  // 800ms, down from 2s. Measured on hardware 2026-10-01: the knob was found in the same
+  // millisecond the scan started, and the app then sat in this window for the full two seconds
+  // before connecting -- a fixed fifth of a 9.6s connect, paid on every single connect, in the
+  // overwhelmingly common case where there is only one board to find.
+  //
+  // 800ms still comfortably covers a second board advertising at a typical 100-500ms interval.
+  // The risk it accepts is narrow: if a second board's advertisement lands between 800ms and 2s
+  // it will be missed and the app will connect to the first without asking. That matters only
+  // to someone running two boards at once, and the cost of being wrong is connecting to the
+  // other knob rather than anything destructive.
+  static const Duration _scanGrace = Duration(milliseconds: 800);
 
   // One key, overwritten on every import. Survives an app restart, which an in-memory undo
   // would not — and a wrong import is the only irreversible action in this app.

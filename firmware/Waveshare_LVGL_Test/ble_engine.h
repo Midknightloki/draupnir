@@ -38,3 +38,7 @@ void ble_clear_profiles_dirty();
 // a bulk transfer. See CONN_PARAMS_IDLE in ble_engine.cpp: the idle settings exist to stop HID
 // output stalling and must be restored on every OTA exit path.
 void ble_set_fast_conn_params(bool fast);
+
+// Hands the link back to the idle connection parameters once sending stops. Called from
+// ble_update(); see holdFastParams() in the .cpp for why this is not optional.
+void ble_release_fast_params_if_quiet();

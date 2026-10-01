@@ -21,7 +21,21 @@
 // arrived (notify() itself has no delivery guarantee -- confirmed on M5Dial: the stack reports
 // success even when the central's OS never surfaces the packet).
 #define BLE_CHUNK_ACK_MARKER 0xFE
-static const int BLE_CHUNK_PAYLOAD_SIZE = 100;
+// Notification payload sizing.
+//
+// This WAS a flat 100 bytes while the app negotiates a 512-byte MTU -- so every chunk used a
+// fifth of the packet it had already paid for. Measured on hardware 2026-10-01: a 3,913-byte
+// get_profiles took 4.4s as 40 round trips at ~110ms each, and a 1,610-byte get_glyphs took
+// 2.0s. Together that was 6.4s of a 9.6s connect.
+//
+// MAX sizes the buffers; the actual fill follows the negotiated MTU at runtime. An ATT
+// notification carries MTU-3 bytes and this protocol spends one more on the sequence prefix,
+// hence MTU-4.
+//
+// MIN is the old value, used whenever the MTU is unknown or absurdly small -- a central that
+// never negotiates gets exactly the behaviour it got before this change.
+#define BLE_CHUNK_PAYLOAD_MAX 508
+#define BLE_CHUNK_PAYLOAD_MIN 100
 
 // RX reassembly buffer for chunked incoming commands. Must be malloc()'d, not static/global --
 // on the M5Dial firmware a static array here silently broke BLE advertising (see
@@ -84,6 +98,49 @@ static uint16_t   activeConnHandle = 0;
 #define CONN_PARAMS_IDLE 0x28, 0x50, 4, 400
 #define CONN_PARAMS_FAST 0x06, 0x0C, 0, 400
 
+// Bytes of payload per notification, from the MTU actually negotiated for this connection.
+//
+// Deliberately queried per send rather than cached: the MTU is negotiated shortly AFTER connect,
+// so anything cached at connect time would lock in the 23-byte default and silently keep the
+// old behaviour forever.
+// Fast connection parameters are requested whenever we are actively sending, and handed back
+// after a short quiet period. This is the SAME fix that took an OTA from 15 minutes to 90
+// seconds, which was originally scoped to OTA alone -- wrongly, because every chunked response
+// pays the identical cost.
+//
+// Measured 2026-10-01: raising the ATT chunk from 100 to 508 bytes cut the chunk COUNT 4x and
+// changed total time not at all, because a 508-byte notification fragments into ~20 link-layer
+// packets and each one still needs a connection event. At a 50-100ms interval with slave
+// latency 4, connection events are the unit of cost -- not ATT chunks.
+static uint32_t lastChunkedSendMs = 0;
+static bool     fastParamsHeld = false;
+static const uint32_t FAST_PARAMS_LINGER_MS = 1500;
+
+static void holdFastParams() {
+  lastChunkedSendMs = millis();
+  if (fastParamsHeld) return;
+  ble_set_fast_conn_params(true);
+  fastParamsHeld = true;
+}
+
+// Called from ble_update(). Returns the link to the idle parameters once traffic stops -- those
+// exist to stop HID output stalling while idle-connected and are not optional.
+void ble_release_fast_params_if_quiet() {
+  if (!fastParamsHeld) return;
+  if (millis() - lastChunkedSendMs < FAST_PARAMS_LINGER_MS) return;
+  ble_set_fast_conn_params(false);
+  fastParamsHeld = false;
+}
+
+static int bleChunkPayload() {
+  if (pServer == nullptr || !connected) return BLE_CHUNK_PAYLOAD_MIN;
+  uint16_t mtu = pServer->getPeerMTU(activeConnHandle);
+  int n = (int)mtu - 4;                       // 3 bytes ATT header + 1 byte seq prefix
+  if (n < BLE_CHUNK_PAYLOAD_MIN) n = BLE_CHUNK_PAYLOAD_MIN;
+  if (n > BLE_CHUNK_PAYLOAD_MAX) n = BLE_CHUNK_PAYLOAD_MAX;
+  return n;
+}
+
 void ble_set_fast_conn_params(bool fast) {
   if (activeServer == nullptr) return;
   if (fast) activeServer->updateConnParams(activeConnHandle, CONN_PARAMS_FAST);
@@ -101,7 +158,7 @@ void ble_clear_profiles_dirty() { profilesDirty = false; }
 // resending (not just waiting longer) on timeout since a missing ack over BLE genuinely means
 // the packet needs resending, not that it's merely late.
 static bool sendNotifyAndWaitAck(const uint8_t *data, size_t len, uint8_t seq) {
-  uint8_t framed[BLE_CHUNK_PAYLOAD_SIZE + 1];
+  uint8_t framed[BLE_CHUNK_PAYLOAD_MAX + 1];
   framed[0] = seq;
   memcpy(framed + 1, data, len);
   const int maxAttempts = 5;
@@ -142,7 +199,7 @@ public:
     if (failed) return 0;
     _buf[_fill++] = c;
     totalSent++;
-    if (_fill == BLE_CHUNK_PAYLOAD_SIZE) {
+    if (_fill >= _chunkLimit) {      // >= not ==: _chunkLimit is a runtime value now
       if (!sendNotifyAndWaitAck(_buf, _fill, _seq)) { failed = true; return 0; }
       _seq++;
       _fill = 0;
@@ -165,7 +222,10 @@ public:
   }
 
 private:
-  uint8_t _buf[BLE_CHUNK_PAYLOAD_SIZE];
+  uint8_t _buf[BLE_CHUNK_PAYLOAD_MAX];
+  // Fixed for the lifetime of one response, so a mid-stream MTU change cannot alter the
+  // chunking partway through a message.
+  const int _chunkLimit = (holdFastParams(), bleChunkPayload());
   int _fill = 0;
   uint8_t _seq = 0;
 };
@@ -264,11 +324,13 @@ private:
 // By the time OTA is streaming the link has long since settled -- ota_begin was answered over
 // it -- so the preamble buys nothing and costs everything.
 static void sendBleMessageBody(const String &msg) {
+  holdFastParams();
+  const int payload = bleChunkPayload();
   int len = msg.length();
   int offset = 0;
   uint8_t seq = 0;
   while (offset < len) {
-    int chunkSize = min(BLE_CHUNK_PAYLOAD_SIZE, len - offset);
+    int chunkSize = min(payload, len - offset);
     if (!sendNotifyAndWaitAck((const uint8_t *)(msg.c_str() + offset), chunkSize, seq)) return;
     offset += chunkSize;
     seq++;
@@ -711,11 +773,21 @@ class ServerCallbacks : public BLEServerCallbacks {
     int rc = 0;
     bool started = BLESecurity::startSecurity(desc->conn_handle, &rc);
     Serial.printf("[ble] startSecurity requested, ok=%d rc=%d\n", started, rc);
-    // Explicitly request the widened interval (the advertised preference above is only a hint
-    // the central can ignore) plus slave latency 4 -- lets this side skip up to 4 connection
-    // events when it has nothing to send, cutting background radio/host activity further while
-    // idle-connected, which is when we saw HID output silently stop.
-    server->updateConnParams(desc->conn_handle, CONN_PARAMS_IDLE);
+    // Start FAST, not idle.
+    //
+    // A connection is followed immediately by the app's get_glyphs and get_profiles -- about
+    // 5.5KB of chunked response. Requesting fast parameters when that traffic STARTS is too
+    // late: the central has to accept the update, which takes a round trip or two, so the first
+    // transfer pays the old rate regardless. Measured 2026-10-01: with fast params requested at
+    // first-send, get_profiles dropped from 4.4s to 0.90s but get_glyphs -- the first send --
+    // stayed at ~2s in every run.
+    //
+    // ble_release_fast_params_if_quiet() hands the link back to CONN_PARAMS_IDLE 1.5s after the
+    // last chunked send. Those idle settings are not optional: slave latency 4 exists because
+    // idle-connected was when HID output was seen to silently stop, and that is precisely the
+    // state this returns to once the burst is over.
+    server->updateConnParams(desc->conn_handle, CONN_PARAMS_FAST);
+    holdFastParams();
   }
   void onDisconnect(BLEServer *server, ble_gap_conn_desc *desc) override {
     connected = false;
@@ -927,4 +999,5 @@ void ble_update() {
     }
   }
   ota_tick();
+  ble_release_fast_params_if_quiet();
 }
