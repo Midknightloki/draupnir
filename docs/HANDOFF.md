@@ -473,7 +473,7 @@ installed the matching release APK.
 Production signing key generated, backed up by the owner, and its public key compiled in
 (fingerprint `ac20b4e2...`). Device flashed over USB with that key, then updated over the air.
 
-**Passed — 7 of 10:**
+**Passed — all 10:**
 
 1. `sign_firmware.py` exits 1 when `DRAUPNIR_OTA_KEY` is unset, and refuses a `--version` that
    does not appear in the image bytes (verified both directions).
@@ -492,8 +492,13 @@ Production signing key generated, backed up by the owner, and its public key com
 8. **Transfer time: 90 seconds** for 1.23 MB, against ~15 minutes before the connection-parameter
    fix.
 
-**Still open: 7 (HID silent for the duration), 9 (downgrade warned and installed), 10 (the
-retired M5Dial unaffected).**
+7. **HID silent for the whole transfer.** A focused text editor received nothing.
+9. **Downgrade warned and installed.** An older version was offered with an explicit downgrade
+   warning and installed correctly -- refusing downgrades would make a bad release recoverable
+   only over USB, which is the situation OTA exists to avoid.
+10. **The retired M5Dial is unaffected.** Still loads profiles and fires macros, unflashed.
+
+**All 10 criteria passed.**
 
 **Two defects found here that no review could have found:**
 
