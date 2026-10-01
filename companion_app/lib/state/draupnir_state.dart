@@ -1005,15 +1005,33 @@ class DraupnirState extends ChangeNotifier {
       await _waitForOtaDisconnect(device);
       await Future.delayed(const Duration(seconds: 3));
 
+      // Let the device finish booting and start advertising before the first scan. Without this
+      // the first attempt reliably scans a device that is not on the air yet, and simply burns
+      // one of the retries.
+      await Future.delayed(const Duration(seconds: 3));
+
       var reconnected = false;
-      for (var attempt = 0; attempt < 3 && !reconnected; attempt++) {
-        _log('[OTA] reconnect attempt ${attempt + 1}/3');
-        // Bind to the exact board we just flashed, and keep the log across the reboot so the
-        // OTA-phase lines survive for diagnosis.
-        await connectBluetooth(requireRemoteId: deviceId, preserveLog: true);
-        reconnected = isBluetooth && rxChar != null;
-        if (!reconnected) {
-          await Future.delayed(const Duration(seconds: 2));
+      const attempts = 5;
+      for (var attempt = 0; attempt < attempts && !reconnected; attempt++) {
+        _log('[OTA] reconnect attempt ${attempt + 1}/$attempts');
+        try {
+          // Bind to the exact board we just flashed, and keep the log across the reboot so the
+          // OTA-phase lines survive for diagnosis.
+          await connectBluetooth(requireRemoteId: deviceId, preserveLog: true);
+          reconnected = isBluetooth && rxChar != null;
+        } catch (e) {
+          // connectBluetooth THROWS when the required board is not among the scan results --
+          // which is the normal case for the first attempt or two after a reboot. Without this
+          // catch the throw escapes the loop entirely and the remaining attempts never run, so
+          // a device that simply needed a few more seconds is reported as a failed update and
+          // then rolls back. (Regression introduced with requireRemoteId; the previous chooser
+          // never threw because it fell back to connecting to ANY Draupnir, which was the bug
+          // requireRemoteId exists to fix.)
+          _log('[OTA] reconnect attempt ${attempt + 1} failed: $e');
+          reconnected = false;
+        }
+        if (!reconnected && attempt < attempts - 1) {
+          await Future.delayed(const Duration(seconds: 3));
         }
       }
       if (!reconnected) {

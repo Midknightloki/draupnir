@@ -7,6 +7,7 @@
 #include "mbedtls/pk.h"
 
 #include "macro_engine.h"
+#include "ble_engine.h"
 
 // Binary mode dies after this long without a chunk. A dropped transfer must not leave the device
 // in a mode where it no longer parses commands -- that would need a power cycle to recover from.
@@ -104,6 +105,13 @@ bool ota_begin_request(uint32_t size, const char *sha256hex, const char *sighex,
   otaReceived = 0;
   otaLastFeedMs = millis();
   otaActive = true;
+
+  // Idle connection parameters (50-100ms interval, slave latency 4) cost ~371ms per acked chunk
+  // -- measured at ~15 minutes for a 1.23MB image against a one-minute target. Ask for fast ones
+  // for the duration. Restored on EVERY exit below, because the idle settings are not a default
+  // to drift back to at leisure: they exist to stop HID output stalling while idle-connected.
+  ble_set_fast_conn_params(true);
+
   Serial.printf("[ota] begin: %lu bytes -> %s\n", (unsigned long)size, otaTarget->label);
   return true;
 }
@@ -178,16 +186,19 @@ bool ota_finish(char *err, size_t errlen) {
     snprintf(err, errlen, "esp_ota_end failed");
     otaHandle = 0;                 // consumed by esp_ota_end even on failure
     otaActive = false;
+    ble_set_fast_conn_params(false);
     return false;
   }
   if (esp_ota_set_boot_partition(otaTarget) != ESP_OK) {
     snprintf(err, errlen, "set_boot_partition failed");
     otaHandle = 0;
     otaActive = false;
+    ble_set_fast_conn_params(false);
     return false;
   }
   otaHandle = 0;
   otaActive = false;
+  ble_set_fast_conn_params(false);
   Serial.println("[ota] verified and committed; rebooting");
   return true;
 }
@@ -199,6 +210,7 @@ void ota_abort() {
   otaHandle = 0;
   otaActive = false;
   otaReceived = 0;
+  ble_set_fast_conn_params(false);
   Serial.println("[ota] aborted; back to command mode");
 }
 

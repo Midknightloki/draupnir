@@ -65,6 +65,32 @@ static volatile bool pairingActive = false;
 static volatile uint32_t currentPasskey = 0;
 static volatile bool profilesDirty = false;
 
+// Retained so an OTA can renegotiate the link and hand it back afterwards.
+static BLEServer *activeServer = nullptr;
+static uint16_t   activeConnHandle = 0;
+
+// Connection parameters, in NimBLE's 1.25ms units.
+//
+// IDLE is what onConnect() installs: a 50-100ms interval with slave latency 4, letting this side
+// skip up to 4 connection events when it has nothing to say. That is deliberate and load-bearing
+// -- it was added because idle-connected was when HID output was seen to silently stop.
+//
+// It is also ruinous for bulk transfer. Each OTA chunk is an acked write, so it costs at least
+// one connection event, and latency 4 lets the peripheral skip four more. Measured on hardware:
+// a 1.23 MB image took ~15 MINUTES against a target of about one, i.e. ~371ms per chunk.
+//
+// FAST is 7.5-15ms with no latency, requested only for the duration of a transfer. A central may
+// refuse or round these; Android commonly grants 15-30ms, which is still several times better.
+#define CONN_PARAMS_IDLE 0x28, 0x50, 4, 400
+#define CONN_PARAMS_FAST 0x06, 0x0C, 0, 400
+
+void ble_set_fast_conn_params(bool fast) {
+  if (activeServer == nullptr) return;
+  if (fast) activeServer->updateConnParams(activeConnHandle, CONN_PARAMS_FAST);
+  else      activeServer->updateConnParams(activeConnHandle, CONN_PARAMS_IDLE);
+  Serial.printf("[ble] conn params -> %s\n", fast ? "FAST" : "idle");
+}
+
 bool ble_is_connected() { return connected; }
 bool ble_pairing_active() { return pairingActive; }
 uint32_t ble_passkey() { return currentPasskey; }
@@ -679,6 +705,8 @@ class ServerCallbacks : public BLEServerCallbacks {
   // relying on per-characteristic ENC permission flags to trigger it implicitly.
   void onConnect(BLEServer *server, ble_gap_conn_desc *desc) override {
     connected = true;
+    activeServer = server;
+    activeConnHandle = desc->conn_handle;
     Serial.printf("[ble] connected, conn_handle=%d\n", desc->conn_handle);
     int rc = 0;
     bool started = BLESecurity::startSecurity(desc->conn_handle, &rc);
@@ -687,10 +715,11 @@ class ServerCallbacks : public BLEServerCallbacks {
     // the central can ignore) plus slave latency 4 -- lets this side skip up to 4 connection
     // events when it has nothing to send, cutting background radio/host activity further while
     // idle-connected, which is when we saw HID output silently stop.
-    server->updateConnParams(desc->conn_handle, 0x28, 0x50, 4, 400);
+    server->updateConnParams(desc->conn_handle, CONN_PARAMS_IDLE);
   }
   void onDisconnect(BLEServer *server, ble_gap_conn_desc *desc) override {
     connected = false;
+    activeServer = nullptr;
     pairingActive = false;
     // A half-received command from a dropped connection must not poison the next one. Without
     // this, bytes buffered when the link dropped stay in bleRxBuf and get prepended to the next
