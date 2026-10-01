@@ -518,6 +518,45 @@ against a negotiated 509-byte MTU. Roughly 5x each. This is pre-existing, affect
 and is deliberately NOT part of M13 -- it touches the transport everything depends on and needs
 its own verification.
 
+### Verified on hardware during M14a (transport) — Waveshare, 2026-10-01
+
+Connect measured end to end, before and after, from the app's own log.
+
+|                      | before | after  |
+|----------------------|--------|--------|
+| scan grace           | 2.0s   | 0.80s  |
+| get_glyphs  (1610 B) | 2.0s   | 0.52s  |
+| get_profiles (3913 B)| 4.4s   | 0.76s  |
+| **total**            | 9.6s   | **3.43s** |
+
+**The idle connection parameters still work**, which was the real risk: three macro triggers all
+returned ok, including one **69 seconds** after the previous. That is the link sitting idle on the
+restored parameters -- the exact state slave latency 4 was added to protect -- still firing HID.
+
+**What the measurements overturned, recorded because each looked right in advance:**
+
+- A *good* connect was always ~9.6s. The 60-90s complaint is **failed attempts**, which is a
+  separate bug (see M14b below).
+- Raising the ATT chunk from 100 to 508 bytes cut the chunk count 4x and changed total time by
+  nothing. **Connection events are the unit of cost, not ATT chunks** -- a 508-byte notification
+  fragments into ~20 link-layer packets. The per-chunk time went 118ms -> 625ms, which is what
+  proved the change HAD applied and the model was wrong.
+- Requesting fast connection parameters when traffic starts is one round trip too late; the first
+  transfer always pays the old rate. The connection now starts fast and is handed back to idle
+  1.5s after the last chunked send.
+
+### M14b — connection failures, NOT YET DIAGNOSED
+
+The 60-90s connect is failed attempts, not slow transfers. One `GATT_CONNECTION_TIMEOUT`
+(android-code 147) was captured on 2026-10-01, and the owner reports connects routinely taking
+2-3 attempts. **There is no model for this yet.** It needs its own capture: a long window,
+`grep --line-buffered`, and specifically several consecutive FAILED attempts rather than a
+successful one.
+
+Do not assume it is bond state, advertising restart, or anything else without evidence -- an
+earlier guess in this session that the device had stopped advertising turned out to be a
+truncated log, not a fact.
+
 ## 5. Hardware — read before plugging anything in
 
 The board is a **Waveshare ESP32-S3 knob**: ESP32-S3 rev v0.2, 16 MB quad flash, 8 MB PSRAM
