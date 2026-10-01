@@ -161,15 +161,28 @@ lost if the new image were broken. A firmware that cannot do those things cannot
 and is reverted automatically. Self-confirming on boot would mark a half-working image valid and
 throw away the net.
 
-### 3.4 Resume, scoped honestly
+### 3.4 No resume *(decided 2026-09-30)*
 
-`esp_ota_write` is sequential and the handle does not survive a reboot. So:
+**Dropped.** An earlier draft of this section promised resume-within-a-session: a reconnect
+mid-transfer would send `ota_begin` with a matching `sha256` and get back the offset already
+accepted. It was never implemented, and on review it is not worth implementing.
 
-- **Reconnect mid-transfer:** supported. The device keeps the handle alive under the inactivity
-  timeout; `ota_begin` with a matching `sha256` replies with the offset already accepted and the
-  app seeks.
-- **Device reboot mid-transfer:** starts over. Persisting partition write state to survive a
-  reboot is real work for a transfer that takes about a minute.
+`esp_ota_write` is sequential and its handle does not survive a reboot, so resume could only ever
+have covered a reconnect without a device restart. That is a narrow window on a transfer that
+takes about a minute, and the fallback -- start again -- costs a minute. The machinery to support
+it is not free: the device would have to keep a partition handle open across a disconnect, match
+an incoming request against an in-flight session, and decide what to do when the hashes disagree.
+Every one of those is a state the idle-timeout path would also have to reason about.
+
+Consequences, recorded rather than left implicit:
+
+- `ota_begin` refuses outright while a session is active, and the `offset` it returns is always
+  `0`. The field stays in the protocol because it costs nothing and a later implementation would
+  want it, but today it carries no information.
+- A transfer interrupted by anything -- disconnect, app crash, walking out of range -- restarts
+  from the beginning after the device's idle timeout reclaims the partition handle.
+- **Done criterion 9 is removed**, not merely deferred. Nothing tests resume because nothing
+  implements it.
 
 ### 3.5 Device behaviour during an update
 
@@ -215,7 +228,7 @@ it. No cleanup is needed; noting it so nobody invents some.
 - Secure Boot v2 and any eFuse burning (§2.2).
 - OTA for the retired M5Dial. It is frozen; it will not receive this or anything else.
 - Delta/differential updates. At ~1 minute for a full image the complexity earns nothing.
-- Persisting resume state across a device reboot (§3.4).
+- Resume of any kind (§3.4). Dropped, not deferred.
 - Raising `BLE_CHUNK_PAYLOAD_SIZE` for the existing JSON path. §2.3 notes the waste; changing the
   shared chunk size touches a protocol the frozen M5Dial also speaks, and that is its own change
   with its own compatibility argument. Binary mode sets its own payload size and does not disturb
@@ -235,7 +248,6 @@ it. No cleanup is needed; noting it so nobody invents some.
    previous firmware.
 7. Macros are stopped and HID is quiesced for the duration; the host receives no keystrokes.
 8. Transfer of the real ~1.18 MB image completes in roughly a minute.
-9. Resume-after-reconnect works mid-transfer.
-10. A downgrade is offered with a warning and installs correctly.
-11. The retired M5Dial, unflashed, is unaffected — it never sees these commands and continues to
+9. A downgrade is offered with a warning and installs correctly.
+10. The retired M5Dial, unflashed, is unaffected — it never sees these commands and continues to
     work.

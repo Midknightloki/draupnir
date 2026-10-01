@@ -309,14 +309,30 @@ class DraupnirState extends ChangeNotifier {
   /// [chooseDevice] is called only when the scan turns up more than one Draupnir. Returning null
   /// (the user dismissed the picker) cancels the connect quietly — not an error. Omitting it
   /// falls back to the strongest signal, so callers without a UI to show still work.
+  /// [requireRemoteId] binds this connect to ONE specific board and fails if it is not found.
+  ///
+  /// Distinct from [chooseDevice] on purpose. chooseDevice is only consulted when more than one
+  /// Draupnir answers the scan -- with exactly one candidate the code takes it without asking,
+  /// which is right for a human picker (nobody wants a dialog to choose between one option) and
+  /// catastrophic for an OTA reconnect: if the freshly-updated knob does NOT come back and a
+  /// different Draupnir is the only one in range, the app would connect to that one and send it
+  /// ota_confirm. It would answer "ok" -- its own image is already settled -- and the app would
+  /// report "Update Complete" while the device that actually matters sat unconfirmed, due to
+  /// roll back on its next power cycle.
+  ///
+  /// [preserveLog] keeps the debug log across the connect. The OTA flow needs it: a reconnect
+  /// normally starts a fresh log, which would discard exactly the OTA-phase lines you need to
+  /// diagnose what happened on the far side of a reboot.
   Future<void> connectBluetooth({
     Future<BluetoothDevice?> Function(List<ScanResult>)? chooseDevice,
+    DeviceIdentifier? requireRemoteId,
+    bool preserveLog = false,
   }) async {
     isLoading = true;
     isScanningBle = true;
     error = null;
     needsConfigMode = false;
-    clearDebugLog();
+    if (!preserveLog) clearDebugLog();
     notifyListeners();
 
     try {
@@ -416,8 +432,21 @@ class DraupnirState extends ChangeNotifier {
 
       // Strongest signal first: it is the best guess when nobody is choosing, and the most
       // useful order to show a human who is.
-      final candidates = matches.values.toList()
+      var candidates = matches.values.toList()
         ..sort((a, b) => b.rssi.compareTo(a.rssi));
+
+      // Applied before selection, so neither the single-candidate shortcut nor a picker can
+      // route around it.
+      if (requireRemoteId != null) {
+        final before = candidates.length;
+        candidates = candidates.where((c) => c.device.remoteId == requireRemoteId).toList();
+        if (candidates.isEmpty) {
+          _log('[SCAN] required device $requireRemoteId not among $before Draupnir(s) found');
+          throw Exception(
+              'The device being updated did not come back. Another Draupnir may be nearby, but '
+              'this will not connect to the wrong one.');
+        }
+      }
 
       BluetoothDevice? targetDevice;
       if (candidates.length == 1 || chooseDevice == null) {
@@ -979,14 +1008,9 @@ class DraupnirState extends ChangeNotifier {
       var reconnected = false;
       for (var attempt = 0; attempt < 3 && !reconnected; attempt++) {
         _log('[OTA] reconnect attempt ${attempt + 1}/3');
-        await connectBluetooth(
-          chooseDevice: (results) async {
-            for (final r in results) {
-              if (r.device.remoteId == deviceId) return r.device;
-            }
-            return results.isNotEmpty ? results.first.device : null;
-          },
-        );
+        // Bind to the exact board we just flashed, and keep the log across the reboot so the
+        // OTA-phase lines survive for diagnosis.
+        await connectBluetooth(requireRemoteId: deviceId, preserveLog: true);
         reconnected = isBluetooth && rxChar != null;
         if (!reconnected) {
           await Future.delayed(const Duration(seconds: 2));
