@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -70,6 +71,24 @@ def sign_image(key, image_path, version):
     data = Path(image_path).read_bytes()
     if not data:
         die(f"{image_path} is empty")
+
+    # The manifest version is free-form operator input, and getting it wrong is silent and
+    # self-perpetuating: the app compares the device's reported version against the manifest, so
+    # a manifest claiming 1.0.1 over an image built from 1.0.0 means the device reports 1.0.0
+    # after a SUCCESSFUL update, the app offers the same update forever, and the completion
+    # dialog cheerfully states the device is now running a version it is not.
+    #
+    # Checking against version.h alone would not catch a stale binary, so check the IMAGE: the
+    # compiled DRAUPNIR_FW_VERSION string is in there verbatim.
+    if version.encode() not in data:
+        hdr = REPO / "firmware/Waveshare_LVGL_Test/version.h"
+        compiled = None
+        if hdr.exists():
+            m = re.search(r'DRAUPNIR_FW_VERSION\s+"([^"]+)"', hdr.read_text(encoding="utf-8"))
+            compiled = m.group(1) if m else None
+        die(f"--version {version!r} does not appear in {image_path}.\n"
+            f"  version.h declares: {compiled!r}\n"
+            "  Either the version is wrong, or the binary is stale. Rebuild, then re-sign.")
     digest = hashlib.sha256(data).digest()
     sig = key.sign(digest, ec.ECDSA(utils.Prehashed(hashes.SHA256())))
 

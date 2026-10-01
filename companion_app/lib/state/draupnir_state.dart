@@ -79,6 +79,10 @@ class DraupnirState extends ChangeNotifier {
   // 0.0-1.0 through the byte-transfer phase of [updateFirmware]; not meaningful outside it.
   double otaProgress = 0.0;
 
+  /// Size of the image currently being sent, so a device-reported byte offset can be turned into
+  /// a fraction. Zero outside an update, which is why the progress-ack handler guards on it.
+  int otaImageSize = 0;
+
   Completer<Map<String, dynamic>>? _bleResponseCompleter;
   String _bleBuffer = '';
   int? _lastProcessedSeq;
@@ -186,6 +190,22 @@ class DraupnirState extends ChangeNotifier {
             try {
               final responseJson = jsonDecode(responseStr) as Map<String, dynamic>;
               _log('[RX] Parse OK: status=${responseJson['status']}');
+
+              // An OTA progress ack is NOT a reply to anything. The device tags it "ota":true
+              // precisely because it is otherwise shape-identical to ota_begin's reply, and this
+              // completer takes the first complete JSON line it sees. Without this guard a
+              // progress ack still in flight when the app sends ota_end would satisfy ota_end --
+              // and the app would report the image committed and the device rebooting when the
+              // device had done neither.
+              if (responseJson['ota'] == true) {
+                final off = responseJson['offset'];
+                if (off is int && otaImageSize > 0) {
+                  otaProgress = (off / otaImageSize).clamp(0.0, 1.0);
+                  notifyListeners();
+                }
+                continue;
+              }
+
               _bleResponseCompleter!.complete(responseJson);
             } catch (e) {
               _log('[RX] Parse ERROR: $e');
@@ -921,6 +941,7 @@ class DraupnirState extends ChangeNotifier {
         throw Exception('Device refused ota_begin: ${begin['message'] ?? begin['status']}');
       }
       final offset = (begin['offset'] as num?)?.toInt() ?? 0;
+      otaImageSize = bundle.bytes.length;
       _log('[OTA] begin ok, resuming from offset=$offset of ${bundle.bytes.length}');
 
       // 3+4. Raw bytes, no framing. Every write is awaited (withoutResponse: false, matching the
@@ -988,6 +1009,7 @@ class DraupnirState extends ChangeNotifier {
       _log('[OTA] confirmed');
     } finally {
       otaInProgress = false;
+      otaImageSize = 0;
       notifyListeners();
     }
   }

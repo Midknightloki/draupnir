@@ -226,8 +226,18 @@ private:
   bool _skipping = false; // inside an icon_xbm hex value
 };
 
-static void sendBleMessage(const String &msg) {
-  bleSendPreamble();
+// The body of a single-shot reply, WITHOUT the settle delay.
+//
+// Split out for the OTA progress acks. bleSendPreamble()'s own comment says its delay(300)
+// exists to let the central settle right after CCCD-enable before the FIRST notify -- a
+// once-per-connection concern. sendBleMessage() calls it on every message, which is harmless
+// for a handful of command replies and ruinous for OTA: a 1.23 MB image acked every 16 chunks
+// is ~151 acks, i.e. ~45 SECONDS of pure delay() inside the transfer, blowing the "about a
+// minute" target and stalling the chunk queue drain while image bytes keep arriving.
+//
+// By the time OTA is streaming the link has long since settled -- ota_begin was answered over
+// it -- so the preamble buys nothing and costs everything.
+static void sendBleMessageBody(const String &msg) {
   int len = msg.length();
   int offset = 0;
   uint8_t seq = 0;
@@ -239,6 +249,13 @@ static void sendBleMessage(const String &msg) {
   }
   uint8_t nl = '\n';
   sendNotifyAndWaitAck(&nl, 1, seq);
+}
+
+// Every pre-existing caller keeps the settle delay it was verified with. Only the OTA progress
+// ack opts out, via sendBleMessageBody().
+static void sendBleMessage(const String &msg) {
+  bleSendPreamble();
+  sendBleMessageBody(msg);
 }
 
 // Runs only from ble_update() (loop() task) -- never call directly from a BLE callback.
@@ -868,9 +885,15 @@ void ble_update() {
       if (!ok) { sendBleMessage("{\"status\":\"error\",\"message\":\"Flash write failed\"}"); break; }
       if (++chunksSinceAck >= OTA_ACK_EVERY) {
         chunksSinceAck = 0;
-        char ack[64];
-        snprintf(ack, sizeof(ack), "{\"status\":\"ok\",\"offset\":%lu}", (unsigned long)ota_offset());
-        sendBleMessage(ack);
+        // "ota":true is a discriminator, not decoration. Without it this is byte-identical in
+        // shape to ota_begin's reply, and the app completes whatever request is outstanding with
+        // the first complete JSON line it sees -- so a progress ack still in flight when the app
+        // sends ota_end would satisfy ota_end, and the app would report the image committed and
+        // the device rebooting when neither had happened.
+        char ack[80];
+        snprintf(ack, sizeof(ack),
+                 "{\"status\":\"ok\",\"ota\":true,\"offset\":%lu}", (unsigned long)ota_offset());
+        sendBleMessageBody(ack);
       }
     }
   }
