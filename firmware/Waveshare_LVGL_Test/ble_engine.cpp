@@ -1,6 +1,8 @@
 #include "ble_engine.h"
 #include "macro_engine.h"
 #include "icon_names.h"
+#include "version.h"
+#include "ota_engine.h"
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLESecurity.h>
@@ -8,6 +10,7 @@
 #include <LittleFS.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include "esp_ota_ops.h"
 
 #define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -52,10 +55,41 @@ static BLECharacteristic *pTxCharacteristic = nullptr;
 static QueueHandle_t bleRxQueue = nullptr;   // completed command strings (char*, caller frees)
 static QueueHandle_t bleAckQueue = nullptr;  // acked chunk sequence numbers
 
+// Image bytes handed from the BLE host task to loop(). esp_ota_write() must not run on the BLE
+// task -- same rule as every other write in this file.
+struct OtaChunk { uint8_t *data; size_t len; };
+static QueueHandle_t bleOtaQueue = nullptr;
+
 static volatile bool connected = false;
 static volatile bool pairingActive = false;
 static volatile uint32_t currentPasskey = 0;
 static volatile bool profilesDirty = false;
+
+// Retained so an OTA can renegotiate the link and hand it back afterwards.
+static BLEServer *activeServer = nullptr;
+static uint16_t   activeConnHandle = 0;
+
+// Connection parameters, in NimBLE's 1.25ms units.
+//
+// IDLE is what onConnect() installs: a 50-100ms interval with slave latency 4, letting this side
+// skip up to 4 connection events when it has nothing to say. That is deliberate and load-bearing
+// -- it was added because idle-connected was when HID output was seen to silently stop.
+//
+// It is also ruinous for bulk transfer. Each OTA chunk is an acked write, so it costs at least
+// one connection event, and latency 4 lets the peripheral skip four more. Measured on hardware:
+// a 1.23 MB image took ~15 MINUTES against a target of about one, i.e. ~371ms per chunk.
+//
+// FAST is 7.5-15ms with no latency, requested only for the duration of a transfer. A central may
+// refuse or round these; Android commonly grants 15-30ms, which is still several times better.
+#define CONN_PARAMS_IDLE 0x28, 0x50, 4, 400
+#define CONN_PARAMS_FAST 0x06, 0x0C, 0, 400
+
+void ble_set_fast_conn_params(bool fast) {
+  if (activeServer == nullptr) return;
+  if (fast) activeServer->updateConnParams(activeConnHandle, CONN_PARAMS_FAST);
+  else      activeServer->updateConnParams(activeConnHandle, CONN_PARAMS_IDLE);
+  Serial.printf("[ble] conn params -> %s\n", fast ? "FAST" : "idle");
+}
 
 bool ble_is_connected() { return connected; }
 bool ble_pairing_active() { return pairingActive; }
@@ -218,8 +252,18 @@ private:
   bool _skipping = false; // inside an icon_xbm hex value
 };
 
-static void sendBleMessage(const String &msg) {
-  bleSendPreamble();
+// The body of a single-shot reply, WITHOUT the settle delay.
+//
+// Split out for the OTA progress acks. bleSendPreamble()'s own comment says its delay(300)
+// exists to let the central settle right after CCCD-enable before the FIRST notify -- a
+// once-per-connection concern. sendBleMessage() calls it on every message, which is harmless
+// for a handful of command replies and ruinous for OTA: a 1.23 MB image acked every 16 chunks
+// is ~151 acks, i.e. ~45 SECONDS of pure delay() inside the transfer, blowing the "about a
+// minute" target and stalling the chunk queue drain while image bytes keep arriving.
+//
+// By the time OTA is streaming the link has long since settled -- ota_begin was answered over
+// it -- so the preamble buys nothing and costs everything.
+static void sendBleMessageBody(const String &msg) {
   int len = msg.length();
   int offset = 0;
   uint8_t seq = 0;
@@ -231,6 +275,13 @@ static void sendBleMessage(const String &msg) {
   }
   uint8_t nl = '\n';
   sendNotifyAndWaitAck(&nl, 1, seq);
+}
+
+// Every pre-existing caller keeps the settle delay it was verified with. Only the OTA progress
+// ack opts out, via sendBleMessageBody().
+static void sendBleMessage(const String &msg) {
+  bleSendPreamble();
+  sendBleMessageBody(msg);
 }
 
 // Runs only from ble_update() (loop() task) -- never call directly from a BLE callback.
@@ -461,6 +512,51 @@ static void handleBleCommand(char *cmdStr) {
     } else {
       sendBleMessage("{\"status\":\"error\",\"message\":\"Macro not found\"}");
     }
+  } else if (cmd == "get_version") {
+    // Deliberately also reports the OTA image state: the app needs to know whether the running
+    // firmware is still on probation (PENDING_VERIFY) so it can send ota_confirm. Without this
+    // the app cannot tell a freshly-updated device from a settled one.
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state = ESP_OTA_IMG_VALID;
+    esp_ota_get_state_partition(running, &state);
+    char resp[160];
+    snprintf(resp, sizeof(resp),
+             "{\"status\":\"ok\",\"version\":\"%s\",\"pending_verify\":%s}",
+             DRAUPNIR_FW_VERSION,
+             state == ESP_OTA_IMG_PENDING_VERIFY ? "true" : "false");
+    sendBleMessage(resp);
+  } else if (cmd == "ota_begin") {
+    char err[96] = {0};
+    uint32_t size = req["size"] | 0;
+    const char *sha = req["sha256"] | "";
+    const char *sig = req["sig"] | "";
+    if (ota_begin_request(size, sha, sig, err, sizeof(err))) {
+      char resp[64];
+      snprintf(resp, sizeof(resp), "{\"status\":\"ok\",\"offset\":%lu}", (unsigned long)ota_offset());
+      sendBleMessage(resp);
+    } else {
+      char resp[160];
+      snprintf(resp, sizeof(resp), "{\"status\":\"error\",\"message\":\"%s\"}", err);
+      sendBleMessage(resp);
+    }
+  } else if (cmd == "ota_end") {
+    char err[96] = {0};
+    if (ota_finish(err, sizeof(err))) {
+      sendBleMessage("{\"status\":\"ok\",\"rebooting\":true}");
+      delay(200);          // let the notification drain before the reset
+      esp_restart();
+    } else {
+      char resp[160];
+      snprintf(resp, sizeof(resp), "{\"status\":\"error\",\"message\":\"%s\"}", err);
+      sendBleMessage(resp);
+    }
+  } else if (cmd == "ota_abort") {
+    ota_abort();
+    sendBleMessage("{\"status\":\"ok\"}");
+  } else if (cmd == "ota_confirm") {
+    bool ok = ota_confirm();
+    sendBleMessage(ok ? "{\"status\":\"ok\"}"
+                      : "{\"status\":\"error\",\"message\":\"Confirm failed\"}");
   } else {
     sendBleMessage("{\"status\":\"error\",\"message\":\"Unknown command\"}");
   }
@@ -507,6 +603,24 @@ class RxCallbacks : public BLECharacteristicCallbacks {
     if (rxValue.length() == 2 && (uint8_t)rxValue[0] == BLE_CHUNK_ACK_MARKER) {
       uint8_t seq = (uint8_t)rxValue[1];
       xQueueOverwrite(bleAckQueue, &seq);
+      return;
+    }
+
+    // BINARY MODE. Image bytes, not a command -- and deliberately intercepted ABOVE the
+    // duplicate-write guard below.
+    //
+    // That guard drops any write byte-identical to the previous one inside
+    // BLE_RX_DUP_WINDOW_MS. A firmware image is full of identical adjacent chunks (0xFF padding,
+    // zero-filled regions) and pipelined chunks arrive far inside 10ms, so letting binary data
+    // reach the guard would silently discard real payload. The SHA-256 would then fail and the
+    // symptom would be "OTA always fails verification" -- with nothing pointing at the guard.
+    if (ota_active()) {
+      uint8_t *copy = (uint8_t *)malloc(rxValue.length());
+      if (copy != nullptr) {
+        memcpy(copy, rxValue.c_str(), rxValue.length());
+        OtaChunk chunk = { copy, rxValue.length() };
+        if (xQueueSend(bleOtaQueue, &chunk, 0) != pdTRUE) free(copy);   // drop, app re-sends
+      }
       return;
     }
 
@@ -591,6 +705,8 @@ class ServerCallbacks : public BLEServerCallbacks {
   // relying on per-characteristic ENC permission flags to trigger it implicitly.
   void onConnect(BLEServer *server, ble_gap_conn_desc *desc) override {
     connected = true;
+    activeServer = server;
+    activeConnHandle = desc->conn_handle;
     Serial.printf("[ble] connected, conn_handle=%d\n", desc->conn_handle);
     int rc = 0;
     bool started = BLESecurity::startSecurity(desc->conn_handle, &rc);
@@ -599,10 +715,11 @@ class ServerCallbacks : public BLEServerCallbacks {
     // the central can ignore) plus slave latency 4 -- lets this side skip up to 4 connection
     // events when it has nothing to send, cutting background radio/host activity further while
     // idle-connected, which is when we saw HID output silently stop.
-    server->updateConnParams(desc->conn_handle, 0x28, 0x50, 4, 400);
+    server->updateConnParams(desc->conn_handle, CONN_PARAMS_IDLE);
   }
   void onDisconnect(BLEServer *server, ble_gap_conn_desc *desc) override {
     connected = false;
+    activeServer = nullptr;
     pairingActive = false;
     // A half-received command from a dropped connection must not poison the next one. Without
     // this, bytes buffered when the link dropped stay in bleRxBuf and get prepended to the next
@@ -648,6 +765,7 @@ class SecurityCallbacks : public BLESecurityCallbacks {
 void ble_init() {
   bleRxQueue = xQueueCreate(4, sizeof(char *));
   bleAckQueue = xQueueCreate(1, sizeof(uint8_t));
+  bleOtaQueue = xQueueCreate(24, sizeof(OtaChunk));
 
   BLEDevice::init("Draupnir");
   uint32_t heapBefore = ESP.getFreeHeap();
@@ -783,4 +901,30 @@ void ble_update() {
     handleBleCommand(cmdStr); // zero-copy parse; cmdStr must outlive the call
     free(cmdStr);
   }
+
+  // Drain image bytes on the loop() task, and ack every OTA_ACK_EVERY chunks so the app can
+  // pipeline instead of waiting per chunk.
+  {
+    static uint32_t chunksSinceAck = 0;
+    const uint32_t OTA_ACK_EVERY = 16;
+    OtaChunk chunk;
+    while (xQueueReceive(bleOtaQueue, &chunk, 0) == pdTRUE) {
+      bool ok = ota_feed(chunk.data, chunk.len);
+      free(chunk.data);
+      if (!ok) { sendBleMessage("{\"status\":\"error\",\"message\":\"Flash write failed\"}"); break; }
+      if (++chunksSinceAck >= OTA_ACK_EVERY) {
+        chunksSinceAck = 0;
+        // "ota":true is a discriminator, not decoration. Without it this is byte-identical in
+        // shape to ota_begin's reply, and the app completes whatever request is outstanding with
+        // the first complete JSON line it sees -- so a progress ack still in flight when the app
+        // sends ota_end would satisfy ota_end, and the app would report the image committed and
+        // the device rebooting when neither had happened.
+        char ack[80];
+        snprintf(ack, sizeof(ack),
+                 "{\"status\":\"ok\",\"ota\":true,\"offset\":%lu}", (unsigned long)ota_offset());
+        sendBleMessageBody(ack);
+      }
+    }
+  }
+  ota_tick();
 }

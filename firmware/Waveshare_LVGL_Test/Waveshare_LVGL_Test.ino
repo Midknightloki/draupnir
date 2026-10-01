@@ -11,6 +11,8 @@
 #include "haptics.h"
 #include "trace.h"
 #include "icon_names.h"
+#include "ota_engine.h"
+#include "esp_ota_ops.h"
 
 #define ENCODER_ECA_PIN 8
 #define ENCODER_ECB_PIN 7
@@ -1235,6 +1237,83 @@ static void update_pairing_overlay(void) {
   wasPairing = isPairing; // only now has the transition actually been applied to the UI
 }
 
+// Full-screen overlay shown while ota_active() is true, built after build_pairing_overlay() so
+// it draws on top of every other overlay by LVGL's default per-screen z-order (later created,
+// later drawn). A binary transfer takes roughly a minute, during which the ring would otherwise
+// sit static -- indistinguishable from a hang -- and unplugging mid-write is the one action that
+// can leave the target partition half-written. This overlay's only job is to make "still working,
+// leave it plugged in" obvious.
+static lv_obj_t *ota_overlay = nullptr;
+static lv_obj_t *ota_label = nullptr;
+
+static void build_ota_overlay(void) {
+  lv_obj_t *scr = lv_scr_act();
+  ota_overlay = lv_obj_create(scr);
+  lv_obj_set_size(ota_overlay, EXAMPLE_LCD_H_RES, EXAMPLE_LCD_V_RES);
+  lv_obj_set_pos(ota_overlay, 0, 0);
+  lv_obj_set_style_bg_color(ota_overlay, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(ota_overlay, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(ota_overlay, 0, 0);
+  lv_obj_set_style_border_width(ota_overlay, 0, 0);
+  lv_obj_clear_flag(ota_overlay, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(ota_overlay, LV_OBJ_FLAG_HIDDEN);
+
+  ota_label = lv_label_create(ota_overlay);
+  lv_obj_set_style_text_color(ota_label, lv_color_white(), 0);
+  lv_obj_set_style_text_align(ota_label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_text(ota_label, "Updating firmware\n\nDo not unplug\n\n0%");
+  lv_obj_center(ota_label);
+}
+
+// Polled from loop(), same reasoning as update_pairing_overlay(): ota_feed() drains image bytes
+// from a queue inside ble_update() (also loop()-task), and ota_active()/ota_offset()/
+// ota_expected() are plain reads of loop()-task-owned state, but the LVGL objects they drive
+// must still only ever be touched here, under lvgl_lock() -- never from ble_engine's BLE host
+// callbacks and never from ota_feed() itself.
+//
+// Unlike update_pairing_overlay(), this one also has to repaint WHILE active (the percentage
+// keeps moving), not just on the active/inactive edge -- so it throttles like
+// update_running_pulse() rather than being a pure edge trigger.
+static unsigned long last_ota_repaint = 0;
+static void update_ota_overlay(void) {
+  static bool wasActive = false;
+  bool active = ota_active();
+
+  if (active != wasActive) {
+    // Lock FIRST, commit wasActive AFTER -- the H5 lesson (see update_pairing_overlay()). A
+    // timed-out lock here must leave the transition for the next tick to retry, not drop it.
+    if (!lvgl_lock(100)) return;
+    if (active) {
+      lv_label_set_text(ota_label, "Updating firmware\n\nDo not unplug\n\n0%");
+      lv_obj_clear_flag(ota_overlay, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_move_foreground(ota_overlay);
+    } else {
+      lv_obj_add_flag(ota_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+    lvgl_unlock();
+    wasActive = active;
+    last_ota_repaint = millis();
+    return;
+  }
+
+  if (!active) return;
+
+  // ~5 fps: the percentage only advances once per OTA_ACK_EVERY chunk batch on the wire, so
+  // anything faster just burns the LVGL lock for no visible benefit.
+  unsigned long now = millis();
+  if (now - last_ota_repaint < 200) return;
+  last_ota_repaint = now;
+
+  uint32_t expected = ota_expected();
+  uint32_t pct = expected ? (uint32_t)(((uint64_t)ota_offset() * 100) / expected) : 0;
+  if (pct > 100) pct = 100; // defensive only; ota_feed() already clamps received <= expected
+  if (!lvgl_lock(100)) return; // a missed frame here just means the next tick repaints instead
+  char buf[64];
+  snprintf(buf, sizeof(buf), "Updating firmware\n\nDo not unplug\n\n%lu%%", (unsigned long)pct);
+  lv_label_set_text(ota_label, buf);
+  lvgl_unlock();
+}
+
 // Polled from loop() -- a save_profiles command (handled entirely on the Bluedroid/NimBLE host
 // task, see ble_engine.h) sets ble_profiles_dirty() once it's written+reloaded a new
 // profiles.json. Rebuilding the ring here, under lvgl_lock(), keeps every LVGL touch on either
@@ -1486,6 +1565,9 @@ static void update_settings(void) {
     lv_obj_clear_flag(settings_overlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(settings_overlay);
     if (pairing_overlay) lv_obj_move_foreground(pairing_overlay);
+    // OTA progress must stay visible above Settings/rotary too, on the off chance either is
+    // reachable mid-transfer -- the "do not unplug" warning outranks everything else on screen.
+    if (ota_overlay) lv_obj_move_foreground(ota_overlay);
     lvgl_unlock();
     Serial.println("[diag] settings opened, macros stopped");
     return;
@@ -1564,6 +1646,9 @@ static void update_rotary(void) {
     lv_obj_clear_flag(rotary_overlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(rotary_overlay);
     if (pairing_overlay) lv_obj_move_foreground(pairing_overlay);
+    // OTA progress must stay visible above Settings/rotary too, on the off chance either is
+    // reachable mid-transfer -- the "do not unplug" warning outranks everything else on screen.
+    if (ota_overlay) lv_obj_move_foreground(ota_overlay);
     lvgl_unlock();
     Serial.printf("[diag] rotary mode entered: %s\n", macros_rotary_name());
     return;
@@ -1655,6 +1740,7 @@ static void build_ring_ui(void) {
   build_settings_overlay();
   build_rotary_overlay();
   build_pairing_overlay();
+  build_ota_overlay();
 }
 
 // Callbacks run on the esp_timer task, not in an ISR -- plain xQueueSend (not the FromISR variant)
@@ -1713,6 +1799,19 @@ void setup() {
   // asking whether a change had been flashed at all.
   Serial.printf("[diag] build %s %s\n", __DATE__, __TIME__);
   Serial.println("[diag] host-commanded bootloader reset DISABLED (enableReboot(false))");
+
+  {
+    esp_ota_img_states_t st = ESP_OTA_IMG_VALID;
+    esp_ota_get_state_partition(esp_ota_get_running_partition(), &st);
+    if (st == ESP_OTA_IMG_PENDING_VERIFY) {
+      // Deliberately NOT confirmed here. Confirmation must require the app to reconnect and ask
+      // for it, because that round trip proves BLE, pairing and command handling all work -- the
+      // exact capability a broken image would have lost. Self-confirming on boot would mark a
+      // half-working image valid and throw the rollback net away.
+      Serial.println("[ota] running image is PENDING_VERIFY -- awaiting ota_confirm from the app");
+    }
+  }
+
   hid_init();
   Serial.println("[diag] hid_init done");
   USB.begin();
@@ -1808,6 +1907,7 @@ void loop() {
   macros_update();
   ble_update();
   update_pairing_overlay();
+  update_ota_overlay();
   update_profiles_reload();
   update_settings();
   update_rotary();

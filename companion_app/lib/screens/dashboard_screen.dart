@@ -10,6 +10,8 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
 import '../state/draupnir_state.dart';
+import '../services/firmware_source.dart';
+import '../services/ota_transfer.dart';
 import '../services/profile_transfer.dart';
 import '../theme.dart';
 import '../widgets/palette_picker.dart';
@@ -24,6 +26,12 @@ class DashboardScreen extends StatefulWidget {
 
 class _DashboardScreenState extends State<DashboardScreen> {
   int? _editingKeyIdx;
+
+  // Set only while a firmware update's progress dialog is up, cleared at the start of every
+  // attempt. state.updateFirmware() reports failure by throwing rather than through a field, and
+  // _runFirmwareUpdate below catches that and stashes it here so the caller can still see it
+  // after the dialog it popped has already closed.
+  Object? _otaFailure;
 
   // Every connect goes through here so the picker is always attached. The state layer only asks
   // when the scan finds more than one board — with a single Draupnir on the air this is exactly
@@ -294,6 +302,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 case 'settings':
                   _showSettingsDialog(state);
                   break;
+                case 'update_firmware':
+                  _startFirmwareUpdate(state);
+                  break;
                 case 'debug':
                   _showDebugLog(state);
                   break;
@@ -321,6 +332,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 value: 'settings',
                 child: ListTile(leading: Icon(Icons.settings), title: Text('Device Settings')),
               ),
+              // Needs only a live BLE link, not loaded profiles -- it never touches
+              // profilesData. Gated the same way pairing/config-mode guidance is: hidden rather
+              // than shown-and-disabled, matching this menu's existing convention.
+              if (state.isBluetooth)
+                const PopupMenuItem(
+                  value: 'update_firmware',
+                  child: ListTile(
+                    leading: Icon(Icons.system_update_alt),
+                    title: Text('Update Firmware'),
+                  ),
+                ),
               PopupMenuItem(
                 value: 'debug',
                 child: ListTile(
@@ -1063,6 +1085,210 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final deleted = await state.deleteMacro(pos);
     if (!mounted || deleted) return;
     _reportSaveFailure(state, "Couldn't delete the macro.");
+  }
+
+  // ===========================================================================================
+  // FIRMWARE UPDATE (M13 Task 7)
+  // ===========================================================================================
+
+  /// Entry point for the "Update Firmware" menu action.
+  ///
+  /// Loads the bundled image and asks the device its running version purely to decide what to
+  /// tell the user before anything happens -- nothing here writes to the device.
+  /// [DraupnirState.updateFirmware] does its own bundle load and BLE writes and is the only
+  /// thing that actually starts a transfer.
+  Future<void> _startFirmwareUpdate(DraupnirState state) async {
+    final bundle = await const BundledFirmwareSource().load();
+    if (!mounted) return;
+    if (bundle == null) {
+      await _alert('No Firmware Bundled',
+          'This build of the app does not ship a firmware image to install.');
+      return;
+    }
+
+    final deviceVersion = await state.fetchDeviceVersion();
+    if (!mounted) return;
+
+    if (!shouldOffer(deviceVersion: deviceVersion, bundleVersion: bundle.version)) {
+      await _alert(
+          'Already Up To Date', 'The device is already running firmware ${bundle.version}.');
+      return;
+    }
+
+    // shouldOffer() deliberately offers a downgrade too (see ota_transfer.dart) -- refusing one
+    // would make a bad release recoverable only over USB, which is the situation OTA exists to
+    // avoid. This is the app's half of that deal: say so, plainly, instead of refusing.
+    final isDowngrade =
+        deviceVersion != null && _compareVersions(bundle.version, deviceVersion) < 0;
+
+    final go = await _confirmFirmwareUpdate(
+      deviceVersion: deviceVersion,
+      bundleVersion: bundle.version,
+      isDowngrade: isDowngrade,
+    );
+    if (go != true) return;
+    if (!mounted) return;
+
+    _otaFailure = null;
+    final runFuture = _runFirmwareUpdate(state);
+
+    // Non-dismissible: state.otaInProgress stays true regardless of what the user does to this
+    // dialog, so letting them dismiss it would leave the transfer running with no visible state
+    // at all. PopScope(canPop:false) blocks the back gesture/button; barrierDismissible:false
+    // blocks tapping outside it. Only _runFirmwareUpdate's own Navigator.pop() (in its `finally`)
+    // closes this, once the whole sequence -- ota_confirm included -- has settled either way.
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => PopScope(
+        canPop: false,
+        child: AlertDialog(
+          backgroundColor: AppTheme.surface,
+          title: Text('Updating Firmware', style: GoogleFonts.orbitron(fontSize: 16)),
+          content: Consumer<DraupnirState>(
+            builder: (context, s, _) => _buildOtaProgressBody(s),
+          ),
+        ),
+      ),
+    );
+    await runFuture;
+    if (!mounted) return;
+
+    if (_otaFailure == null) {
+      await _alert('Update Complete',
+          'The device is now running firmware ${bundle.version}, and the update has been '
+          'confirmed.');
+    } else {
+      await _alert('Update Failed', _describeOtaFailure(_otaFailure!));
+    }
+  }
+
+  /// Runs [DraupnirState.updateFirmware] and closes the progress dialog when it settles, success
+  /// or failure. The failure is stashed in [_otaFailure] rather than rethrown: by the time the
+  /// caller above can look at it, the dialog this pops needs to already be gone.
+  Future<void> _runFirmwareUpdate(DraupnirState state) async {
+    try {
+      await state.updateFirmware();
+    } catch (e) {
+      _otaFailure = e;
+    } finally {
+      if (mounted) Navigator.of(context, rootNavigator: true).pop();
+    }
+  }
+
+  /// The pre-flight dialog: names both versions, states the downgrade plainly when it is one,
+  /// and warns not to unplug before a single byte has moved.
+  Future<bool?> _confirmFirmwareUpdate({
+    required String? deviceVersion,
+    required String bundleVersion,
+    required bool isDowngrade,
+  }) {
+    final buffer = StringBuffer();
+    if (isDowngrade) {
+      buffer.writeln(
+          'This is a DOWNGRADE: version $bundleVersion is older than the $deviceVersion '
+          'currently on the device.');
+    } else if (deviceVersion != null) {
+      buffer.writeln('This installs firmware version $bundleVersion. The device is currently '
+          'running $deviceVersion.');
+    } else {
+      buffer.writeln('The device didn\'t report its current version. This installs firmware '
+          'version $bundleVersion.');
+    }
+    buffer.writeln();
+    buffer.writeln('Do not unplug the device during the update. It takes about a minute, '
+        'including a reboot partway through when the screen may look idle — that is expected, '
+        'not a hang.');
+
+    return showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppTheme.surface,
+        title: Text(isDowngrade ? 'Downgrade Firmware?' : 'Update Firmware?',
+            style: GoogleFonts.orbitron(fontSize: 16)),
+        content: Text(buffer.toString(), style: const TextStyle(color: Colors.white70)),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false), child: const Text('CANCEL')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text(
+              isDowngrade ? 'DOWNGRADE' : 'UPDATE',
+              style: TextStyle(color: isDowngrade ? AppTheme.brandGold : AppTheme.accent),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// The progress dialog's body. Split on otaProgress reaching 1.0 rather than on a dedicated
+  /// "confirming" flag: [DraupnirState.updateFirmware] sets it to 1.0 right after the
+  /// byte-transfer loop and holds it there through ota_end, the reboot wait, reconnect and
+  /// ota_confirm -- so "progress is full but otaInProgress is still true" IS the
+  /// reconnect-and-confirm phase, and there is nothing else it could mean.
+  Widget _buildOtaProgressBody(DraupnirState state) {
+    final confirming = state.otaProgress >= 1.0;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        LinearProgressIndicator(
+          value: confirming ? null : state.otaProgress, // null = indeterminate while confirming
+          color: AppTheme.accent,
+          backgroundColor: AppTheme.surfaceHighlight,
+        ),
+        const SizedBox(height: 12),
+        Text(
+          confirming
+              ? 'Firmware sent. Device is rebooting — reconnecting to confirm the update.'
+              : 'Sending firmware — ${(state.otaProgress * 100).toStringAsFixed(0)}%',
+          style: const TextStyle(color: Colors.white70),
+        ),
+        const SizedBox(height: 16),
+        const Text(
+          'Do not unplug the device. This takes about a minute, and the screen may look idle '
+          'partway through — that is expected.',
+          style: TextStyle(color: AppTheme.brandGold, fontWeight: FontWeight.bold, fontSize: 12),
+        ),
+      ],
+    );
+  }
+
+  /// Turns a thrown [DraupnirState.updateFirmware] failure into user-facing copy.
+  ///
+  /// Every failure before the device calls esp_ota_set_boot_partition (inside its ota_end
+  /// handler on the firmware side) leaves it running its previous, already-confirmed firmware --
+  /// genuinely reassuring, and worth saying. The two failures that can only happen AFTER that
+  /// call -- the post-reboot reconnect timing out, and a reconnect landing but ota_confirm being
+  /// refused -- already state, correctly, that the device rebooted onto the new, unconfirmed
+  /// image and will revert on its own; appending "still on previous firmware" to those would be
+  /// false, so they're passed through unchanged instead.
+  String _describeOtaFailure(Object failure) {
+    var msg = failure.toString();
+    if (msg.startsWith('Exception: ')) msg = msg.substring('Exception: '.length);
+
+    final alreadyOnProbation =
+        msg.contains("didn't come back after rebooting") || msg.contains('refused ota_confirm');
+    if (alreadyOnProbation) return msg;
+
+    return '$msg\n\nThe device never rebooted onto the new image — it is still running its '
+        'previous firmware, unaffected by this.';
+  }
+
+  /// Numeric dotted-version compare (1.2.10 > 1.2.9, unlike a plain string compare). Falls back
+  /// to a string compare for anything that isn't all-numeric segments, so an odd version string
+  /// degrades to "not detected as a downgrade" rather than throwing.
+  int _compareVersions(String a, String b) {
+    final pa = a.split('.').map(int.tryParse).toList();
+    final pb = b.split('.').map(int.tryParse).toList();
+    if (pa.contains(null) || pb.contains(null)) return a.compareTo(b);
+    for (var i = 0; i < pa.length || i < pb.length; i++) {
+      final va = i < pa.length ? pa[i]! : 0;
+      final vb = i < pb.length ? pb[i]! : 0;
+      if (va != vb) return va.compareTo(vb);
+    }
+    return 0;
   }
 
   /// Reports a retryable write failure in place, leaving the deck on screen.

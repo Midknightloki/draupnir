@@ -468,6 +468,56 @@ installed the matching release APK.
 - **No scoped re-review ran on the final fix round** (account rate limit). Each fix was verified
   in place by the controller instead, which is weaker than a fresh reviewer.
 
+### Verified on hardware during M13 (OTA) — Waveshare, 2026-10-01
+
+Production signing key generated, backed up by the owner, and its public key compiled in
+(fingerprint `ac20b4e2...`). Device flashed over USB with that key, then updated over the air.
+
+**Passed — all 10:**
+
+1. `sign_firmware.py` exits 1 when `DRAUPNIR_OTA_KEY` is unset, and refuses a `--version` that
+   does not appear in the image bytes (verified both directions).
+2. **Tampered image refused.** One byte flipped mid-payload after signing; full transfer, then
+   refused at the hash check. Device untouched on its existing firmware.
+3. **Wrong key refused.** A genuine, uncorrupted image signed with an untrusted key: hash passed,
+   signature rejected. This is the property that justifies signing at all -- a bonded phone with
+   a valid image still cannot push code.
+4. **Dropped transfer recovered.** BLE killed mid-flight; device stayed on its old firmware and
+   returned to command mode after the idle timeout with no power cycle.
+5. **Happy path.** Transfer, reboot, reconnect, confirm.
+6. **Rollback proven by use, not inspection.** An image that was never confirmed was reverted by
+   the bootloader on power cycle. Found accidentally -- the reconnect failed, so nothing
+   confirmed, and the net did exactly its job. Stronger evidence than a staged test, because
+   nothing about it was arranged to succeed.
+8. **Transfer time: 90 seconds** for 1.23 MB, against ~15 minutes before the connection-parameter
+   fix.
+
+7. **HID silent for the whole transfer.** A focused text editor received nothing.
+9. **Downgrade warned and installed.** An older version was offered with an explicit downgrade
+   warning and installed correctly -- refusing downgrades would make a bad release recoverable
+   only over USB, which is the situation OTA exists to avoid.
+10. **The retired M5Dial is unaffected.** Still loads profiles and fires macros, unflashed.
+
+**All 10 criteria passed.**
+
+**Two defects found here that no review could have found:**
+
+- **The 15-minute transfer.** `ble_engine.cpp` installs a 50-100ms connection interval with slave
+  latency 4 on connect -- deliberate, and added because idle-connected was when HID output
+  silently stopped. Correct for the problem it solved; ruinous for bulk transfer at ~371ms per
+  acked chunk. Fast parameters are now requested for the duration of a transfer and the idle ones
+  restored on every exit path.
+- **The post-reboot reconnect never retried.** Introduced while fixing the wrong-device bug: once
+  `connectBluetooth` could throw, the retry loop's missing try/catch let the first failed scan
+  escape it. A device needing a few more seconds to boot was reported as a failed update and then
+  correctly rolled back.
+
+**Known and unresolved:** the initial connect takes 60-90 s. Two compounding causes, both
+measured: the idle connection parameters above, and `BLE_CHUNK_PAYLOAD_SIZE` being 100 bytes
+against a negotiated 509-byte MTU. Roughly 5x each. This is pre-existing, affects every feature,
+and is deliberately NOT part of M13 -- it touches the transport everything depends on and needs
+its own verification.
+
 ## 5. Hardware — read before plugging anything in
 
 The board is a **Waveshare ESP32-S3 knob**: ESP32-S3 rev v0.2, 16 MB quad flash, 8 MB PSRAM

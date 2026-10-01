@@ -33,3 +33,8 @@ bool ble_is_connected();
 // macro_engine), then call ble_clear_profiles_dirty().
 bool ble_profiles_dirty();
 void ble_clear_profiles_dirty();
+
+// Swap the link between the idle-tuned connection parameters and fast ones, for the duration of
+// a bulk transfer. See CONN_PARAMS_IDLE in ble_engine.cpp: the idle settings exist to stop HID
+// output stalling and must be restored on every OTA exit path.
+void ble_set_fast_conn_params(bool fast);
